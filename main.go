@@ -10,7 +10,44 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unsafe"
 )
+
+const (
+	prSetNoNewPrivs       = 38
+	prCapBsetDrop         = 24
+	prCapAmbient          = 47
+	prCapAmbientClearAll  = 4
+)
+
+func dropAllCaps() error {
+	if _, _, e := syscall.Syscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0); e != 0 {
+		return fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", e)
+	}
+	if _, _, e := syscall.Syscall6(syscall.SYS_PRCTL, prCapAmbient, prCapAmbientClearAll, 0, 0, 0, 0); e != 0 {
+		return fmt.Errorf("PR_CAP_AMBIENT_CLEAR_ALL: %w", e)
+	}
+	for i := uintptr(0); i < 64; i++ {
+		// EINVAL means cap doesn't exist; stop iterating.
+		if _, _, e := syscall.Syscall(syscall.SYS_PRCTL, prCapBsetDrop, i, 0); e == syscall.EINVAL {
+			break
+		}
+	}
+	type header struct {
+		version uint32
+		pid     int32
+	}
+	type data struct {
+		effective, permitted, inheritable uint32
+	}
+	hdr := header{version: 0x20080522} // _LINUX_CAPABILITY_VERSION_3
+	var d [2]data
+	if _, _, e := syscall.Syscall(syscall.SYS_CAPSET,
+		uintptr(unsafe.Pointer(&hdr)), uintptr(unsafe.Pointer(&d[0])), 0); e != 0 {
+		return fmt.Errorf("capset: %w", e)
+	}
+	return nil
+}
 
 const (
 	childEnv = "_RUNCLAUDE_CHILD"
@@ -287,6 +324,10 @@ func initMain() error {
 	}
 	if err := os.Chdir(cfg.Cwd); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.Cwd, err)
+	}
+
+	if err := dropAllCaps(); err != nil {
+		return err
 	}
 
 	os.Unsetenv(childEnv)
