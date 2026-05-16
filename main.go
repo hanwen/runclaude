@@ -128,6 +128,13 @@ func childMain() error {
 		return err
 	}
 
+	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("make-rprivate /: %w", err)
+	}
+	if err := syscall.Mount(cfg.Rootfs, cfg.Rootfs, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind rootfs onto itself: %w", err)
+	}
+
 	homePrefix := "/" + strings.SplitN(strings.TrimPrefix(cfg.Home, "/"), "/", 2)[0]
 	entries, err := os.ReadDir("/")
 	if err != nil {
@@ -269,8 +276,14 @@ func initMain() error {
 		return fmt.Errorf("mount proc: %w", err)
 	}
 
-	if err := syscall.Chroot(cfg.Rootfs); err != nil {
-		return fmt.Errorf("chroot %s: %w", cfg.Rootfs, err)
+	if err := os.Chdir(cfg.Rootfs); err != nil {
+		return fmt.Errorf("chdir rootfs: %w", err)
+	}
+	if err := syscall.PivotRoot(".", "."); err != nil {
+		return fmt.Errorf("pivot_root: %w", err)
+	}
+	if err := syscall.Unmount(".", syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount old root: %w", err)
 	}
 	if err := os.Chdir(cfg.Cwd); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.Cwd, err)
