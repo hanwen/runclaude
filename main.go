@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -16,10 +17,11 @@ const (
 )
 
 type Config struct {
-	Rootfs string   `json:"rootfs"`
-	Home   string   `json:"home"`
-	Cwd    string   `json:"cwd"`
-	Binds  []string `json:"binds"`
+	Rootfs    string   `json:"rootfs"`
+	Home      string   `json:"home"`
+	Cwd       string   `json:"cwd"`
+	Binds     []string `json:"binds"`
+	BashArgs  []string `json:"bashArgs"`
 }
 
 func loadConfig(envName string) (*Config, error) {
@@ -36,6 +38,28 @@ func encodeConfig(c *Config) string {
 		panic(err)
 	}
 	return string(data)
+}
+
+func claudeBinds(home string) ([]string, error) {
+	binds := []string{
+		filepath.Join(home, ".claude"),
+		filepath.Join(home, ".claude.json"),
+		filepath.Join(home, ".config", "claude"),
+	}
+	claude, err := exec.LookPath("claude")
+	if err == nil {
+		binds = append(binds, filepath.Dir(claude))
+		if target, err := filepath.EvalSymlinks(claude); err == nil {
+			binds = append(binds, filepath.Dir(target))
+		}
+	}
+	var out []string
+	for _, b := range binds {
+		if _, err := os.Stat(b); err == nil {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 func mainErr() error {
@@ -57,18 +81,29 @@ func mainErr() error {
 		return err
 	}
 
+	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the shell command")
+	flag.Parse()
+
 	cfg := &Config{
 		Rootfs: rootfs,
 		Home:   home,
 		Cwd:    cwd,
 		Binds:  []string{cwd},
 	}
-	for _, a := range os.Args[1:] {
+	for _, a := range flag.Args() {
 		abs, err := filepath.Abs(a)
 		if err != nil {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, abs)
+	}
+	if *claudeMode {
+		extra, err := claudeBinds(home)
+		if err != nil {
+			return err
+		}
+		cfg.Binds = append(cfg.Binds, extra...)
+		cfg.BashArgs = []string{"-c", "claude"}
 	}
 
 	self, err := os.Executable()
@@ -117,8 +152,23 @@ func childMain() error {
 
 	for _, d := range cfg.Binds {
 		dest := filepath.Join(cfg.Rootfs, d)
-		if err := os.MkdirAll(dest, 0755); err != nil {
+		info, err := os.Stat(d)
+		if err != nil {
 			return err
+		}
+		if info.IsDir() {
+			if err := os.MkdirAll(dest, 0755); err != nil {
+				return err
+			}
+		} else {
+			if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				return err
+			}
+			f.Close()
 		}
 		if err := syscall.Mount(d, dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 			return fmt.Errorf("rbind %s -> %s: %w", d, dest, err)
@@ -174,7 +224,8 @@ func initMain() error {
 
 	os.Unsetenv(childEnv)
 	os.Unsetenv(initEnv)
-	return syscall.Exec("/bin/bash", []string{"bash"}, os.Environ())
+	argv := append([]string{"bash"}, cfg.BashArgs...)
+	return syscall.Exec("/bin/bash", argv, os.Environ())
 }
 
 func main() {
