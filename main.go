@@ -118,6 +118,9 @@ func mainErr() error {
 	if err != nil {
 		return err
 	}
+	if !filepath.IsAbs(home) || strings.Trim(home, "/") == "" {
+		return fmt.Errorf("$HOME must be absolute and not %q, got %q", "/", home)
+	}
 
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the shell command")
 	flag.Parse()
