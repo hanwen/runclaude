@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -127,11 +128,43 @@ func childMain() error {
 		return err
 	}
 
-	if err := syscall.Mount("/", cfg.Rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("rbind / -> %s: %w", cfg.Rootfs, err)
+	homePrefix := "/" + strings.SplitN(strings.TrimPrefix(cfg.Home, "/"), "/", 2)[0]
+	entries, err := os.ReadDir("/")
+	if err != nil {
+		return err
 	}
-	if err := syscall.Mount("", cfg.Rootfs, "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("make-rslave %s: %w", cfg.Rootfs, err)
+	for _, e := range entries {
+		src := "/" + e.Name()
+		if src == homePrefix || src == "/proc" || src == "/tmp" {
+			continue
+		}
+		dest := filepath.Join(cfg.Rootfs, src)
+		info, err := os.Lstat(src)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(src)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dest); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.IsDir() {
+			continue
+		}
+		if err := os.Mkdir(dest, 0755); err != nil {
+			return err
+		}
+		if err := syscall.Mount(src, dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("rbind %s -> %s: %w", src, dest, err)
+		}
+		if err := syscall.Mount("", dest, "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("make-rslave %s: %w", dest, err)
+		}
 	}
 
 	homeInRoot := filepath.Join(cfg.Rootfs, cfg.Home)
