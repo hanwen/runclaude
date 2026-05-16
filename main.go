@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	prSetNoNewPrivs       = 38
-	prCapBsetDrop         = 24
-	prCapAmbient          = 47
-	prCapAmbientClearAll  = 4
+	prSetNoNewPrivs      = 38
+	prCapBsetDrop        = 24
+	prCapAmbient         = 47
+	prCapAmbientClearAll = 4
 )
 
 func dropAllCaps() error {
@@ -168,6 +168,62 @@ func mainErr() error {
 	return cmd.Run()
 }
 
+func setupDev(rootfs string) error {
+	dev := filepath.Join(rootfs, "dev")
+	if err := os.MkdirAll(dev, 0755); err != nil {
+		return err
+	}
+	if err := syscall.Mount("tmpfs", dev, "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_STRICTATIME, "mode=755"); err != nil {
+		return fmt.Errorf("tmpfs %s: %w", dev, err)
+	}
+
+	for _, name := range []string{"null", "zero", "full", "random", "urandom", "tty"} {
+		src := "/dev/" + name
+		dst := filepath.Join(dev, name)
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			return err
+		}
+		f.Close()
+		if err := syscall.Mount(src, dst, "", syscall.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind %s: %w", src, err)
+		}
+	}
+
+	pts := filepath.Join(dev, "pts")
+	if err := os.Mkdir(pts, 0755); err != nil {
+		return err
+	}
+	if err := syscall.Mount("devpts", pts, "devpts",
+		syscall.MS_NOSUID|syscall.MS_NOEXEC,
+		"newinstance,ptmxmode=0666,mode=0620"); err != nil {
+		return fmt.Errorf("devpts: %w", err)
+	}
+
+	shm := filepath.Join(dev, "shm")
+	if err := os.Mkdir(shm, 0755); err != nil {
+		return err
+	}
+	if err := syscall.Mount("tmpfs", shm, "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "mode=1777"); err != nil {
+		return fmt.Errorf("tmpfs /dev/shm: %w", err)
+	}
+
+	for _, l := range [][2]string{
+		{"pts/ptmx", "ptmx"},
+		{"/proc/self/fd", "fd"},
+		{"/proc/self/fd/0", "stdin"},
+		{"/proc/self/fd/1", "stdout"},
+		{"/proc/self/fd/2", "stderr"},
+	} {
+		if err := os.Symlink(l[0], filepath.Join(dev, l[1])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func childMain() error {
 	cfg, err := loadConfig(childEnv)
 	if err != nil {
@@ -188,7 +244,7 @@ func childMain() error {
 	}
 	for _, e := range entries {
 		src := "/" + e.Name()
-		if src == homePrefix || src == "/proc" || src == "/tmp" || src == "/run" {
+		if src == homePrefix || src == "/proc" || src == "/tmp" || src == "/run" || src == "/dev" {
 			continue
 		}
 		dest := filepath.Join(cfg.Rootfs, src)
@@ -218,10 +274,21 @@ func childMain() error {
 		if err := syscall.Mount("", dest, "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
 			return fmt.Errorf("make-rslave %s: %w", dest, err)
 		}
+		if err := syscall.Mount("", dest, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+			if err != syscall.EPERM {
+				// Some pseudo-filesystems (sysfs, etc.) refuse a RO remount in a
+				// nested user ns. Keep them writable rather than failing.
+				log.Printf("warning: remount-ro %s: %v", dest, err)
+			}
+		}
+	}
+
+	if err := setupDev(cfg.Rootfs); err != nil {
+		return err
 	}
 
 	homeInRoot := filepath.Join(cfg.Rootfs, cfg.Home)
-	if err := os.MkdirAll(homeInRoot, 0755); err != nil {
+	if err := os.MkdirAll(homeInRoot, 0700); err != nil {
 		return err
 	}
 	if err := syscall.Mount("tmpfs", homeInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"); err != nil {
@@ -266,6 +333,9 @@ func childMain() error {
 		}
 		if err := syscall.Mount("/run/systemd/resolve", dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 			return fmt.Errorf("rbind /run/systemd/resolve: %w", err)
+		}
+		if err := syscall.Mount("", dest, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+			log.Printf("warning: remount-ro /run/systemd/resolve: %v", err)
 		}
 	}
 
