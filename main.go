@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -13,6 +14,29 @@ const (
 	childEnv = "_RUNCLAUDE_CHILD"
 	initEnv  = "_RUNCLAUDE_INIT"
 )
+
+type Config struct {
+	Rootfs string   `json:"rootfs"`
+	Home   string   `json:"home"`
+	Cwd    string   `json:"cwd"`
+	Binds  []string `json:"binds"`
+}
+
+func loadConfig(envName string) (*Config, error) {
+	var c Config
+	if err := json.Unmarshal([]byte(os.Getenv(envName)), &c); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", envName, err)
+	}
+	return &c, nil
+}
+
+func encodeConfig(c *Config) string {
+	data, err := json.Marshal(c)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
 
 func mainErr() error {
 	dir, err := os.MkdirTemp("", "runclaude-")
@@ -33,66 +57,49 @@ func mainErr() error {
 		return err
 	}
 
-	binds := []string{cwd}
+	cfg := &Config{
+		Rootfs: rootfs,
+		Home:   home,
+		Cwd:    cwd,
+		Binds:  []string{cwd},
+	}
 	for _, a := range os.Args[1:] {
 		abs, err := filepath.Abs(a)
 		if err != nil {
 			return err
 		}
-		binds = append(binds, abs)
+		cfg.Binds = append(cfg.Binds, abs)
 	}
 
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	args := []string{
+	cmd := exec.Command("unshare",
 		"--user", "--map-current-user", "--map-auto", "--keep-caps", "--mount",
-		"--", self, "--rootfs", rootfs, "--home", home, "--cwd", cwd,
-	}
-	for _, d := range binds {
-		args = append(args, "--bind", d)
-	}
-	cmd := exec.Command("unshare", args...)
-	cmd.Env = append(os.Environ(), childEnv+"=1")
+		"--", self,
+	)
+	cmd.Env = append(os.Environ(), childEnv+"="+encodeConfig(cfg))
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
 	return cmd.Run()
 }
 
-func parseArgs() (rootfs, home, cwd string, binds []string) {
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--rootfs":
-			i++
-			rootfs = args[i]
-		case "--home":
-			i++
-			home = args[i]
-		case "--cwd":
-			i++
-			cwd = args[i]
-		case "--bind":
-			i++
-			binds = append(binds, args[i])
-		}
-	}
-	return
-}
-
 func childMain() error {
-	rootfs, home, cwd, binds := parseArgs()
-
-	if err := syscall.Mount("/", rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("rbind / -> %s: %w", rootfs, err)
-	}
-	if err := syscall.Mount("", rootfs, "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("make-rslave %s: %w", rootfs, err)
+	cfg, err := loadConfig(childEnv)
+	if err != nil {
+		return err
 	}
 
-	homeInRoot := filepath.Join(rootfs, home)
+	if err := syscall.Mount("/", cfg.Rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("rbind / -> %s: %w", cfg.Rootfs, err)
+	}
+	if err := syscall.Mount("", cfg.Rootfs, "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("make-rslave %s: %w", cfg.Rootfs, err)
+	}
+
+	homeInRoot := filepath.Join(cfg.Rootfs, cfg.Home)
 	if err := os.MkdirAll(homeInRoot, 0755); err != nil {
 		return err
 	}
@@ -100,7 +107,7 @@ func childMain() error {
 		return fmt.Errorf("tmpfs %s: %w", homeInRoot, err)
 	}
 
-	tmpInRoot := filepath.Join(rootfs, "tmp")
+	tmpInRoot := filepath.Join(cfg.Rootfs, "tmp")
 	if err := os.MkdirAll(tmpInRoot, 0755); err != nil {
 		return err
 	}
@@ -108,8 +115,8 @@ func childMain() error {
 		return fmt.Errorf("tmpfs %s: %w", tmpInRoot, err)
 	}
 
-	for _, d := range binds {
-		dest := filepath.Join(rootfs, d)
+	for _, d := range cfg.Binds {
+		dest := filepath.Join(cfg.Rootfs, d)
 		if err := os.MkdirAll(dest, 0755); err != nil {
 			return err
 		}
@@ -122,10 +129,8 @@ func childMain() error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(self,
-		"--rootfs", rootfs, "--home", home, "--cwd", cwd,
-	)
-	cmd.Env = append(os.Environ(), initEnv+"=1")
+	cmd := exec.Command(self)
+	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWCGROUP,
 	}
@@ -142,13 +147,16 @@ func childMain() error {
 }
 
 func initMain() error {
-	rootfs, _, cwd, _ := parseArgs()
+	cfg, err := loadConfig(initEnv)
+	if err != nil {
+		return err
+	}
 
 	if err := syscall.Sethostname([]byte("runclaude")); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
 
-	procPath := filepath.Join(rootfs, "proc")
+	procPath := filepath.Join(cfg.Rootfs, "proc")
 	if err := os.MkdirAll(procPath, 0755); err != nil {
 		return err
 	}
@@ -157,20 +165,16 @@ func initMain() error {
 		return fmt.Errorf("mount proc: %w", err)
 	}
 
-	if err := syscall.Chroot(rootfs); err != nil {
-		return fmt.Errorf("chroot %s: %w", rootfs, err)
+	if err := syscall.Chroot(cfg.Rootfs); err != nil {
+		return fmt.Errorf("chroot %s: %w", cfg.Rootfs, err)
 	}
-	if err := os.Chdir(cwd); err != nil {
-		return fmt.Errorf("chdir %s: %w", cwd, err)
+	if err := os.Chdir(cfg.Cwd); err != nil {
+		return fmt.Errorf("chdir %s: %w", cfg.Cwd, err)
 	}
 
-	env := []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"TERM=" + os.Getenv("TERM"),
-		"HOME=" + os.Getenv("HOME"),
-		"USER=" + os.Getenv("USER"),
-	}
-	return syscall.Exec("/bin/sh", []string{"sh"}, env)
+	os.Unsetenv(childEnv)
+	os.Unsetenv(initEnv)
+	return syscall.Exec("/bin/bash", []string{"bash"}, os.Environ())
 }
 
 func main() {
