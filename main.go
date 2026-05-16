@@ -104,7 +104,7 @@ func mainErr() error {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
-		cfg.BashArgs = []string{"-c", "claude"}
+		cfg.BashArgs = []string{"-c", "claude --dangerously-skip-permissions"}
 	}
 
 	self, err := os.Executable()
