@@ -55,11 +55,13 @@ const (
 )
 
 type Config struct {
-	Rootfs    string   `json:"rootfs"`
-	Home      string   `json:"home"`
-	Cwd       string   `json:"cwd"`
-	Binds     []string `json:"binds"`
-	BashArgs  []string `json:"bashArgs"`
+	Rootfs          string   `json:"rootfs"`
+	Home            string   `json:"home"`
+	Cwd             string   `json:"cwd"`
+	Binds           []string `json:"binds"`
+	BashArgs        []string `json:"bashArgs"`
+	RestrictNet     bool     `json:"restrictNet"`
+	ExposeLocalhost bool     `json:"exposeLocalhost"`
 }
 
 func loadConfig(envName string) (*Config, error) {
@@ -123,13 +125,17 @@ func mainErr() error {
 	}
 
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the shell command")
+	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace with pasta providing user-mode networking")
+	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
 	flag.Parse()
 
 	cfg := &Config{
-		Rootfs: rootfs,
-		Home:   home,
-		Cwd:    cwd,
-		Binds:  []string{cwd},
+		Rootfs:          rootfs,
+		Home:            home,
+		Cwd:             cwd,
+		Binds:           []string{cwd},
+		RestrictNet:     *restrictNet,
+		ExposeLocalhost: *exposeLocalhost,
 	}
 	for _, a := range flag.Args() {
 		abs, err := filepath.Abs(a)
@@ -241,7 +247,19 @@ func childMain() error {
 	if err := os.MkdirAll(runUserInRoot, 0700); err != nil {
 		return err
 	}
-	if _, err := os.Stat("/run/systemd/resolve"); err == nil {
+	if cfg.RestrictNet {
+		// Host's resolver (typically 127.0.0.53) isn't reachable from the
+		// netns. Provide a stub-resolv.conf pointing at public resolvers
+		// that pasta will proxy via the host stack.
+		dest := filepath.Join(runInRoot, "systemd", "resolve")
+		if err := os.MkdirAll(dest, 0755); err != nil {
+			return err
+		}
+		stub := "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+		if err := os.WriteFile(filepath.Join(dest, "stub-resolv.conf"), []byte(stub), 0644); err != nil {
+			return err
+		}
+	} else if _, err := os.Stat("/run/systemd/resolve"); err == nil {
 		dest := filepath.Join(runInRoot, "systemd", "resolve")
 		if err := os.MkdirAll(dest, 0755); err != nil {
 			return err
@@ -276,6 +294,61 @@ func childMain() error {
 		}
 	}
 
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	var cmd *exec.Cmd
+	if cfg.RestrictNet {
+		hostToNs := "none"
+		if cfg.ExposeLocalhost {
+			hostToNs = "auto"
+		}
+		cmd = exec.Command("pasta",
+			"--config-net", "--no-map-gw", "--ipv4-only", "--netns-only",
+			"--quiet", "--log-file=/dev/null",
+			"-a", "100.64.0.2", "-n", "24", "-g", "100.64.0.1",
+			"-t", hostToNs, "-u", hostToNs, "-T", "none", "-U", "none",
+			"--runas", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+			"--", self, "--clone-init",
+		)
+	} else {
+		cmd = exec.Command(self, "--clone-init")
+	}
+	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		return err
+	}
+	return nil
+}
+
+// cloneInitMain runs after pasta (or directly) inside the netns, then clones
+// into a fresh PID/IPC/UTS/cgroup namespace to become the container's init.
+func cloneInitMain() error {
+	cfg, err := loadConfig(initEnv)
+	if err != nil {
+		return err
+	}
+	if cfg.RestrictNet {
+		blackhole := []string{
+			"10.0.0.0/8",
+			"172.16.0.0/12",
+			"192.168.0.0/16",
+			"169.254.169.254/32",
+		}
+		for _, r := range blackhole {
+			out, err := exec.Command("ip", "-4", "route", "add", "blackhole", r).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("ip route add blackhole %s: %w: %s", r, err, out)
+			}
+		}
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -340,8 +413,11 @@ func initMain() error {
 }
 
 func main() {
+	cloneInit := len(os.Args) > 1 && os.Args[1] == "--clone-init"
 	var err error
 	switch {
+	case os.Getenv(initEnv) != "" && cloneInit:
+		err = cloneInitMain()
 	case os.Getenv(initEnv) != "":
 		err = initMain()
 	case os.Getenv(childEnv) != "":
