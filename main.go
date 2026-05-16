@@ -135,7 +135,7 @@ func childMain() error {
 	}
 	for _, e := range entries {
 		src := "/" + e.Name()
-		if src == homePrefix || src == "/proc" || src == "/tmp" {
+		if src == homePrefix || src == "/proc" || src == "/tmp" || src == "/run" {
 			continue
 		}
 		dest := filepath.Join(cfg.Rootfs, src)
@@ -181,6 +181,27 @@ func childMain() error {
 	}
 	if err := syscall.Mount("tmpfs", tmpInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777"); err != nil {
 		return fmt.Errorf("tmpfs %s: %w", tmpInRoot, err)
+	}
+
+	runInRoot := filepath.Join(cfg.Rootfs, "run")
+	if err := os.MkdirAll(runInRoot, 0755); err != nil {
+		return err
+	}
+	if err := syscall.Mount("tmpfs", runInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"); err != nil {
+		return fmt.Errorf("tmpfs %s: %w", runInRoot, err)
+	}
+	runUserInRoot := filepath.Join(runInRoot, "user", fmt.Sprintf("%d", os.Getuid()))
+	if err := os.MkdirAll(runUserInRoot, 0700); err != nil {
+		return err
+	}
+	if _, err := os.Stat("/run/systemd/resolve"); err == nil {
+		dest := filepath.Join(runInRoot, "systemd", "resolve")
+		if err := os.MkdirAll(dest, 0755); err != nil {
+			return err
+		}
+		if err := syscall.Mount("/run/systemd/resolve", dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("rbind /run/systemd/resolve: %w", err)
+		}
 	}
 
 	for _, d := range cfg.Binds {
