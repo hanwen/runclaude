@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -11,13 +12,13 @@ import (
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func defaultSpec(rootPath string) *rspec.Spec {
+func defaultSpec(rootPath, cwd string) *rspec.Spec {
 	caps := []string{
 		"CAP_AUDIT_WRITE",
 		"CAP_KILL",
 		"CAP_NET_BIND_SERVICE",
 	}
-	return &rspec.Spec{
+	spec := &rspec.Spec{
 		Version: "1.2.1",
 		Process: &rspec.Process{
 			Terminal: true,
@@ -33,7 +34,7 @@ func defaultSpec(rootPath string) *rspec.Spec {
 				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 				"TERM=xterm",
 			},
-			Cwd: "/",
+			Cwd: cwd,
 			Capabilities: &rspec.LinuxCapabilities{
 				Bounding:  caps,
 				Effective: caps,
@@ -78,7 +79,7 @@ func defaultSpec(rootPath string) *rspec.Spec {
 					"newinstance",
 					"ptmxmode=0666",
 					"mode=0620",
-					"gid=5",
+					"gid=0",
 				},
 			},
 			{
@@ -105,9 +106,10 @@ func defaultSpec(rootPath string) *rspec.Spec {
 			},
 			{
 				Destination: "/sys",
-				Type:        "sysfs",
-				Source:      "sysfs",
+				Type:        "none",
+				Source:      "/sys",
 				Options: []string{
+					"rbind",
 					"nosuid",
 					"noexec",
 					"nodev",
@@ -127,6 +129,12 @@ func defaultSpec(rootPath string) *rspec.Spec {
 				},
 			}},
 		Linux: &rspec.Linux{
+			UIDMappings: []rspec.LinuxIDMapping{
+				{ContainerID: 0, HostID: 0, Size: 1},
+			},
+			GIDMappings: []rspec.LinuxIDMapping{
+				{ContainerID: 0, HostID: 0, Size: 1},
+			},
 			Resources: &rspec.LinuxResources{
 				Devices: []rspec.LinuxDeviceCgroup{
 					{Allow: false,
@@ -162,6 +170,8 @@ func defaultSpec(rootPath string) *rspec.Spec {
 				"/proc/sysrq-trigger",
 			},
 		}}
+
+	return spec
 }
 
 func ns(name string) rspec.LinuxNamespace {
@@ -171,12 +181,35 @@ func ns(name string) rspec.LinuxNamespace {
 }
 
 func mainErr() error {
-	d := defaultSpec("/")
-
 	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
+
+	rootfs := filepath.Join(dir, "rootfs")
+	if err := os.Mkdir(rootfs, 0755); err != nil {
+		return err
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	bindDirs := []string{cwd}
+	for _, a := range os.Args[1:] {
+		abs, err := filepath.Abs(a)
+		if err != nil {
+			return err
+		}
+		bindDirs = append(bindDirs, abs)
+	}
+
+	d := defaultSpec(rootfs, cwd)
 
 	data, err := json.Marshal(d)
 	if err != nil {
@@ -186,16 +219,28 @@ func mainErr() error {
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), data, 0644); err != nil {
 		return err
 	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
 	id := "claude-" + cwd
-	id = strings.Replace(id, "/", "_", -1)
-	cmd := exec.Command("runc", "--rootless=true", "run", "--bundle", dir, id)
+	id = strings.ReplaceAll(id, "/", "_")
+	var b strings.Builder
+	fmt.Fprintf(&b, "set -e\n")
+	fmt.Fprintf(&b, "mount --rbind / %q\n", rootfs)
+	fmt.Fprintf(&b, "mount --make-rslave %q\n", rootfs)
+	homeInRoot := filepath.Join(rootfs, home)
+	fmt.Fprintf(&b, "mkdir -p %q\n", homeInRoot)
+	fmt.Fprintf(&b, "mount -t tmpfs -o nosuid,nodev,mode=755 tmpfs %q\n", homeInRoot)
+	tmpInRoot := filepath.Join(rootfs, "tmp")
+	fmt.Fprintf(&b, "mkdir -p %q\n", tmpInRoot)
+	fmt.Fprintf(&b, "mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs %q\n", tmpInRoot)
+	for _, d := range bindDirs {
+		dest := filepath.Join(rootfs, d)
+		fmt.Fprintf(&b, "mkdir -p %q\n", dest)
+		fmt.Fprintf(&b, "mount --rbind %q %q\n", d, dest)
+	}
+	fmt.Fprintf(&b, "exec runc --rootless=true run --bundle %q %q\n", dir, id)
+	cmd := exec.Command("unshare", "--user", "--map-root-user", "--mount", "sh", "-c", b.String())
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
+	cmd.Stdin = os.Stdin
 	log.Printf("running %v", cmd.Args)
 	return cmd.Run()
 }
