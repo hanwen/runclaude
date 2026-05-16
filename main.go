@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -57,6 +59,7 @@ const (
 type Config struct {
 	Rootfs          string   `json:"rootfs"`
 	Home            string   `json:"home"`
+	CacheDir        string   `json:"cacheDir"`
 	Cwd             string   `json:"cwd"`
 	Binds           []string `json:"binds"`
 	BashArgs        []string `json:"bashArgs"`
@@ -129,9 +132,22 @@ func mainErr() error {
 	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
 	flag.Parse()
 
+	sum := sha256.Sum256([]byte(cwd))
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	cacheDir := filepath.Join(cacheBase, "runclaude", hex.EncodeToString(sum[:])[:16])
+	for _, sub := range []string{"home", "tmp", "run"} {
+		if err := os.MkdirAll(filepath.Join(cacheDir, sub), 0700); err != nil {
+			return err
+		}
+	}
+
 	cfg := &Config{
 		Rootfs:          rootfs,
 		Home:            home,
+		CacheDir:        cacheDir,
 		Cwd:             cwd,
 		Binds:           []string{cwd},
 		RestrictNet:     *restrictNet,
@@ -287,29 +303,31 @@ func childMain() error {
 		return err
 	}
 
-	homeInRoot := filepath.Join(cfg.Rootfs, cfg.Home)
-	if err := os.MkdirAll(homeInRoot, 0700); err != nil {
-		return err
+	type cacheMount struct {
+		dest, sub string
+		mode      os.FileMode
 	}
-	if err := syscall.Mount("tmpfs", homeInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"); err != nil {
-		return fmt.Errorf("tmpfs %s: %w", homeInRoot, err)
+	for _, m := range []cacheMount{
+		{cfg.Home, "home", 0700},
+		{"/tmp", "tmp", 01777},
+		{"/run", "run", 0755},
+	} {
+		src := filepath.Join(cfg.CacheDir, m.sub)
+		if err := os.Chmod(src, m.mode); err != nil {
+			return err
+		}
+		dst := filepath.Join(cfg.Rootfs, m.dest)
+		if err := os.MkdirAll(dst, 0755); err != nil {
+			return err
+		}
+		if err := syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("bind %s -> %s: %w", src, dst, err)
+		}
+		if err := syscall.Mount("", dst, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_NOSUID|syscall.MS_NODEV, ""); err != nil {
+			log.Printf("warning: remount-nosuid %s: %v", dst, err)
+		}
 	}
-
-	tmpInRoot := filepath.Join(cfg.Rootfs, "tmp")
-	if err := os.MkdirAll(tmpInRoot, 0755); err != nil {
-		return err
-	}
-	if err := syscall.Mount("tmpfs", tmpInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777"); err != nil {
-		return fmt.Errorf("tmpfs %s: %w", tmpInRoot, err)
-	}
-
 	runInRoot := filepath.Join(cfg.Rootfs, "run")
-	if err := os.MkdirAll(runInRoot, 0755); err != nil {
-		return err
-	}
-	if err := syscall.Mount("tmpfs", runInRoot, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"); err != nil {
-		return fmt.Errorf("tmpfs %s: %w", runInRoot, err)
-	}
 	runUserInRoot := filepath.Join(runInRoot, "user", fmt.Sprintf("%d", os.Getuid()))
 	if err := os.MkdirAll(runUserInRoot, 0700); err != nil {
 		return err
