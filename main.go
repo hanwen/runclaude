@@ -99,7 +99,6 @@ func encodeConfig(c *Config) string {
 	return string(data)
 }
 
-
 // credentialFiles is the set of files inside ~/.claude that hold auth tokens.
 // They are excluded from claudeBinds so the container can't read them.
 var credentialFiles = map[string]bool{
@@ -136,6 +135,38 @@ func claudeBinds(home string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// pathBinds returns directories from $PATH that live under a top-level dir the
+// rootfs setup does not bind-mount from / (i.e. under $HOME, /tmp, /run, /dev).
+// Everything else is already reachable through the recursive root rbinds.
+func pathBinds(home string) []string {
+	homePrefix := "/" + strings.SplitN(strings.TrimPrefix(home, "/"), "/", 2)[0]
+	needsBind := map[string]bool{homePrefix: true, "/tmp": true, "/run": true, "/dev": true}
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
+		if p == "" || !filepath.IsAbs(p) {
+			continue
+		}
+		abs := filepath.Clean(p)
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			abs = resolved
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		top := "/" + strings.SplitN(strings.TrimPrefix(abs, "/"), "/", 2)[0]
+		if !needsBind[top] {
+			continue
+		}
+		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+			continue
+		}
+		out = append(out, abs)
+	}
+	return out
 }
 
 // writeStubCredentials writes a fake .credentials.json into the container's
@@ -211,6 +242,7 @@ func mainErr() error {
 
 	var exposed stringSlice
 	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
+	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
@@ -394,6 +426,9 @@ func mainErr() error {
 		}
 		cfg.Binds = append(cfg.Binds, abs)
 	}
+	if *mapPath {
+		cfg.Binds = append(cfg.Binds, pathBinds(home)...)
+	}
 	if *claudeMode {
 		extra, err := claudeBinds(home)
 		if err != nil {
@@ -458,8 +493,8 @@ func scrubAWSCreds(env []string) []string {
 		"AWS_SECURITY_TOKEN":    true,
 		// AWS_PROFILE would have the SDK look in ~/.aws/credentials, which we
 		// haven't bound into the container; safer to force env-only creds.
-		"AWS_PROFILE":              true,
-		"AWS_CONFIG_FILE":          true,
+		"AWS_PROFILE":                 true,
+		"AWS_CONFIG_FILE":             true,
 		"AWS_SHARED_CREDENTIALS_FILE": true,
 	}
 	out := env[:0]
@@ -649,7 +684,12 @@ func childMain() error {
 		}
 	}
 
+	boundSeen := map[string]bool{}
 	for _, d := range cfg.Binds {
+		if boundSeen[d] {
+			continue
+		}
+		boundSeen[d] = true
 		dest := filepath.Join(cfg.Rootfs, d)
 		info, err := os.Stat(d)
 		if err != nil {
