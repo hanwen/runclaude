@@ -6,14 +6,27 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
+
+var defaultAllowedDomains = []string{
+	"api.anthropic.com",
+	"github.com", "*.github.com",
+	"registry.npmjs.org",
+	"pypi.org", "*.pypi.org", "files.pythonhosted.org",
+	"crates.io", "static.crates.io",
+	"proxy.golang.org", "sum.golang.org", "go.dev",
+}
 
 const (
 	prSetNoNewPrivs      = 38
@@ -65,6 +78,8 @@ type Config struct {
 	BashArgs        []string `json:"bashArgs"`
 	RestrictNet     bool     `json:"restrictNet"`
 	ExposeLocalhost bool     `json:"exposeLocalhost"`
+	AllowedDomains  []string `json:"allowedDomains"`
+	ProxyPort       int      `json:"proxyPort"`
 }
 
 func loadConfig(envName string) (*Config, error) {
@@ -81,6 +96,103 @@ func encodeConfig(c *Config) string {
 		panic(err)
 	}
 	return string(data)
+}
+
+func enforceAllowlist(cfg *Config) bool {
+	return cfg.RestrictNet && len(cfg.AllowedDomains) > 0
+}
+
+func matchDomain(host string, patterns []string) bool {
+	host = strings.ToLower(host)
+	for _, p := range patterns {
+		p = strings.ToLower(p)
+		if p == host {
+			return true
+		}
+		if strings.HasPrefix(p, "*.") {
+			base := p[2:]
+			if host == base || strings.HasSuffix(host, "."+base) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func startProxy(allowed []string) (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !matchDomain(host, allowed) {
+			log.Printf("proxy: deny %s %s", r.Method, host)
+			http.Error(w, "denied by runclaude allowlist", http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodConnect {
+			proxyConnect(w, r)
+		} else {
+			proxyHTTP(w, r)
+		}
+	})
+
+	srv := &http.Server{Handler: handler, ReadTimeout: 0, WriteTimeout: 0}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("proxy: %v", err)
+		}
+	}()
+	return port, nil
+}
+
+func proxyConnect(w http.ResponseWriter, r *http.Request) {
+	upstream, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		upstream.Close()
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	client, _, err := hj.Hijack()
+	if err != nil {
+		upstream.Close()
+		return
+	}
+	fmt.Fprint(client, "HTTP/1.1 200 OK\r\n\r\n")
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(upstream, client); done <- struct{}{} }()
+	go func() { io.Copy(client, upstream); done <- struct{}{} }()
+	<-done
+	upstream.Close()
+	client.Close()
+}
+
+func proxyHTTP(w http.ResponseWriter, r *http.Request) {
+	r.RequestURI = ""
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func claudeBinds(home string) ([]string, error) {
@@ -130,7 +242,17 @@ func mainErr() error {
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the shell command")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace with pasta providing user-mode networking")
 	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
+	allowDomain := flag.String("allow-domain",
+		strings.Join(defaultAllowedDomains, ","),
+		"comma-separated allowlist of egress domains; empty disables allowlist enforcement")
 	flag.Parse()
+
+	var allowedDomains []string
+	for _, d := range strings.Split(*allowDomain, ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			allowedDomains = append(allowedDomains, d)
+		}
+	}
 
 	sum := sha256.Sum256([]byte(cwd))
 	cacheBase, err := os.UserCacheDir()
@@ -152,6 +274,14 @@ func mainErr() error {
 		Binds:           []string{cwd},
 		RestrictNet:     *restrictNet,
 		ExposeLocalhost: *exposeLocalhost,
+		AllowedDomains:  allowedDomains,
+	}
+	if enforceAllowlist(cfg) {
+		port, err := startProxy(allowedDomains)
+		if err != nil {
+			return fmt.Errorf("start proxy: %w", err)
+		}
+		cfg.ProxyPort = port
 	}
 	for _, a := range flag.Args() {
 		abs, err := filepath.Abs(a)
@@ -392,11 +522,15 @@ func childMain() error {
 		if cfg.ExposeLocalhost {
 			hostToNs = "auto"
 		}
+		nsToHostTCP := "none"
+		if enforceAllowlist(cfg) {
+			nsToHostTCP = fmt.Sprintf("%d", cfg.ProxyPort)
+		}
 		cmd = exec.Command("pasta",
 			"--config-net", "--no-map-gw", "--ipv4-only", "--netns-only",
 			"--quiet", "--log-file=/dev/null",
 			"-a", "100.64.0.2", "-n", "24", "-g", "100.64.0.1",
-			"-t", hostToNs, "-u", hostToNs, "-T", "none", "-U", "none",
+			"-t", hostToNs, "-u", hostToNs, "-T", nsToHostTCP, "-U", "none",
 			"--runas", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 			"--", self, "--clone-init",
 		)
@@ -435,6 +569,23 @@ func cloneInitMain() error {
 			if err != nil {
 				return fmt.Errorf("ip route add blackhole %s: %w: %s", r, err, out)
 			}
+		}
+	}
+	if enforceAllowlist(cfg) {
+		rules := fmt.Sprintf(`
+			table inet runclaude {
+				chain output {
+					type filter hook output priority filter; policy drop;
+					oif lo accept
+					ip daddr 100.64.0.0/24 tcp dport %d accept
+					ip daddr {1.1.1.1, 8.8.8.8} udp dport 53 accept
+					ip daddr {1.1.1.1, 8.8.8.8} tcp dport 53 accept
+				}
+			}`, cfg.ProxyPort)
+		nft := exec.Command("nft", "-f", "-")
+		nft.Stdin = strings.NewReader(rules)
+		if out, err := nft.CombinedOutput(); err != nil {
+			return fmt.Errorf("nft: %w: %s", err, out)
 		}
 	}
 	self, err := os.Executable()
@@ -496,6 +647,15 @@ func initMain() error {
 
 	os.Unsetenv(childEnv)
 	os.Unsetenv(initEnv)
+	if enforceAllowlist(cfg) {
+		proxy := fmt.Sprintf("http://127.0.0.1:%d", cfg.ProxyPort)
+		os.Setenv("HTTP_PROXY", proxy)
+		os.Setenv("HTTPS_PROXY", proxy)
+		os.Setenv("http_proxy", proxy)
+		os.Setenv("https_proxy", proxy)
+		os.Setenv("NO_PROXY", "")
+		os.Setenv("no_proxy", "")
+	}
 	argv := append([]string{"bash"}, cfg.BashArgs...)
 	return syscall.Exec("/bin/bash", argv, os.Environ())
 }
