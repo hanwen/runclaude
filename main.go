@@ -1,19 +1,30 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -79,7 +90,10 @@ type Config struct {
 	RestrictNet     bool     `json:"restrictNet"`
 	ExposeLocalhost bool     `json:"exposeLocalhost"`
 	AllowedDomains  []string `json:"allowedDomains"`
+	MitmDomains     []string `json:"mitmDomains"`
 	ProxyPort       int      `json:"proxyPort"`
+	BundlePath      string   `json:"bundlePath"`
+	CAPath          string   `json:"caPath"`
 }
 
 type stringSlice []string
@@ -120,7 +134,116 @@ func encodeConfig(c *Config) string {
 }
 
 func enforceAllowlist(cfg *Config) bool {
-	return cfg.RestrictNet && len(cfg.AllowedDomains) > 0
+	return cfg.RestrictNet && (len(cfg.AllowedDomains) > 0 || len(cfg.MitmDomains) > 0)
+}
+
+func loadOrCreateCA(dir string) (*tls.Certificate, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	crtPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if _, err := os.Stat(crtPath); err == nil {
+		cert, err := tls.LoadX509KeyPair(crtPath, keyPath)
+		if err != nil {
+			return nil, err
+		}
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return nil, err
+		}
+		cert.Leaf = leaf
+		return &cert, nil
+	}
+	priv, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		return nil, err
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "runclaude CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+	crtPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	if err := os.WriteFile(crtPath, crtPEM, 0644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		return nil, err
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv, Leaf: leaf}, nil
+}
+
+func writeBundle(caCertPEM []byte, dst string) error {
+	var sys []byte
+	for _, p := range []string{
+		"/etc/ssl/certs/ca-bundle.crt",
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/cert.pem",
+	} {
+		if b, err := os.ReadFile(p); err == nil {
+			sys = b
+			break
+		}
+	}
+	out := append(append([]byte(nil), sys...), '\n')
+	out = append(out, caCertPEM...)
+	return os.WriteFile(dst, out, 0644)
+}
+
+type leafCache struct {
+	mu sync.Mutex
+	m  map[string]*tls.Certificate
+	ca *tls.Certificate
+}
+
+func newLeafCache(ca *tls.Certificate) *leafCache {
+	return &leafCache{m: map[string]*tls.Certificate{}, ca: ca}
+}
+
+func (c *leafCache) get(host string) (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cert, ok := c.m[host]; ok {
+		return cert, nil
+	}
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	serial := big.NewInt(mathrand.Int63())
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{host},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, c.ca.Leaf, &priv.PublicKey, c.ca.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+	cert := &tls.Certificate{
+		Certificate: [][]byte{der, c.ca.Certificate[0]},
+		PrivateKey:  priv,
+	}
+	c.m[host] = cert
+	return cert, nil
 }
 
 func matchDomain(host string, patterns []string) bool {
@@ -140,7 +263,23 @@ func matchDomain(host string, patterns []string) bool {
 	return false
 }
 
-func startProxy(allowed []string) (int, error) {
+type proxySetup struct {
+	allowed []string
+	mitm    []string
+	leaves  *leafCache
+	inject  func(host string, r *http.Request)
+}
+
+func startProxy(p *proxySetup, logPath string) (int, error) {
+	logger := log.New(io.Discard, "proxy: ", log.LstdFlags|log.Lmicroseconds)
+	if logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return 0, fmt.Errorf("open proxy log: %w", err)
+		}
+		logger = log.New(f, "proxy: ", log.LstdFlags|log.Lmicroseconds)
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
@@ -152,28 +291,135 @@ func startProxy(allowed []string) (int, error) {
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
-		if !matchDomain(host, allowed) {
-			log.Printf("proxy: deny %s %s", r.Method, host)
+		switch {
+		case matchDomain(host, p.mitm):
+			logger.Printf("mitm  %s %s", r.Method, host)
+			if r.Method != http.MethodConnect {
+				p.inject(host, r)
+				proxyHTTP(w, r, logger)
+				return
+			}
+			proxyMitm(w, r, host, p.leaves, p.inject, logger)
+		case matchDomain(host, p.allowed):
+			logger.Printf("allow %s %s", r.Method, host)
+			if r.Method == http.MethodConnect {
+				proxyConnect(w, r, logger)
+			} else {
+				proxyHTTP(w, r, logger)
+			}
+		default:
+			logger.Printf("deny  %s %s", r.Method, host)
 			http.Error(w, "denied by runclaude allowlist", http.StatusForbidden)
-			return
-		}
-		if r.Method == http.MethodConnect {
-			proxyConnect(w, r)
-		} else {
-			proxyHTTP(w, r)
 		}
 	})
 
 	srv := &http.Server{Handler: handler, ReadTimeout: 0, WriteTimeout: 0}
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("proxy: %v", err)
+			logger.Printf("server: %v", err)
 		}
 	}()
 	return port, nil
 }
 
-func proxyConnect(w http.ResponseWriter, r *http.Request) {
+type singleConnListener struct {
+	conn  net.Conn
+	block chan struct{}
+	once  sync.Once
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if l.conn != nil {
+		c := l.conn
+		l.conn = nil
+		return c, nil
+	}
+	<-l.block
+	return nil, io.EOF
+}
+func (l *singleConnListener) Close() error {
+	l.once.Do(func() { close(l.block) })
+	return nil
+}
+func (l *singleConnListener) Addr() net.Addr { return dummyAddr{} }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "127.0.0.1:0" }
+
+func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), logger *log.Logger) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	client, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	fmt.Fprint(client, "HTTP/1.1 200 OK\r\n\r\n")
+
+	leaf, err := leaves.get(host)
+	if err != nil {
+		logger.Printf("mint leaf for %s: %v", host, err)
+		client.Close()
+		return
+	}
+	tlsConn := tls.Server(client, &tls.Config{
+		Certificates: []tls.Certificate{*leaf},
+		NextProtos:   []string{"http/1.1"},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		logger.Printf("mitm handshake %s: %v", host, err)
+		tlsConn.Close()
+		return
+	}
+
+	target, _ := url.Parse("https://" + host)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	origDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = host
+		req.Header.Del("Proxy-Connection")
+		inject(host, req)
+		logger.Printf("mitm req  %s %s", req.Method, req.URL.String())
+	}
+	rp.FlushInterval = 50 * time.Millisecond
+	rp.ErrorLog = logger
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Printf("mitm upstream %s %s: %v", host, r.URL.Path, err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+	}
+
+	logger.Printf("mitm tls  %s alpn=%q", host, tlsConn.ConnectionState().NegotiatedProtocol)
+	ln := &singleConnListener{conn: tlsConn, block: make(chan struct{})}
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	srv := &http.Server{
+		Handler:  rp,
+		ErrorLog: logger,
+		ConnState: func(c net.Conn, s http.ConnState) {
+			logger.Printf("mitm conn %s -> %s", host, s)
+			if s == http.StateClosed || s == http.StateHijacked {
+				closeOnce.Do(func() {
+					ln.Close()
+					close(done)
+				})
+			}
+		},
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != io.EOF {
+			logger.Printf("mitm serve %s: %v", host, err)
+		}
+	}()
+	<-done
+	tlsConn.Close()
+}
+
+func proxyConnect(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
 	upstream, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -199,7 +445,7 @@ func proxyConnect(w http.ResponseWriter, r *http.Request) {
 	client.Close()
 }
 
-func proxyHTTP(w http.ResponseWriter, r *http.Request) {
+func proxyHTTP(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
 	r.RequestURI = ""
 	resp, err := http.DefaultTransport.RoundTrip(r)
 	if err != nil {
@@ -216,12 +462,28 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+// credentialFiles is the set of files inside ~/.claude that hold auth tokens.
+// They are excluded from claudeBinds so the container can't read them.
+var credentialFiles = map[string]bool{
+	".credentials.json": true,
+	"credentials.json":  true,
+}
+
 func claudeBinds(home string) ([]string, error) {
-	binds := []string{
-		filepath.Join(home, ".claude"),
+	var binds []string
+	claudeDir := filepath.Join(home, ".claude")
+	if entries, err := os.ReadDir(claudeDir); err == nil {
+		for _, e := range entries {
+			if credentialFiles[e.Name()] {
+				continue
+			}
+			binds = append(binds, filepath.Join(claudeDir, e.Name()))
+		}
+	}
+	binds = append(binds,
 		filepath.Join(home, ".claude.json"),
 		filepath.Join(home, ".config", "claude"),
-	}
+	)
 	claude, err := exec.LookPath("claude")
 	if err == nil {
 		binds = append(binds, filepath.Dir(claude))
@@ -236,6 +498,55 @@ func claudeBinds(home string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// writeStubCredentials writes a fake .credentials.json into the container's
+// $HOME/.claude/ so claude believes it is logged in. The real credential lives
+// only in the host proxy's memory and is injected by the MITM layer.
+func writeStubCredentials(claudeDir string) error {
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		return err
+	}
+	stub := `{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-runclaude-stub",
+    "refreshToken": "sk-ant-ort01-runclaude-stub",
+    "expiresAt": 99999999999000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "pro"
+  }
+}
+`
+	return os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), []byte(stub), 0600)
+}
+
+// readClaudeAuth returns either an OAuth bearer token or an API key extracted
+// from ~/.claude/.credentials.json (preferred) or $ANTHROPIC_API_KEY.
+func readClaudeAuth(home string) (apiKey, bearer string, err error) {
+	for _, name := range []string{".credentials.json", "credentials.json"} {
+		data, rerr := os.ReadFile(filepath.Join(home, ".claude", name))
+		if rerr != nil {
+			continue
+		}
+		var creds struct {
+			ClaudeAiOauth struct {
+				AccessToken string `json:"accessToken"`
+			} `json:"claudeAiOauth"`
+			APIKey string `json:"apiKey"`
+		}
+		if json.Unmarshal(data, &creds) == nil {
+			if creds.ClaudeAiOauth.AccessToken != "" {
+				return "", creds.ClaudeAiOauth.AccessToken, nil
+			}
+			if creds.APIKey != "" {
+				return creds.APIKey, "", nil
+			}
+		}
+	}
+	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
+		return k, "", nil
+	}
+	return "", "", fmt.Errorf("no claude credentials found (looked in ~/.claude/.credentials.json and $ANTHROPIC_API_KEY)")
 }
 
 func mainErr() error {
@@ -268,11 +579,35 @@ func mainErr() error {
 	var allowDomain domainList
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
+	injectAuth := flag.Bool("inject-auth", false,
+		"MITM api.anthropic.com and inject $ANTHROPIC_API_KEY when the client doesn't supply credentials")
 	flag.Parse()
 
 	allowedDomains := allowDomain.items
 	if !allowDomain.set {
 		allowedDomains = defaultAllowedDomains
+	}
+
+	var (
+		mitmDomains []string
+		apiKey      string
+		bearer      string
+	)
+	if *injectAuth || *claudeMode {
+		var err error
+		apiKey, bearer, err = readClaudeAuth(home)
+		if err != nil {
+			if *injectAuth {
+				return fmt.Errorf("--inject-auth: %w", err)
+			}
+			// --claude without credentials: continue without injection.
+			log.Printf("warning: --claude: %v", err)
+		} else {
+			mitmDomains = append(mitmDomains, "api.anthropic.com")
+			if !matchDomain("api.anthropic.com", allowedDomains) {
+				allowedDomains = append(allowedDomains, "api.anthropic.com")
+			}
+		}
 	}
 
 	sum := sha256.Sum256([]byte(cwd))
@@ -296,13 +631,57 @@ func mainErr() error {
 		RestrictNet:     *restrictNet,
 		ExposeLocalhost: *exposeLocalhost,
 		AllowedDomains:  allowedDomains,
+		MitmDomains:     mitmDomains,
 	}
 	if enforceAllowlist(cfg) {
-		port, err := startProxy(allowedDomains)
+		setup := &proxySetup{
+			allowed: allowedDomains,
+			mitm:    mitmDomains,
+			inject:  func(string, *http.Request) {},
+		}
+		if len(mitmDomains) > 0 {
+			ca, err := loadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
+			if err != nil {
+				return fmt.Errorf("load CA: %w", err)
+			}
+			caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Leaf.Raw})
+			caCopy := filepath.Join(cacheDir, "tmp", "runclaude-ca.crt")
+			if err := os.WriteFile(caCopy, caPEM, 0644); err != nil {
+				return err
+			}
+			bundleCopy := filepath.Join(cacheDir, "tmp", "runclaude-bundle.crt")
+			if err := writeBundle(caPEM, bundleCopy); err != nil {
+				return err
+			}
+			cfg.BundlePath = "/tmp/runclaude-bundle.crt"
+			cfg.CAPath = "/tmp/runclaude-ca.crt"
+			setup.leaves = newLeafCache(ca)
+			setup.inject = func(host string, r *http.Request) {
+				if host != "api.anthropic.com" {
+					return
+				}
+				// Always overwrite: the client may have a stub or expired token
+				// from a credentials file we declined to bind into the container.
+				r.Header.Del("Authorization")
+				r.Header.Del("x-api-key")
+				switch {
+				case bearer != "":
+					r.Header.Set("Authorization", "Bearer "+bearer)
+				case apiKey != "":
+					r.Header.Set("x-api-key", apiKey)
+				}
+				if r.Header.Get("anthropic-version") == "" {
+					r.Header.Set("anthropic-version", "2023-06-01")
+				}
+			}
+		}
+		logPath := filepath.Join(cacheDir, "proxy.log")
+		port, err := startProxy(setup, logPath)
 		if err != nil {
 			return fmt.Errorf("start proxy: %w", err)
 		}
 		cfg.ProxyPort = port
+		log.Printf("proxy log: %s", logPath)
 	}
 	for _, e := range exposed {
 		abs, err := filepath.Abs(e)
@@ -318,6 +697,11 @@ func mainErr() error {
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
 		cfg.Command = []string{"claude", "--dangerously-skip-permissions"}
+		if bearer != "" || apiKey != "" {
+			if err := writeStubCredentials(filepath.Join(cacheDir, "home", ".claude")); err != nil {
+				return err
+			}
+		}
 	}
 	if args := flag.Args(); len(args) > 0 {
 		cfg.Command = args
@@ -682,6 +1066,16 @@ func initMain() error {
 		os.Setenv("https_proxy", proxy)
 		os.Setenv("NO_PROXY", "")
 		os.Setenv("no_proxy", "")
+	}
+	if cfg.BundlePath != "" {
+		os.Setenv("SSL_CERT_FILE", cfg.BundlePath)
+		os.Setenv("REQUESTS_CA_BUNDLE", cfg.BundlePath)
+		os.Setenv("CURL_CA_BUNDLE", cfg.BundlePath)
+		os.Setenv("GIT_SSL_CAINFO", cfg.BundlePath)
+	}
+	if cfg.CAPath != "" {
+		// Node wants only the *extra* CAs, not the whole system bundle.
+		os.Setenv("NODE_EXTRA_CA_CERTS", cfg.CAPath)
 	}
 	bin, err := exec.LookPath(cfg.Command[0])
 	if err != nil {
