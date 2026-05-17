@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -25,6 +28,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
 
 var defaultAllowedDomains = []string{
@@ -56,16 +62,46 @@ func enforceAllowlist(cfg *Config) bool {
 	return cfg.RestrictNet && (len(cfg.AllowedDomains) > 0 || len(cfg.MitmDomains) > 0)
 }
 
+// matchDomain reports whether host matches any of patterns.
+//
+//   - exact "api.anthropic.com"          matches only that hostname
+//   - leading "*.github.com"             matches "github.com" and any
+//                                        subdomain at any depth (legacy form)
+//   - mid-label "bedrock-runtime.*.amazonaws.com"
+//                                        each "*" label matches exactly one
+//                                        DNS label
 func matchDomain(host string, patterns []string) bool {
 	host = strings.ToLower(host)
 	for _, p := range patterns {
-		p = strings.ToLower(p)
-		if p == host {
+		if matchPattern(host, strings.ToLower(p)) {
 			return true
 		}
-		if strings.HasPrefix(p, "*.") {
-			base := p[2:]
-			if host == base || strings.HasSuffix(host, "."+base) {
+	}
+	return false
+}
+
+func matchPattern(host, pattern string) bool {
+	if pattern == host {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		base := pattern[2:]
+		if host == base || strings.HasSuffix(host, "."+base) {
+			return true
+		}
+	}
+	if strings.Contains(pattern, "*") {
+		pParts := strings.Split(pattern, ".")
+		hParts := strings.Split(host, ".")
+		if len(pParts) == len(hParts) {
+			match := true
+			for i := range pParts {
+				if pParts[i] != "*" && pParts[i] != hParts[i] {
+					match = false
+					break
+				}
+			}
+			if match {
 				return true
 			}
 		}
@@ -645,4 +681,65 @@ func setupNetwork(cfg *Config) (int, error) {
 		return 0, fmt.Errorf("nft: %w: %s", err, out)
 	}
 	return port, nil
+}
+
+// ---------- AWS Bedrock (SigV4) ----------
+
+func isBedrockHost(host string) bool {
+	return strings.HasPrefix(host, "bedrock-runtime.") &&
+		strings.HasSuffix(host, ".amazonaws.com")
+}
+
+func bedrockRegion(host string) string {
+	if !isBedrockHost(host) {
+		return ""
+	}
+	mid := strings.TrimSuffix(strings.TrimPrefix(host, "bedrock-runtime."), ".amazonaws.com")
+	if strings.Contains(mid, ".") {
+		return ""
+	}
+	return mid
+}
+
+// injectBedrock re-signs an in-flight request using host-side AWS credentials.
+// The client (e.g., claude code's @aws-sdk/client-bedrock-runtime) may have
+// signed with stub credentials we set in the container env; we strip those and
+// recompute SigV4 against the real credentials. Body is unchanged.
+func injectBedrock(host string, r *http.Request, provider aws.CredentialsProvider, signer *v4.Signer, logger *log.Logger) {
+	region := bedrockRegion(host)
+	if region == "" {
+		logger.Printf("bedrock: malformed host %q", host)
+		return
+	}
+	for _, h := range []string{
+		"Authorization",
+		"X-Amz-Date",
+		"X-Amz-Security-Token",
+		"X-Amz-Content-Sha256",
+	} {
+		r.Header.Del(h)
+	}
+	var body []byte
+	if r.Body != nil {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.Printf("bedrock: read body: %v", err)
+			return
+		}
+		body = b
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	ctx := r.Context()
+	creds, err := provider.Retrieve(ctx)
+	if err != nil {
+		logger.Printf("bedrock: retrieve credentials: %v", err)
+		return
+	}
+	if err := signer.SignHTTP(ctx, creds, r, hash, "bedrock", region, time.Now()); err != nil {
+		logger.Printf("bedrock: sign: %v", err)
+		return
+	}
 }

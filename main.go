@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,10 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
 const (
@@ -227,14 +232,14 @@ func mainErr() error {
 		apiKey      string
 		bearer      string
 	)
-	if *injectAuth || *claudeMode {
+	useBedrock := *claudeMode && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
+	if *injectAuth || (*claudeMode && !useBedrock) {
 		var err error
 		apiKey, bearer, err = readClaudeAuth(home)
 		if err != nil {
 			if *injectAuth {
 				return fmt.Errorf("--inject-auth: %w", err)
 			}
-			// --claude without credentials: continue without injection.
 			log.Printf("warning: --claude: %v", err)
 		} else {
 			mitmDomains = append(mitmDomains, "api.anthropic.com")
@@ -242,6 +247,22 @@ func mainErr() error {
 				allowedDomains = append(allowedDomains, "api.anthropic.com")
 			}
 		}
+	}
+	var awsSigner *v4.Signer
+	var awsCreds aws.CredentialsProvider
+	if useBedrock {
+		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: load AWS config: %w", err)
+		}
+		if _, err := awsCfg.Credentials.Retrieve(context.Background()); err != nil {
+			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: %w (try 'aws sso login')", err)
+		}
+		awsCreds = awsCfg.Credentials
+		awsSigner = v4.NewSigner()
+		pattern := "bedrock-runtime.*.amazonaws.com"
+		mitmDomains = append(mitmDomains, pattern)
+		allowedDomains = append(allowedDomains, pattern)
 	}
 
 	sum := sha256.Sum256([]byte(cwd))
@@ -272,6 +293,16 @@ func mainErr() error {
 	var commHostEnd *os.File
 	var commChildFile *os.File
 	if enforceAllowlist(cfg) {
+		logPath := *proxyLog
+		if logPath == "" {
+			logPath = filepath.Join(cacheDir, "proxy.log")
+		}
+		logger, err := openProxyLogger(logPath)
+		if err != nil {
+			return err
+		}
+		log.Printf("proxy log: %s", logPath)
+
 		setup := &proxySetup{
 			allowed: allowedDomains,
 			mitm:    mitmDomains,
@@ -295,31 +326,23 @@ func mainErr() error {
 			cfg.CAPath = "/tmp/runclaude-ca.crt"
 			setup.leaves = newLeafCache(ca)
 			setup.inject = func(host string, r *http.Request) {
-				if host != "api.anthropic.com" {
-					return
-				}
-				r.Header.Del("Authorization")
-				r.Header.Del("x-api-key")
 				switch {
-				case bearer != "":
-					r.Header.Set("Authorization", "Bearer "+bearer)
-				case apiKey != "":
-					r.Header.Set("x-api-key", apiKey)
-				}
-				if r.Header.Get("anthropic-version") == "" {
-					r.Header.Set("anthropic-version", "2023-06-01")
+				case host == "api.anthropic.com" && (bearer != "" || apiKey != ""):
+					r.Header.Del("Authorization")
+					r.Header.Del("x-api-key")
+					if bearer != "" {
+						r.Header.Set("Authorization", "Bearer "+bearer)
+					} else {
+						r.Header.Set("x-api-key", apiKey)
+					}
+					if r.Header.Get("anthropic-version") == "" {
+						r.Header.Set("anthropic-version", "2023-06-01")
+					}
+				case isBedrockHost(host) && awsCreds != nil:
+					injectBedrock(host, r, awsCreds, awsSigner, logger)
 				}
 			}
 		}
-		logPath := *proxyLog
-		if logPath == "" {
-			logPath = filepath.Join(cacheDir, "proxy.log")
-		}
-		logger, err := openProxyLogger(logPath)
-		if err != nil {
-			return err
-		}
-		log.Printf("proxy log: %s", logPath)
 
 		sp, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 		if err != nil {
@@ -399,7 +422,18 @@ func mainErr() error {
 		"--user", "--map-current-user", "--map-auto", "--keep-caps", "--mount",
 		"--", self,
 	)
-	cmd.Env = append(os.Environ(), childEnv+"="+encodeConfig(cfg))
+	containerEnv := os.Environ()
+	if useBedrock {
+		containerEnv = scrubAWSCreds(containerEnv)
+		// Stub credentials so the in-container aws-sdk doesn't refuse to
+		// construct a request. The MITM strips these and signs with the real
+		// host credentials before forwarding.
+		containerEnv = append(containerEnv,
+			"AWS_ACCESS_KEY_ID=AKIA000RUNCLAUDESTUB",
+			"AWS_SECRET_ACCESS_KEY=runclaude-stub-secret-do-not-use",
+		)
+	}
+	cmd.Env = append(containerEnv, childEnv+"="+encodeConfig(cfg))
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
@@ -411,6 +445,35 @@ func mainErr() error {
 		commChildFile.Close()
 	}
 	return err
+}
+
+// scrubAWSCreds returns env without any AWS credential-bearing variables.
+// AWS_REGION / AWS_PROFILE / AWS_DEFAULT_REGION are kept so the in-container
+// aws-sdk still knows which region to target.
+func scrubAWSCreds(env []string) []string {
+	skip := map[string]bool{
+		"AWS_ACCESS_KEY_ID":     true,
+		"AWS_SECRET_ACCESS_KEY": true,
+		"AWS_SESSION_TOKEN":     true,
+		"AWS_SECURITY_TOKEN":    true,
+		// AWS_PROFILE would have the SDK look in ~/.aws/credentials, which we
+		// haven't bound into the container; safer to force env-only creds.
+		"AWS_PROFILE":              true,
+		"AWS_CONFIG_FILE":          true,
+		"AWS_SHARED_CREDENTIALS_FILE": true,
+	}
+	out := env[:0]
+	for _, e := range env {
+		name := e
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			name = e[:i]
+		}
+		if skip[name] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 func setupDev(rootfs string) error {
