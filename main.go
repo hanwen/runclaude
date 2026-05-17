@@ -581,6 +581,8 @@ func mainErr() error {
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
 	injectAuth := flag.Bool("inject-auth", false,
 		"MITM api.anthropic.com and inject $ANTHROPIC_API_KEY when the client doesn't supply credentials")
+	proxyLog := flag.String("proxy-log", "",
+		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	flag.Parse()
 
 	allowedDomains := allowDomain.items
@@ -675,7 +677,10 @@ func mainErr() error {
 				}
 			}
 		}
-		logPath := filepath.Join(cacheDir, "proxy.log")
+		logPath := *proxyLog
+		if logPath == "" {
+			logPath = filepath.Join(cacheDir, "proxy.log")
+		}
 		port, err := startProxy(setup, logPath)
 		if err != nil {
 			return fmt.Errorf("start proxy: %w", err)
