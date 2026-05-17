@@ -87,6 +87,22 @@ type stringSlice []string
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
+// domainList tracks whether the user explicitly passed --allow-domain
+// (possibly with an empty value) so we know not to fall back to defaults.
+type domainList struct {
+	items []string
+	set   bool
+}
+
+func (d *domainList) String() string { return strings.Join(d.items, ",") }
+func (d *domainList) Set(v string) error {
+	d.set = true
+	if v != "" {
+		d.items = append(d.items, v)
+	}
+	return nil
+}
+
 func loadConfig(envName string) (*Config, error) {
 	var c Config
 	if err := json.Unmarshal([]byte(os.Getenv(envName)), &c); err != nil {
@@ -249,16 +265,14 @@ func mainErr() error {
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace with pasta providing user-mode networking")
 	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
-	allowDomain := flag.String("allow-domain",
-		strings.Join(defaultAllowedDomains, ","),
-		"comma-separated allowlist of egress domains; empty disables allowlist enforcement")
+	var allowDomain domainList
+	flag.Var(&allowDomain, "allow-domain",
+		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
 	flag.Parse()
 
-	var allowedDomains []string
-	for _, d := range strings.Split(*allowDomain, ",") {
-		if d = strings.TrimSpace(d); d != "" {
-			allowedDomains = append(allowedDomains, d)
-		}
+	allowedDomains := allowDomain.items
+	if !allowDomain.set {
+		allowedDomains = defaultAllowedDomains
 	}
 
 	sum := sha256.Sum256([]byte(cwd))
