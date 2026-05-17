@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -81,19 +83,17 @@ const (
 )
 
 type Config struct {
-	Rootfs          string   `json:"rootfs"`
-	Home            string   `json:"home"`
-	CacheDir        string   `json:"cacheDir"`
-	Cwd             string   `json:"cwd"`
-	Binds           []string `json:"binds"`
-	Command         []string `json:"command"`
-	RestrictNet     bool     `json:"restrictNet"`
-	ExposeLocalhost bool     `json:"exposeLocalhost"`
-	AllowedDomains  []string `json:"allowedDomains"`
-	MitmDomains     []string `json:"mitmDomains"`
-	ProxyPort       int      `json:"proxyPort"`
-	BundlePath      string   `json:"bundlePath"`
-	CAPath          string   `json:"caPath"`
+	Rootfs         string   `json:"rootfs"`
+	Home           string   `json:"home"`
+	CacheDir       string   `json:"cacheDir"`
+	Cwd            string   `json:"cwd"`
+	Binds          []string `json:"binds"`
+	Command        []string `json:"command"`
+	RestrictNet    bool     `json:"restrictNet"`
+	AllowedDomains []string `json:"allowedDomains"`
+	MitmDomains    []string `json:"mitmDomains"`
+	BundlePath     string   `json:"bundlePath"`
+	CAPath         string   `json:"caPath"`
 }
 
 type stringSlice []string
@@ -270,22 +270,18 @@ type proxySetup struct {
 	inject  func(host string, r *http.Request)
 }
 
-func startProxy(p *proxySetup, logPath string) (int, error) {
-	logger := log.New(io.Discard, "proxy: ", log.LstdFlags|log.Lmicroseconds)
-	if logPath != "" {
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			return 0, fmt.Errorf("open proxy log: %w", err)
-		}
-		logger = log.New(f, "proxy: ", log.LstdFlags|log.Lmicroseconds)
+func openProxyLogger(logPath string) (*log.Logger, error) {
+	if logPath == "" {
+		return log.New(io.Discard, "proxy: ", log.LstdFlags|log.Lmicroseconds), nil
 	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("open proxy log: %w", err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
+	return log.New(f, "proxy: ", log.LstdFlags|log.Lmicroseconds), nil
+}
 
+func serveProxy(p *proxySetup, ln net.Listener, logger *log.Logger) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
@@ -314,12 +310,209 @@ func startProxy(p *proxySetup, logPath string) (int, error) {
 	})
 
 	srv := &http.Server{Handler: handler, ReadTimeout: 0, WriteTimeout: 0}
-	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			logger.Printf("server: %v", err)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		logger.Printf("server: %v", err)
+	}
+}
+
+// ---------- DNS server (in-process, minimal) ----------
+//
+// Serves A/AAAA queries from the container netns: parses the question,
+// resolves on the host via net.DefaultResolver, returns answers. Anything
+// outside the allowlist returns NXDOMAIN. Anything other than A/AAAA returns
+// NOTIMP. This is intentionally not a recursive resolver -- it is the
+// container's only path to name resolution, and the allowlist controls what
+// the proxy will let through anyway.
+
+func parseDNSQuery(buf []byte) (id uint16, name string, qtype uint16, err error) {
+	if len(buf) < 12 {
+		return 0, "", 0, fmt.Errorf("query too short")
+	}
+	id = binary.BigEndian.Uint16(buf[0:2])
+	if qd := binary.BigEndian.Uint16(buf[4:6]); qd != 1 {
+		return 0, "", 0, fmt.Errorf("qdcount %d != 1", qd)
+	}
+	pos := 12
+	var parts []string
+	for {
+		if pos >= len(buf) {
+			return 0, "", 0, fmt.Errorf("name truncated")
 		}
-	}()
-	return port, nil
+		n := int(buf[pos])
+		pos++
+		if n == 0 {
+			break
+		}
+		if n&0xc0 != 0 {
+			return 0, "", 0, fmt.Errorf("unexpected compression in question")
+		}
+		if pos+n > len(buf) {
+			return 0, "", 0, fmt.Errorf("label truncated")
+		}
+		parts = append(parts, string(buf[pos:pos+n]))
+		pos += n
+	}
+	if pos+4 > len(buf) {
+		return 0, "", 0, fmt.Errorf("qtype/qclass truncated")
+	}
+	qtype = binary.BigEndian.Uint16(buf[pos : pos+2])
+	return id, strings.Join(parts, "."), qtype, nil
+}
+
+func questionEnd(buf []byte) int {
+	pos := 12
+	for buf[pos] != 0 {
+		pos += 1 + int(buf[pos])
+	}
+	return pos + 1 + 4 // null label + qtype + qclass
+}
+
+func buildDNSAnswer(req []byte, ips []net.IP, qtype uint16) []byte {
+	qend := questionEnd(req)
+	out := make([]byte, 0, 512)
+	out = append(out, req[:qend]...)
+	binary.BigEndian.PutUint16(out[2:4], 0x8180)             // QR=1, RD=1, RA=1
+	binary.BigEndian.PutUint16(out[6:8], uint16(len(ips)))   // ANCOUNT
+	for _, ip := range ips {
+		var rdata []byte
+		var rtype uint16
+		if v4 := ip.To4(); v4 != nil && qtype == 1 {
+			rdata, rtype = v4, 1
+		} else if v6 := ip.To16(); v6 != nil && qtype == 28 && ip.To4() == nil {
+			rdata, rtype = v6, 28
+		} else {
+			continue
+		}
+		out = append(out, 0xc0, 0x0c) // name = pointer to offset 12 (start of question name)
+		out = binary.BigEndian.AppendUint16(out, rtype)
+		out = binary.BigEndian.AppendUint16(out, 1) // class IN
+		out = binary.BigEndian.AppendUint32(out, 60)
+		out = binary.BigEndian.AppendUint16(out, uint16(len(rdata)))
+		out = append(out, rdata...)
+	}
+	return out
+}
+
+func buildDNSError(req []byte, rcode uint16) []byte {
+	out := make([]byte, len(req))
+	copy(out, req)
+	binary.BigEndian.PutUint16(out[2:4], 0x8180|rcode)
+	return out
+}
+
+func handleDNSQuery(buf []byte, allowed []string, logger *log.Logger) []byte {
+	_, name, qtype, err := parseDNSQuery(buf)
+	if err != nil {
+		logger.Printf("dns: parse: %v", err)
+		return buildDNSError(buf, 1) // FORMERR
+	}
+	name = strings.TrimSuffix(name, ".")
+	if !matchDomain(name, allowed) {
+		logger.Printf("dns: deny %s", name)
+		return buildDNSError(buf, 3) // NXDOMAIN
+	}
+	if qtype != 1 && qtype != 28 {
+		logger.Printf("dns: notimp %s type=%d", name, qtype)
+		return buildDNSError(buf, 4) // NOTIMP
+	}
+	network := "ip4"
+	if qtype == 28 {
+		network = "ip6"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, network, name)
+	if err != nil {
+		logger.Printf("dns: lookup %s %s: %v", network, name, err)
+		return buildDNSError(buf, 2) // SERVFAIL
+	}
+	logger.Printf("dns: %s %s -> %v", network, name, ips)
+	return buildDNSAnswer(buf, ips, qtype)
+}
+
+func serveDNSUDP(conn net.PacketConn, allowed []string, logger *log.Logger) {
+	defer conn.Close()
+	buf := make([]byte, 1500)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req := make([]byte, n)
+		copy(req, buf[:n])
+		go func() {
+			resp := handleDNSQuery(req, allowed, logger)
+			if resp != nil {
+				conn.WriteTo(resp, addr)
+			}
+		}()
+	}
+}
+
+func serveDNSTCP(ln net.Listener, allowed []string, logger *log.Logger) {
+	defer ln.Close()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(10 * time.Second))
+			var lb [2]byte
+			if _, err := io.ReadFull(c, lb[:]); err != nil {
+				return
+			}
+			msg := make([]byte, binary.BigEndian.Uint16(lb[:]))
+			if _, err := io.ReadFull(c, msg); err != nil {
+				return
+			}
+			resp := handleDNSQuery(msg, allowed, logger)
+			if resp == nil {
+				return
+			}
+			binary.BigEndian.PutUint16(lb[:], uint16(len(resp)))
+			c.Write(lb[:])
+			c.Write(resp)
+		}(c)
+	}
+}
+
+// ---------- fd-passing helpers ----------
+
+func sendFds(sock *os.File, fds []int) error {
+	rights := syscall.UnixRights(fds...)
+	// One dummy data byte: SCM_RIGHTS without payload is allowed but some
+	// libcs require at least one byte. Stay portable.
+	return syscall.Sendmsg(int(sock.Fd()), []byte{0}, rights, nil, 0)
+}
+
+func recvFds(sock *os.File, n int) ([]int, error) {
+	oob := make([]byte, syscall.CmsgSpace(n*4))
+	buf := make([]byte, 1)
+	_, oobn, _, _, err := syscall.Recvmsg(int(sock.Fd()), buf, oob, 0)
+	if err != nil {
+		return nil, err
+	}
+	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return nil, err
+	}
+	var fds []int
+	for _, m := range msgs {
+		fs, err := syscall.ParseUnixRights(&m)
+		if err != nil {
+			return nil, err
+		}
+		fds = append(fds, fs...)
+	}
+	if len(fds) != n {
+		for _, fd := range fds {
+			syscall.Close(fd)
+		}
+		return nil, fmt.Errorf("expected %d fds, got %d", n, len(fds))
+	}
+	return fds, nil
 }
 
 type singleConnListener struct {
@@ -574,8 +767,7 @@ func mainErr() error {
 	var exposed stringSlice
 	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
-	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace with pasta providing user-mode networking")
-	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
+	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
@@ -625,16 +817,20 @@ func mainErr() error {
 	}
 
 	cfg := &Config{
-		Rootfs:          rootfs,
-		Home:            home,
-		CacheDir:        cacheDir,
-		Cwd:             cwd,
-		Binds:           []string{cwd},
-		RestrictNet:     *restrictNet,
-		ExposeLocalhost: *exposeLocalhost,
-		AllowedDomains:  allowedDomains,
-		MitmDomains:     mitmDomains,
+		Rootfs:         rootfs,
+		Home:           home,
+		CacheDir:       cacheDir,
+		Cwd:            cwd,
+		Binds:          []string{cwd},
+		RestrictNet:    *restrictNet,
+		AllowedDomains: allowedDomains,
+		MitmDomains:    mitmDomains,
 	}
+
+	// commHostEnd is our side of the socketpair used for fd passing back from
+	// init. commChildFile is passed via ExtraFiles all the way to init.
+	var commHostEnd *os.File
+	var commChildFile *os.File
 	if enforceAllowlist(cfg) {
 		setup := &proxySetup{
 			allowed: allowedDomains,
@@ -662,8 +858,6 @@ func mainErr() error {
 				if host != "api.anthropic.com" {
 					return
 				}
-				// Always overwrite: the client may have a stub or expired token
-				// from a credentials file we declined to bind into the container.
 				r.Header.Del("Authorization")
 				r.Header.Del("x-api-key")
 				switch {
@@ -681,12 +875,54 @@ func mainErr() error {
 		if logPath == "" {
 			logPath = filepath.Join(cacheDir, "proxy.log")
 		}
-		port, err := startProxy(setup, logPath)
+		logger, err := openProxyLogger(logPath)
 		if err != nil {
-			return fmt.Errorf("start proxy: %w", err)
+			return err
 		}
-		cfg.ProxyPort = port
 		log.Printf("proxy log: %s", logPath)
+
+		sp, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			return fmt.Errorf("socketpair: %w", err)
+		}
+		commHostEnd = os.NewFile(uintptr(sp[0]), "comm-host")
+		commChildFile = os.NewFile(uintptr(sp[1]), "comm-child")
+
+		go func() {
+			defer commHostEnd.Close()
+			fds, err := recvFds(commHostEnd, 3)
+			if err != nil {
+				logger.Printf("recvFds: %v", err)
+				return
+			}
+			proxyFile := os.NewFile(uintptr(fds[0]), "proxy-listener")
+			dnsUDPFile := os.NewFile(uintptr(fds[1]), "dns-udp")
+			dnsTCPFile := os.NewFile(uintptr(fds[2]), "dns-tcp")
+			proxyLn, err := net.FileListener(proxyFile)
+			proxyFile.Close()
+			if err != nil {
+				logger.Printf("FileListener proxy: %v", err)
+				return
+			}
+			dnsUDP, err := net.FilePacketConn(dnsUDPFile)
+			dnsUDPFile.Close()
+			if err != nil {
+				logger.Printf("FilePacketConn dns: %v", err)
+				return
+			}
+			dnsTCP, err := net.FileListener(dnsTCPFile)
+			dnsTCPFile.Close()
+			if err != nil {
+				logger.Printf("FileListener dns-tcp: %v", err)
+				return
+			}
+			// DNS allowlist covers both passthrough and mitm targets.
+			dnsAllow := append([]string{}, allowedDomains...)
+			dnsAllow = append(dnsAllow, mitmDomains...)
+			go serveDNSUDP(dnsUDP, dnsAllow, logger)
+			go serveDNSTCP(dnsTCP, dnsAllow, logger)
+			serveProxy(setup, proxyLn, logger)
+		}()
 	}
 	for _, e := range exposed {
 		abs, err := filepath.Abs(e)
@@ -727,7 +963,14 @@ func mainErr() error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
-	return cmd.Run()
+	if commChildFile != nil {
+		cmd.ExtraFiles = []*os.File{commChildFile}
+	}
+	err = cmd.Run()
+	if commChildFile != nil {
+		commChildFile.Close()
+	}
+	return err
 }
 
 func setupDev(rootfs string) error {
@@ -879,14 +1122,14 @@ func childMain() error {
 		return err
 	}
 	if cfg.RestrictNet {
-		// Host's resolver (typically 127.0.0.53) isn't reachable from the
-		// netns. Provide a stub-resolv.conf pointing at public resolvers
-		// that pasta will proxy via the host stack.
+		// /etc/resolv.conf is a symlink into /run/systemd/resolve/...; write a
+		// stub there pointing at the in-process DNS server that init brings up
+		// on 127.0.0.1:53 inside the netns.
 		dest := filepath.Join(runInRoot, "systemd", "resolve")
 		if err := os.MkdirAll(dest, 0755); err != nil {
 			return err
 		}
-		stub := "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+		stub := "nameserver 127.0.0.1\noptions edns0 trust-ad\n"
 		if err := os.WriteFile(filepath.Join(dest, "stub-resolv.conf"), []byte(stub), 0644); err != nil {
 			return err
 		}
@@ -932,31 +1175,18 @@ func childMain() error {
 	if err != nil {
 		return err
 	}
-	var cmd *exec.Cmd
-	if cfg.RestrictNet {
-		hostToNs := "none"
-		if cfg.ExposeLocalhost {
-			hostToNs = "auto"
-		}
-		nsToHostTCP := "none"
-		if enforceAllowlist(cfg) {
-			nsToHostTCP = fmt.Sprintf("%d", cfg.ProxyPort)
-		}
-		cmd = exec.Command("pasta",
-			"--config-net", "--no-map-gw", "--ipv4-only", "--netns-only",
-			"--quiet", "--log-file=/dev/null",
-			"-a", "100.64.0.2", "-n", "24", "-g", "100.64.0.1",
-			"-t", hostToNs, "-u", hostToNs, "-T", nsToHostTCP, "-U", "none",
-			"--runas", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-			"--", self, "--clone-init",
-		)
-	} else {
-		cmd = exec.Command(self, "--clone-init")
-	}
+	cmd := exec.Command(self, "--clone-init")
 	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
+	// fd 3 (if present) is the comm socket back to mainErr; forward it.
+	if comm := os.NewFile(3, "comm"); comm != nil {
+		var st syscall.Stat_t
+		if err := syscall.Fstat(3, &st); err == nil {
+			cmd.ExtraFiles = []*os.File{comm}
+		}
+	}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			os.Exit(ee.ExitCode())
@@ -966,43 +1196,14 @@ func childMain() error {
 	return nil
 }
 
-// cloneInitMain runs after pasta (or directly) inside the netns, then clones
-// into a fresh PID/IPC/UTS/cgroup namespace to become the container's init.
+// cloneInitMain forks the container's init process into a fresh PID / IPC /
+// UTS / cgroup namespace (and, when --restrict-net is on, a fresh net ns).
+// The init process is what binds the proxy + DNS sockets and ships their fds
+// back to mainErr via the inherited comm socket on fd 3.
 func cloneInitMain() error {
 	cfg, err := loadConfig(initEnv)
 	if err != nil {
 		return err
-	}
-	if cfg.RestrictNet {
-		blackhole := []string{
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-			"169.254.169.254/32",
-		}
-		for _, r := range blackhole {
-			out, err := exec.Command("ip", "-4", "route", "add", "blackhole", r).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("ip route add blackhole %s: %w: %s", r, err, out)
-			}
-		}
-	}
-	if enforceAllowlist(cfg) {
-		rules := fmt.Sprintf(`
-			table inet runclaude {
-				chain output {
-					type filter hook output priority filter; policy drop;
-					oif lo accept
-					ip daddr 100.64.0.0/24 tcp dport %d accept
-					ip daddr {1.1.1.1, 8.8.8.8} udp dport 53 accept
-					ip daddr {1.1.1.1, 8.8.8.8} tcp dport 53 accept
-				}
-			}`, cfg.ProxyPort)
-		nft := exec.Command("nft", "-f", "-")
-		nft.Stdin = strings.NewReader(rules)
-		if out, err := nft.CombinedOutput(); err != nil {
-			return fmt.Errorf("nft: %w: %s", err, out)
-		}
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -1010,12 +1211,20 @@ func cloneInitMain() error {
 	}
 	cmd := exec.Command(self)
 	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWCGROUP,
+	flags := uintptr(syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWCGROUP)
+	if cfg.RestrictNet {
+		flags |= syscall.CLONE_NEWNET
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: flags}
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
+	if comm := os.NewFile(3, "comm"); comm != nil {
+		var st syscall.Stat_t
+		if err := syscall.Fstat(3, &st); err == nil {
+			cmd.ExtraFiles = []*os.File{comm}
+		}
+	}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			os.Exit(ee.ExitCode())
@@ -1057,14 +1266,23 @@ func initMain() error {
 		return fmt.Errorf("chdir %s: %w", cfg.Cwd, err)
 	}
 
+	var proxyPort int
+	if enforceAllowlist(cfg) {
+		port, err := setupNetwork(cfg)
+		if err != nil {
+			return err
+		}
+		proxyPort = port
+	}
+
 	if err := dropAllCaps(); err != nil {
 		return err
 	}
 
 	os.Unsetenv(childEnv)
 	os.Unsetenv(initEnv)
-	if enforceAllowlist(cfg) {
-		proxy := fmt.Sprintf("http://127.0.0.1:%d", cfg.ProxyPort)
+	if proxyPort > 0 {
+		proxy := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 		os.Setenv("HTTP_PROXY", proxy)
 		os.Setenv("HTTPS_PROXY", proxy)
 		os.Setenv("http_proxy", proxy)
@@ -1079,7 +1297,6 @@ func initMain() error {
 		os.Setenv("GIT_SSL_CAINFO", cfg.BundlePath)
 	}
 	if cfg.CAPath != "" {
-		// Node wants only the *extra* CAs, not the whole system bundle.
 		os.Setenv("NODE_EXTRA_CA_CERTS", cfg.CAPath)
 	}
 	bin, err := exec.LookPath(cfg.Command[0])
@@ -1087,6 +1304,75 @@ func initMain() error {
 		return fmt.Errorf("lookup %s: %w", cfg.Command[0], err)
 	}
 	return syscall.Exec(bin, cfg.Command, os.Environ())
+}
+
+// setupNetwork brings up loopback, binds the proxy + DNS listener sockets
+// inside this (container) netns, ships their fds back to mainErr via the
+// fd-3 comm socket inherited through the exec chain, and installs an
+// nftables policy that drops everything not on lo.  Returns the bound proxy
+// port for HTTPS_PROXY env construction.
+func setupNetwork(cfg *Config) (int, error) {
+	if out, err := exec.Command("ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("ip link set lo up: %w: %s", err, out)
+	}
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("listen proxy: %w", err)
+	}
+	port := proxyLn.Addr().(*net.TCPAddr).Port
+	proxyFile, err := proxyLn.(*net.TCPListener).File()
+	if err != nil {
+		return 0, fmt.Errorf("listener fd: %w", err)
+	}
+
+	udp, err := net.ListenPacket("udp", "127.0.0.1:53")
+	if err != nil {
+		return 0, fmt.Errorf("listen dns udp: %w", err)
+	}
+	dnsUDPFile, err := udp.(*net.UDPConn).File()
+	if err != nil {
+		return 0, fmt.Errorf("udp fd: %w", err)
+	}
+
+	tcpDNS, err := net.Listen("tcp", "127.0.0.1:53")
+	if err != nil {
+		return 0, fmt.Errorf("listen dns tcp: %w", err)
+	}
+	dnsTCPFile, err := tcpDNS.(*net.TCPListener).File()
+	if err != nil {
+		return 0, fmt.Errorf("dns tcp fd: %w", err)
+	}
+
+	comm := os.NewFile(3, "comm")
+	if comm == nil {
+		return 0, fmt.Errorf("fd 3 (comm socket) not present")
+	}
+	if err := sendFds(comm, []int{int(proxyFile.Fd()), int(dnsUDPFile.Fd()), int(dnsTCPFile.Fd())}); err != nil {
+		return 0, fmt.Errorf("sendFds: %w", err)
+	}
+	// We don't need these in-process anymore; the host side serves them.
+	proxyLn.Close()
+	udp.Close()
+	tcpDNS.Close()
+	proxyFile.Close()
+	dnsUDPFile.Close()
+	dnsTCPFile.Close()
+	comm.Close()
+
+	rules := `
+		table inet runclaude {
+			chain output {
+				type filter hook output priority filter; policy drop;
+				oif lo accept
+			}
+		}`
+	nft := exec.Command("nft", "-f", "-")
+	nft.Stdin = strings.NewReader(rules)
+	if out, err := nft.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("nft: %w: %s", err, out)
+	}
+	return port, nil
 }
 
 func main() {
