@@ -75,12 +75,17 @@ type Config struct {
 	CacheDir        string   `json:"cacheDir"`
 	Cwd             string   `json:"cwd"`
 	Binds           []string `json:"binds"`
-	BashArgs        []string `json:"bashArgs"`
+	Command         []string `json:"command"`
 	RestrictNet     bool     `json:"restrictNet"`
 	ExposeLocalhost bool     `json:"exposeLocalhost"`
 	AllowedDomains  []string `json:"allowedDomains"`
 	ProxyPort       int      `json:"proxyPort"`
 }
+
+type stringSlice []string
+
+func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
 func loadConfig(envName string) (*Config, error) {
 	var c Config
@@ -239,7 +244,9 @@ func mainErr() error {
 		return fmt.Errorf("$HOME must be absolute and not %q, got %q", "/", home)
 	}
 
-	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the shell command")
+	var exposed stringSlice
+	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
+	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace with pasta providing user-mode networking")
 	exposeLocalhost := flag.Bool("expose-localhost", true, "expose host listening ports inside the netns (requires --restrict-net)")
 	allowDomain := flag.String("allow-domain",
@@ -283,8 +290,8 @@ func mainErr() error {
 		}
 		cfg.ProxyPort = port
 	}
-	for _, a := range flag.Args() {
-		abs, err := filepath.Abs(a)
+	for _, e := range exposed {
+		abs, err := filepath.Abs(e)
 		if err != nil {
 			return err
 		}
@@ -296,7 +303,13 @@ func mainErr() error {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
-		cfg.BashArgs = []string{"-c", "claude --dangerously-skip-permissions"}
+		cfg.Command = []string{"claude", "--dangerously-skip-permissions"}
+	}
+	if args := flag.Args(); len(args) > 0 {
+		cfg.Command = args
+	}
+	if len(cfg.Command) == 0 {
+		cfg.Command = []string{"bash"}
 	}
 
 	self, err := os.Executable()
@@ -656,8 +669,11 @@ func initMain() error {
 		os.Setenv("NO_PROXY", "")
 		os.Setenv("no_proxy", "")
 	}
-	argv := append([]string{"bash"}, cfg.BashArgs...)
-	return syscall.Exec("/bin/bash", argv, os.Environ())
+	bin, err := exec.LookPath(cfg.Command[0])
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", cfg.Command[0], err)
+	}
+	return syscall.Exec(bin, cfg.Command, os.Environ())
 }
 
 func main() {
