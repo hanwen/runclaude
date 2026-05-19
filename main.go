@@ -137,6 +137,46 @@ func claudeBinds(home string) ([]string, error) {
 	return out, nil
 }
 
+// workspaceBinds returns paths to the underlying repo storage when cwd is a
+// linked git worktree or a jj workspace whose repo lives outside cwd. The
+// worktree's own .git/.jj is already covered by binding cwd itself.
+func workspaceBinds(cwd string) []string {
+	var out []string
+	if data, err := os.ReadFile(filepath.Join(cwd, ".git")); err == nil {
+		s := strings.TrimSpace(string(data))
+		if rest, ok := strings.CutPrefix(s, "gitdir:"); ok {
+			p := strings.TrimSpace(rest)
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(cwd, p)
+			}
+			p = filepath.Clean(p)
+			out = append(out, p)
+			if cd, err := os.ReadFile(filepath.Join(p, "commondir")); err == nil {
+				c := strings.TrimSpace(string(cd))
+				if !filepath.IsAbs(c) {
+					c = filepath.Join(p, c)
+				}
+				out = append(out, filepath.Clean(c))
+			}
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(cwd, ".jj", "repo")); err == nil {
+		p := strings.TrimSpace(string(data))
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(cwd, ".jj", p)
+		}
+		p = filepath.Clean(p)
+		out = append(out, p)
+		// If the primary workspace is colocated, its .git sits next to .jj.
+		// p is <primary>/.jj/repo, so the primary workspace is two levels up.
+		primary := filepath.Dir(filepath.Dir(p))
+		if fi, err := os.Stat(filepath.Join(primary, ".git")); err == nil && fi.IsDir() {
+			out = append(out, filepath.Join(primary, ".git"))
+		}
+	}
+	return out
+}
+
 // pathBinds returns directories from $PATH that live under a top-level dir the
 // rootfs setup does not bind-mount from / (i.e. under $HOME, /tmp, /run, /dev).
 // Everything else is already reachable through the recursive root rbinds.
@@ -246,6 +286,7 @@ func mainErr() error {
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
+	mapWorkspace := flag.Bool("map-workspace", true, "for git/jj workspaces map the originating repository")
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
 	injectAuth := flag.Bool("inject-auth", false,
@@ -428,6 +469,9 @@ func mainErr() error {
 	}
 	if *mapPath {
 		cfg.Binds = append(cfg.Binds, pathBinds(home)...)
+	}
+	if *mapWorkspace {
+		cfg.Binds = append(cfg.Binds, workspaceBinds(cwd)...)
 	}
 	if *claudeMode {
 		extra, err := claudeBinds(home)

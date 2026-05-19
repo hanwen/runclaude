@@ -43,6 +43,18 @@ traffic through an HTTPS proxy. Credentials for Claude are injected in
 outgoing traffic, so Claude itself doesn't have access to the
 credential.
 
+It has no runtime dependencies.
+
+
+# What conveniences does it offer?
+
+* Git worktrees/jj workspaces are mapped into the container automatically
+
+* Entries from $PATH are mapped into the container automatically
+
+* Claude automatically runs with --dangerously-skip-permissions, as it
+  runs in a sandbox anyway.
+
 
 # How secure is it?
 
