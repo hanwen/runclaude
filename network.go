@@ -36,10 +36,15 @@ import (
 var defaultAllowedDomains = []string{
 	"api.anthropic.com",
 	"github.com", "*.github.com",
+	"codeload.github.com",
+	"release-assets.githubusercontent.com",
 	"registry.npmjs.org",
 	"pypi.org", "*.pypi.org", "files.pythonhosted.org",
 	"crates.io", "static.crates.io",
 	"proxy.golang.org", "sum.golang.org", "go.dev",
+	"proxy.golang.org", "sum.golang.org", "go.dev", "*.go.dev",
+	"dl.google.com", "storage.googleapis.com",
+	"releases.bazel.build", "bcr.bazel.build",
 }
 
 // domainList tracks whether the user explicitly passed --allow-domain
@@ -66,10 +71,10 @@ func enforceAllowlist(cfg *Config) bool {
 //
 //   - exact "api.anthropic.com"          matches only that hostname
 //   - leading "*.github.com"             matches "github.com" and any
-//                                        subdomain at any depth (legacy form)
+//     subdomain at any depth (legacy form)
 //   - mid-label "bedrock-runtime.*.amazonaws.com"
-//                                        each "*" label matches exactly one
-//                                        DNS label
+//     each "*" label matches exactly one
+//     DNS label
 func matchDomain(host string, patterns []string) bool {
 	host = strings.ToLower(host)
 	for _, p := range patterns {
