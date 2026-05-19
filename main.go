@@ -78,12 +78,12 @@ type Config struct {
 	// (e.g., "api.anthropic.com" -> "http://127.0.0.1:8443"). Used by tests
 	// to point the proxy at a fake server instead of the real provider.
 	MitmUpstream map[string]string `json:"mitmUpstream,omitempty"`
-	BundlePath     string   `json:"bundlePath"`
-	CAPath         string   `json:"caPath"`
+	BundlePath   string            `json:"bundlePath"`
+	CAPath       string            `json:"caPath"`
 }
 
 type Bind struct {
-	Path     string `json:"path"`
+	Path string `json:"path"`
 	// Dest is the in-container path; defaults to Path when empty. Use it
 	// to overlay a host-side sanitized copy at a path inside an already-
 	// bound tree without modifying the host original.
@@ -316,6 +316,44 @@ func readClaudeAuth(home string) (apiKey, bearer string, err error) {
 		return k, "", nil
 	}
 	return "", "", fmt.Errorf("no claude credentials found (looked in ~/.claude/.credentials.json and $ANTHROPIC_API_KEY)")
+}
+
+// checkUserNS verifies that unprivileged user namespaces are permitted by the
+// kernel and prints actionable instructions if they are blocked.
+func checkUserNS() error {
+	type sysctl struct {
+		path    string
+		blocked string // value that means "blocked"
+		fix     string
+	}
+	checks := []sysctl{
+		{
+			path:    "/proc/sys/kernel/unprivileged_userns_clone",
+			blocked: "0",
+			fix:     "sudo sysctl -w kernel.unprivileged_userns_clone=1",
+		},
+		{
+			path:    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+			blocked: "1",
+			fix:     "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+		},
+	}
+	for _, c := range checks {
+		data, err := os.ReadFile(c.path)
+		if err != nil {
+			continue // sysctl doesn't exist on this kernel — not a problem
+		}
+		if strings.TrimSpace(string(data)) == c.blocked {
+			return fmt.Errorf(
+				"unprivileged user namespaces are disabled (%s = %s)\n"+
+					"runclaude requires them; enable with:\n\n"+
+					"  %s\n\n"+
+					"To persist across reboots, add the setting to /etc/sysctl.d/.",
+				c.path, c.blocked, c.fix,
+			)
+		}
+	}
+	return nil
 }
 
 func mainErr() error {
@@ -605,6 +643,9 @@ func mainErr() error {
 	}
 	if len(cfg.Command) == 0 {
 		cfg.Command = []string{"bash"}
+	}
+	if err := checkUserNS(); err != nil {
+		return err
 	}
 
 	self, err := os.Executable()
