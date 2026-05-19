@@ -69,13 +69,18 @@ type Config struct {
 	Home           string   `json:"home"`
 	CacheDir       string   `json:"cacheDir"`
 	Cwd            string   `json:"cwd"`
-	Binds          []string `json:"binds"`
+	Binds          []Bind   `json:"binds"`
 	Command        []string `json:"command"`
 	RestrictNet    bool     `json:"restrictNet"`
 	AllowedDomains []string `json:"allowedDomains"`
 	MitmDomains    []string `json:"mitmDomains"`
 	BundlePath     string   `json:"bundlePath"`
 	CAPath         string   `json:"caPath"`
+}
+
+type Bind struct {
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"ro,omitempty"`
 }
 
 type stringSlice []string
@@ -106,7 +111,7 @@ var credentialFiles = map[string]bool{
 	"credentials.json":  true,
 }
 
-func claudeBinds(home string) ([]string, error) {
+func claudeBinds(home string) ([]Bind, error) {
 	var binds []string
 	claudeDir := filepath.Join(home, ".claude")
 	if entries, err := os.ReadDir(claudeDir); err == nil {
@@ -128,10 +133,10 @@ func claudeBinds(home string) ([]string, error) {
 			binds = append(binds, filepath.Dir(target))
 		}
 	}
-	var out []string
+	var out []Bind
 	for _, b := range binds {
 		if _, err := os.Stat(b); err == nil {
-			out = append(out, b)
+			out = append(out, Bind{Path: b})
 		}
 	}
 	return out, nil
@@ -140,8 +145,8 @@ func claudeBinds(home string) ([]string, error) {
 // workspaceBinds returns paths to the underlying repo storage when cwd is a
 // linked git worktree or a jj workspace whose repo lives outside cwd. The
 // worktree's own .git/.jj is already covered by binding cwd itself.
-func workspaceBinds(cwd string) []string {
-	var out []string
+func workspaceBinds(cwd string) []Bind {
+	var out []Bind
 	if data, err := os.ReadFile(filepath.Join(cwd, ".git")); err == nil {
 		s := strings.TrimSpace(string(data))
 		if rest, ok := strings.CutPrefix(s, "gitdir:"); ok {
@@ -150,13 +155,13 @@ func workspaceBinds(cwd string) []string {
 				p = filepath.Join(cwd, p)
 			}
 			p = filepath.Clean(p)
-			out = append(out, p)
+			out = append(out, Bind{Path: p})
 			if cd, err := os.ReadFile(filepath.Join(p, "commondir")); err == nil {
 				c := strings.TrimSpace(string(cd))
 				if !filepath.IsAbs(c) {
 					c = filepath.Join(p, c)
 				}
-				out = append(out, filepath.Clean(c))
+				out = append(out, Bind{Path: filepath.Clean(c)})
 			}
 		}
 	}
@@ -166,12 +171,10 @@ func workspaceBinds(cwd string) []string {
 			p = filepath.Join(cwd, ".jj", p)
 		}
 		p = filepath.Clean(p)
-		out = append(out, p)
-		// If the primary workspace is colocated, its .git sits next to .jj.
-		// p is <primary>/.jj/repo, so the primary workspace is two levels up.
+		out = append(out, Bind{Path: p})
 		primary := filepath.Dir(filepath.Dir(p))
 		if fi, err := os.Stat(filepath.Join(primary, ".git")); err == nil && fi.IsDir() {
-			out = append(out, filepath.Join(primary, ".git"))
+			out = append(out, Bind{Path: filepath.Join(primary, ".git")})
 		}
 	}
 	return out
@@ -180,10 +183,10 @@ func workspaceBinds(cwd string) []string {
 // pathBinds returns directories from $PATH that live under a top-level dir the
 // rootfs setup does not bind-mount from / (i.e. under $HOME, /tmp, /run, /dev).
 // Everything else is already reachable through the recursive root rbinds.
-func pathBinds(home string) []string {
+func pathBinds(home string) []Bind {
 	homePrefix := "/" + strings.SplitN(strings.TrimPrefix(home, "/"), "/", 2)[0]
 	needsBind := map[string]bool{homePrefix: true, "/tmp": true, "/run": true, "/dev": true}
-	var out []string
+	var out []Bind
 	seen := map[string]bool{}
 	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
 		if p == "" || !filepath.IsAbs(p) {
@@ -204,7 +207,7 @@ func pathBinds(home string) []string {
 		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
 			continue
 		}
-		out = append(out, abs)
+		out = append(out, Bind{Path: abs, ReadOnly: true})
 	}
 	return out
 }
@@ -355,7 +358,7 @@ func mainErr() error {
 		Home:           home,
 		CacheDir:       cacheDir,
 		Cwd:            cwd,
-		Binds:          []string{cwd},
+		Binds:          []Bind{{Path: cwd}},
 		RestrictNet:    *restrictNet,
 		AllowedDomains: allowedDomains,
 		MitmDomains:    mitmDomains,
@@ -465,7 +468,7 @@ func mainErr() error {
 		if err != nil {
 			return err
 		}
-		cfg.Binds = append(cfg.Binds, abs)
+		cfg.Binds = append(cfg.Binds, Bind{Path: abs})
 	}
 	if *mapPath {
 		cfg.Binds = append(cfg.Binds, pathBinds(home)...)
@@ -730,12 +733,12 @@ func childMain() error {
 
 	boundSeen := map[string]bool{}
 	for _, d := range cfg.Binds {
-		if boundSeen[d] {
+		if boundSeen[d.Path] {
 			continue
 		}
-		boundSeen[d] = true
-		dest := filepath.Join(cfg.Rootfs, d)
-		info, err := os.Stat(d)
+		boundSeen[d.Path] = true
+		dest := filepath.Join(cfg.Rootfs, d.Path)
+		info, err := os.Stat(d.Path)
 		if err != nil {
 			return err
 		}
@@ -753,8 +756,25 @@ func childMain() error {
 			}
 			f.Close()
 		}
-		if err := syscall.Mount(d, dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-			return fmt.Errorf("rbind %s -> %s: %w", d, dest, err)
+		if err := syscall.Mount(d.Path, dest, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("rbind %s -> %s: %w", d.Path, dest, err)
+		}
+		if d.ReadOnly {
+			var st syscall.Statfs_t
+			if err := syscall.Statfs(d.Path, &st); err != nil {
+				return fmt.Errorf("statfs %s: %w", d.Path, err)
+			}
+			// In a user namespace, locked per-mount flags (nosuid, nodev,
+			// noexec, atime variants) on the source must be preserved on
+			// remount; clearing any of them returns EPERM. ST_* bit values
+			// match MS_* for the bits we care about.
+			const preserve = syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC |
+				syscall.MS_NOATIME | syscall.MS_NODIRATIME | syscall.MS_RELATIME |
+				syscall.MS_SYNCHRONOUS
+			flags := uintptr(st.Flags)&preserve | syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY
+			if err := syscall.Mount("", dest, "", flags, ""); err != nil {
+				return fmt.Errorf("remount-ro %s: %w", dest, err)
+			}
 		}
 	}
 
