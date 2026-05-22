@@ -52,12 +52,12 @@ func TestSanitizeSettingsStripsAWSEnv(t *testing.T) {
 		}
 	}
 	for _, k := range []string{"AWS_REGION", "CLAUDE_CODE_USE_BEDROCK"} {
-		if _, ok := env[k]; !ok {
-			t.Errorf("env[%q] should be kept; full env: %v", k, env)
+		if _, ok := env[k]; ok {
+			t.Errorf("env[%q] should be stripped; full env: %v", k, env)
 		}
 	}
-	if raw["awsAuthRefresh"] != "aws sso login --profile myprofile" {
-		t.Errorf("non-env field lost: %v", raw["awsAuthRefresh"])
+	if _, ok := raw["awsAuthRefresh"]; ok {
+		t.Errorf("awsAuthRefresh should be stripped, got: %v", raw["awsAuthRefresh"])
 	}
 
 	// Host file untouched.

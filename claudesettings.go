@@ -9,11 +9,11 @@ import (
 	"path/filepath"
 )
 
-// awsClaudeSettingsScrub lists env keys we strip from .claude/settings.json
-// before exposing it to the in-container claude. The container authenticates
-// to Bedrock via the host proxy's re-signing, not its own AWS SDK; leaving
-// these in causes claude to try the host profile / IMDS / etc.
-var awsClaudeSettingsScrub = []string{
+// awsClaudeSettingsEnvScrub lists env keys we strip from the "env" map in
+// .claude/settings.json before exposing it to the in-container claude. The
+// container authenticates to Bedrock via the host proxy's re-signing, not its
+// own AWS SDK; leaving these in causes claude to try the host profile / IMDS.
+var awsClaudeSettingsEnvScrub = []string{
 	"AWS_ACCESS_KEY_ID",
 	"AWS_SECRET_ACCESS_KEY",
 	"AWS_SESSION_TOKEN",
@@ -21,6 +21,19 @@ var awsClaudeSettingsScrub = []string{
 	"AWS_PROFILE",
 	"AWS_CONFIG_FILE",
 	"AWS_SHARED_CREDENTIALS_FILE",
+	// These tell claude to use Bedrock directly; in-container claude must not
+	// do its own Bedrock auth — the host proxy handles signing.
+	"CLAUDE_CODE_USE_BEDROCK",
+	"AWS_REGION",
+	"AWS_DEFAULT_REGION",
+}
+
+// awsClaudeSettingsTopLevelScrub lists top-level keys we strip from
+// .claude/settings.json. awsAuthRefresh tells claude to run `aws sso login`
+// when credentials fail; that would reference a host profile unavailable in
+// the container and is unnecessary since the proxy handles re-signing.
+var awsClaudeSettingsTopLevelScrub = []string{
+	"awsAuthRefresh",
 }
 
 type claudeSettings struct {
@@ -104,21 +117,25 @@ func sanitizeSettingsFile(src, dst string) (*Bind, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, nil // leave malformed settings.json alone
 	}
-	envAny, ok := raw["env"].(map[string]any)
-	if !ok {
-		return nil, nil
-	}
 	stripped := false
-	for _, k := range awsClaudeSettingsScrub {
-		if _, present := envAny[k]; present {
-			delete(envAny, k)
+	if envAny, ok := raw["env"].(map[string]any); ok {
+		for _, k := range awsClaudeSettingsEnvScrub {
+			if _, present := envAny[k]; present {
+				delete(envAny, k)
+				stripped = true
+			}
+		}
+		raw["env"] = envAny
+	}
+	for _, k := range awsClaudeSettingsTopLevelScrub {
+		if _, present := raw[k]; present {
+			delete(raw, k)
 			stripped = true
 		}
 	}
 	if !stripped {
 		return nil, nil
 	}
-	raw["env"] = envAny
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return nil, err
