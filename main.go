@@ -176,6 +176,33 @@ func workspaceBinds(cwd string) []Bind {
 		if fi, err := os.Stat(filepath.Join(primary, ".git")); err == nil && fi.IsDir() {
 			out = append(out, Bind{Path: filepath.Join(primary, ".git")})
 		}
+		out = append(out, jjConfigBinds()...)
+	}
+	return out
+}
+
+// jjConfigBinds returns the user-level jj configuration paths so commands
+// inside the container resolve the same config (user.name/email, aliases,
+// signing keys, etc.) the host user already has.
+func jjConfigBinds() []Bind {
+	var paths []string
+	if v := os.Getenv("JJ_CONFIG"); v != "" {
+		paths = append(paths, v)
+	}
+	cfgHome := os.Getenv("XDG_CONFIG_HOME")
+	if cfgHome == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			cfgHome = filepath.Join(home, ".config")
+		}
+	}
+	if cfgHome != "" {
+		paths = append(paths, filepath.Join(cfgHome, "jj"))
+	}
+	var out []Bind
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, Bind{Path: p})
+		}
 	}
 	return out
 }
