@@ -619,8 +619,6 @@ func mainErr() error {
 		cfg.Binds = append(cfg.Binds, extra...)
 		if *claudeMode {
 			cfg.Command = append([]string{"claude", "--dangerously-skip-permissions"}, flag.Args()...)
-		} else if args := flag.Args(); len(args) > 0 {
-			cfg.Command = args
 		}
 		if bearer != "" || apiKey != "" {
 			if err := writeStubCredentials(filepath.Join(cacheDir, "home", ".claude")); err != nil {
@@ -642,7 +640,11 @@ func mainErr() error {
 		cfg.Binds = append(cfg.Binds, settingsBinds...)
 	}
 	if len(cfg.Command) == 0 {
-		cfg.Command = []string{"bash"}
+		if args := flag.Args(); len(args) > 0 {
+			cfg.Command = args
+		} else {
+			cfg.Command = []string{"bash"}
+		}
 	}
 	if err := checkUserNS(); err != nil {
 		return err
