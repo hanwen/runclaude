@@ -378,7 +378,7 @@ func mainErr() error {
 	// etc.) without the user having to also export them in their shell.
 	// Host env still wins — settings.json only fills unset variables.
 	if *claudeMode {
-		applyClaudeSettingsEnv(loadClaudeSettingsEnv(cwd))
+		applyClaudeSettingsEnv(loadClaudeSettingsEnv(home, cwd))
 	}
 	useBedrock := *claudeMode && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
 	if *injectAuth || (*claudeMode && !useBedrock) {
@@ -590,7 +590,7 @@ func mainErr() error {
 		// Overlay a sanitized settings.json into the container so claude
 		// doesn't see AWS_PROFILE etc. and try to authenticate itself —
 		// the host proxy handles signing.
-		settingsBinds, err := materializeClaudeSettings(cwd, filepath.Join(cacheDir, "claude"))
+		settingsBinds, err := materializeClaudeSettings(home, cwd, filepath.Join(cacheDir, "claude"))
 		if err != nil {
 			return err
 		}
