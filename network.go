@@ -227,6 +227,9 @@ type proxySetup struct {
 	mitm    []string
 	leaves  *leafCache
 	inject  func(host string, r *http.Request)
+	// upstream maps a MITM-intercepted host to an override target URL.
+	// Empty/missing entries fall back to "https://<host>".
+	upstream map[string]string
 }
 
 func openProxyLogger(logPath string) (*log.Logger, error) {
@@ -254,7 +257,7 @@ func serveProxy(p *proxySetup, ln net.Listener, logger *log.Logger) {
 				proxyHTTP(w, r, logger)
 				return
 			}
-			proxyMitm(w, r, host, p.leaves, p.inject, logger)
+			proxyMitm(w, r, host, p.leaves, p.inject, p.upstream[host], logger)
 		case matchDomain(host, p.allowed):
 			logger.Printf("allow %s %s", r.Method, host)
 			if r.Method == http.MethodConnect {
@@ -345,7 +348,7 @@ func newMitmReverseProxy(host string, target *url.URL, inject func(string, *http
 	return rp
 }
 
-func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), logger *log.Logger) {
+func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), upstreamOverride string, logger *log.Logger) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
@@ -373,7 +376,15 @@ func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leaf
 		return
 	}
 
-	target, _ := url.Parse("https://" + host)
+	targetStr := "https://" + host
+	if upstreamOverride != "" {
+		targetStr = upstreamOverride
+	}
+	target, err := url.Parse(targetStr)
+	if err != nil {
+		logger.Printf("mitm: bad upstream %q: %v", targetStr, err)
+		return
+	}
 	rp := newMitmReverseProxy(host, target, inject, logger)
 
 	logger.Printf("mitm tls  %s alpn=%q", host, tlsConn.ConnectionState().NegotiatedProtocol)

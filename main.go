@@ -74,6 +74,10 @@ type Config struct {
 	RestrictNet    bool     `json:"restrictNet"`
 	AllowedDomains []string `json:"allowedDomains"`
 	MitmDomains    []string `json:"mitmDomains"`
+	// MitmUpstream maps a MITM-intercepted host to an override upstream URL
+	// (e.g., "api.anthropic.com" -> "http://127.0.0.1:8443"). Used by tests
+	// to point the proxy at a fake server instead of the real provider.
+	MitmUpstream map[string]string `json:"mitmUpstream,omitempty"`
 	BundlePath     string   `json:"bundlePath"`
 	CAPath         string   `json:"caPath"`
 }
@@ -92,6 +96,21 @@ func (b Bind) dest() string {
 		return b.Dest
 	}
 	return b.Path
+}
+
+func parseMitmUpstream(items []string) map[string]string {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(items))
+	for _, kv := range items {
+		host, url, ok := strings.Cut(kv, "=")
+		if !ok || host == "" || url == "" {
+			log.Fatalf("--mitm-upstream %q: expected host=url", kv)
+		}
+		out[host] = url
+	}
+	return out
 }
 
 type stringSlice []string
@@ -334,6 +353,13 @@ func mainErr() error {
 		"MITM api.anthropic.com and inject $ANTHROPIC_API_KEY when the client doesn't supply credentials")
 	proxyLog := flag.String("proxy-log", "",
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
+	var mitmUpstream stringSlice
+	flag.Var(&mitmUpstream, "mitm-upstream",
+		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
+	anthropicKeyOverride := flag.String("anthropic-key", "",
+		"override the Anthropic API key the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
+	anthropicBearerOverride := flag.String("anthropic-bearer", "",
+		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	flag.Parse()
 
 	allowedDomains := allowDomain.items
@@ -346,20 +372,45 @@ func mainErr() error {
 		apiKey      string
 		bearer      string
 	)
+	// Pull env from .claude/settings.json into the host process. The
+	// in-container claude reads settings.json itself; this lets runclaude
+	// see the same effective env (CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE,
+	// etc.) without the user having to also export them in their shell.
+	// Host env still wins — settings.json only fills unset variables.
+	if *claudeMode {
+		applyClaudeSettingsEnv(loadClaudeSettingsEnv(cwd))
+	}
 	useBedrock := *claudeMode && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
 	if *injectAuth || (*claudeMode && !useBedrock) {
-		var err error
-		apiKey, bearer, err = readClaudeAuth(home)
-		if err != nil {
-			if *injectAuth {
-				return fmt.Errorf("--inject-auth: %w", err)
+		switch {
+		case *anthropicKeyOverride != "" || *anthropicBearerOverride != "":
+			apiKey = *anthropicKeyOverride
+			bearer = *anthropicBearerOverride
+		default:
+			var err error
+			apiKey, bearer, err = readClaudeAuth(home)
+			if err != nil {
+				if *injectAuth {
+					return fmt.Errorf("--inject-auth: %w", err)
+				}
+				log.Printf("warning: --claude: %v", err)
 			}
-			log.Printf("warning: --claude: %v", err)
-		} else {
+		}
+		if apiKey != "" || bearer != "" {
 			mitmDomains = append(mitmDomains, "api.anthropic.com")
 			if !matchDomain("api.anthropic.com", allowedDomains) {
 				allowedDomains = append(allowedDomains, "api.anthropic.com")
 			}
+		}
+	}
+	// Hosts mentioned via --mitm-upstream should also be MITM'd and on
+	// the allowlist; the override is meaningless otherwise.
+	for host := range parseMitmUpstream(mitmUpstream) {
+		if !matchDomain(host, mitmDomains) {
+			mitmDomains = append(mitmDomains, host)
+		}
+		if !matchDomain(host, allowedDomains) {
+			allowedDomains = append(allowedDomains, host)
 		}
 	}
 	var awsSigner *v4.Signer
@@ -403,6 +454,7 @@ func mainErr() error {
 		RestrictNet:    *restrictNet,
 		AllowedDomains: allowedDomains,
 		MitmDomains:    mitmDomains,
+		MitmUpstream:   parseMitmUpstream(mitmUpstream),
 	}
 
 	// commHostEnd is our side of the socketpair used for fd passing back from
@@ -421,9 +473,10 @@ func mainErr() error {
 		log.Printf("proxy log: %s", logPath)
 
 		setup := &proxySetup{
-			allowed: allowedDomains,
-			mitm:    mitmDomains,
-			inject:  func(string, *http.Request) {},
+			allowed:  allowedDomains,
+			mitm:     mitmDomains,
+			inject:   func(string, *http.Request) {},
+			upstream: cfg.MitmUpstream,
 		}
 		if len(mitmDomains) > 0 {
 			ca, err := loadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
@@ -534,6 +587,14 @@ func mainErr() error {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, excludeBinds...)
+		// Overlay a sanitized settings.json into the container so claude
+		// doesn't see AWS_PROFILE etc. and try to authenticate itself —
+		// the host proxy handles signing.
+		settingsBinds, err := materializeClaudeSettings(cwd, filepath.Join(cacheDir, "claude"))
+		if err != nil {
+			return err
+		}
+		cfg.Binds = append(cfg.Binds, settingsBinds...)
 	} else if args := flag.Args(); len(args) > 0 {
 		cfg.Command = args
 	}
