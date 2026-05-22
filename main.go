@@ -509,14 +509,13 @@ func mainErr() error {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
-		cfg.Command = []string{"claude", "--dangerously-skip-permissions"}
+		cfg.Command = append([]string{"claude", "--dangerously-skip-permissions"}, flag.Args()...)
 		if bearer != "" || apiKey != "" {
 			if err := writeStubCredentials(filepath.Join(cacheDir, "home", ".claude")); err != nil {
 				return err
 			}
 		}
-	}
-	if args := flag.Args(); len(args) > 0 {
+	} else if args := flag.Args(); len(args) > 0 {
 		cfg.Command = args
 	}
 	if len(cfg.Command) == 0 {
