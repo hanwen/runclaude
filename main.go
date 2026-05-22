@@ -379,6 +379,9 @@ func mainErr() error {
 			return err
 		}
 	}
+	if err := materializeGitConfig(home, filepath.Join(cacheDir, "home")); err != nil {
+		return err
+	}
 
 	cfg := &Config{
 		Rootfs:         rootfs,
