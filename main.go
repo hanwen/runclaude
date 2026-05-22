@@ -80,7 +80,18 @@ type Config struct {
 
 type Bind struct {
 	Path     string `json:"path"`
+	// Dest is the in-container path; defaults to Path when empty. Use it
+	// to overlay a host-side sanitized copy at a path inside an already-
+	// bound tree without modifying the host original.
+	Dest     string `json:"dest,omitempty"`
 	ReadOnly bool   `json:"ro,omitempty"`
+}
+
+func (b Bind) dest() string {
+	if b.Dest != "" {
+		return b.Dest
+	}
+	return b.Path
 }
 
 type stringSlice []string
@@ -518,6 +529,11 @@ func mainErr() error {
 				return err
 			}
 		}
+		excludeBinds, err := vcsExcludeBinds(cwd, filepath.Join(cacheDir, "vcs"), ".claude/settings.json")
+		if err != nil {
+			return err
+		}
+		cfg.Binds = append(cfg.Binds, excludeBinds...)
 	} else if args := flag.Args(); len(args) > 0 {
 		cfg.Command = args
 	}
@@ -762,11 +778,11 @@ func childMain() error {
 
 	boundSeen := map[string]bool{}
 	for _, d := range cfg.Binds {
-		if boundSeen[d.Path] {
+		if boundSeen[d.dest()] {
 			continue
 		}
-		boundSeen[d.Path] = true
-		dest := filepath.Join(cfg.Rootfs, d.Path)
+		boundSeen[d.dest()] = true
+		dest := filepath.Join(cfg.Rootfs, d.dest())
 		info, err := os.Stat(d.Path)
 		if err != nil {
 			return err
