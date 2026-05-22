@@ -129,8 +129,9 @@ CLAUDE_CODE_USE_BEDROCK=1 \
 AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
 AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
 AWS_REGION="$REGION" \
-    run_case bedrock '{}' \
+    run_case bedrock \
         "bedrock-runtime.$REGION.amazonaws.com bedrock.$REGION.amazonaws.com" \
+        '{}' \
         --aws-access-key-id "$ACCESS_KEY" \
         --aws-secret-access-key "$SECRET_KEY" \
         --aws-region "$REGION"
@@ -158,17 +159,7 @@ mkdir -p "$AWS_DIR"
 CRED_SCRIPT="$AWS_DIR/sso-cred-process.sh"
 cat > "$CRED_SCRIPT" <<EOF
 #!/usr/bin/env bash
-# Emits the test's fake creds in the format AWS SDK expects from
-# credential_process. Stands in for the cache that `aws sso login`
-# would produce.
-cat <<JSON
-{
-  "Version": 1,
-  "AccessKeyId": "$ACCESS_KEY",
-  "SecretAccessKey": "$SECRET_KEY",
-  "Expiration": "2099-01-01T00:00:00Z"
-}
-JSON
+printf '{"Version":1,"AccessKeyId":"$ACCESS_KEY","SecretAccessKey":"$SECRET_KEY","Expiration":"2099-01-01T00:00:00Z"}\n'
 EOF
 chmod +x "$CRED_SCRIPT"
 

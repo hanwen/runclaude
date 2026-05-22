@@ -421,27 +421,27 @@ func mainErr() error {
 	if claudeLike {
 		applyClaudeSettingsEnv(loadClaudeSettingsEnv(home, cwd))
 	}
-	useBedrock := claudeLike && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
-	if *injectAuth || (claudeLike && !useBedrock) {
-		switch {
-		case *anthropicKeyOverride != "" || *anthropicBearerOverride != "":
-			apiKey = *anthropicKeyOverride
-			bearer = *anthropicBearerOverride
-		default:
-			var err error
-			apiKey, bearer, err = readClaudeAuth(home)
-			if err != nil {
-				if *injectAuth {
-					return fmt.Errorf("--inject-auth: %w", err)
-				}
-				log.Printf("warning: --claude: %v", err)
+	// Explicit key/bearer overrides force the Anthropic path even on a
+	// Bedrock host (e.g. test-mitm.sh passing --anthropic-bearer).
+	hasExplicitAnthropicCreds := *anthropicKeyOverride != "" || *anthropicBearerOverride != ""
+	useBedrock := claudeLike && !hasExplicitAnthropicCreds && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
+	if hasExplicitAnthropicCreds {
+		apiKey = *anthropicKeyOverride
+		bearer = *anthropicBearerOverride
+	} else if *injectAuth || (claudeLike && !useBedrock) {
+		var err error
+		apiKey, bearer, err = readClaudeAuth(home)
+		if err != nil {
+			if *injectAuth {
+				return fmt.Errorf("--inject-auth: %w", err)
 			}
+			log.Printf("warning: --claude: %v", err)
 		}
-		if apiKey != "" || bearer != "" {
-			mitmDomains = append(mitmDomains, "api.anthropic.com")
-			if !matchDomain("api.anthropic.com", allowedDomains) {
-				allowedDomains = append(allowedDomains, "api.anthropic.com")
-			}
+	}
+	if apiKey != "" || bearer != "" {
+		mitmDomains = append(mitmDomains, "api.anthropic.com")
+		if !matchDomain("api.anthropic.com", allowedDomains) {
+			allowedDomains = append(allowedDomains, "api.anthropic.com")
 		}
 	}
 	// Hosts mentioned via --mitm-upstream should also be MITM'd and on
@@ -660,19 +660,25 @@ func mainErr() error {
 	)
 	containerEnv := os.Environ()
 	if claudeLike {
-		// Always strip AWS credential vars in claude mode: applyClaudeSettingsEnv
-		// may have injected them from settings.json into our own process env, and
-		// we don't want them leaking into the container (the MITM handles signing).
+		// Strip all AWS/Bedrock vars that applyClaudeSettingsEnv may have
+		// injected from settings.json; the container gets only what we
+		// explicitly re-add below.
 		containerEnv = scrubAWSCreds(containerEnv)
 	}
 	if useBedrock {
-		// Stub credentials so the in-container aws-sdk doesn't refuse to
-		// construct a request. The MITM strips these and signs with the real
-		// host credentials before forwarding.
+		// Re-add Bedrock routing vars and stub credentials so the in-container
+		// aws-sdk constructs requests; the MITM strips these and re-signs.
 		containerEnv = append(containerEnv,
+			"CLAUDE_CODE_USE_BEDROCK=1",
 			"AWS_ACCESS_KEY_ID=AKIA000RUNCLAUDESTUB",
 			"AWS_SECRET_ACCESS_KEY=runclaude-stub-secret-do-not-use",
 		)
+		if r := os.Getenv("AWS_REGION"); r != "" {
+			containerEnv = append(containerEnv, "AWS_REGION="+r)
+		}
+		if r := os.Getenv("AWS_DEFAULT_REGION"); r != "" {
+			containerEnv = append(containerEnv, "AWS_DEFAULT_REGION="+r)
+		}
 	}
 	cmd.Env = append(containerEnv, childEnv+"="+encodeConfig(cfg))
 	cmd.Stderr = os.Stderr
@@ -688,20 +694,22 @@ func mainErr() error {
 	return err
 }
 
-// scrubAWSCreds returns env without any AWS credential-bearing variables.
-// AWS_REGION / AWS_PROFILE / AWS_DEFAULT_REGION are kept so the in-container
-// aws-sdk still knows which region to target.
+// scrubAWSCreds returns env without AWS credential and Bedrock-routing
+// variables. Callers re-add the ones needed for the specific mode.
 func scrubAWSCreds(env []string) []string {
 	skip := map[string]bool{
 		"AWS_ACCESS_KEY_ID":     true,
 		"AWS_SECRET_ACCESS_KEY": true,
 		"AWS_SESSION_TOKEN":     true,
 		"AWS_SECURITY_TOKEN":    true,
-		// AWS_PROFILE would have the SDK look in ~/.aws/credentials, which we
-		// haven't bound into the container; safer to force env-only creds.
 		"AWS_PROFILE":                 true,
 		"AWS_CONFIG_FILE":             true,
 		"AWS_SHARED_CREDENTIALS_FILE": true,
+		// Bedrock routing: strip so non-Bedrock mode isn't accidentally routed
+		// to Bedrock; re-added explicitly when useBedrock is true.
+		"CLAUDE_CODE_USE_BEDROCK": true,
+		"AWS_REGION":              true,
+		"AWS_DEFAULT_REGION":      true,
 	}
 	out := env[:0]
 	for _, e := range env {
