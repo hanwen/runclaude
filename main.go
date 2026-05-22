@@ -344,6 +344,7 @@ func mainErr() error {
 	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
 	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
 	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
+	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
 	mapWorkspace := flag.Bool("map-workspace", true, "for git/jj workspaces map the originating repository")
@@ -362,6 +363,8 @@ func mainErr() error {
 		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	flag.Parse()
 
+	claudeLike := *claudeMode || *claudeConfig
+
 	allowedDomains := allowDomain.items
 	if !allowDomain.set {
 		allowedDomains = defaultAllowedDomains
@@ -377,11 +380,11 @@ func mainErr() error {
 	// see the same effective env (CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE,
 	// etc.) without the user having to also export them in their shell.
 	// Host env still wins — settings.json only fills unset variables.
-	if *claudeMode {
+	if claudeLike {
 		applyClaudeSettingsEnv(loadClaudeSettingsEnv(home, cwd))
 	}
-	useBedrock := *claudeMode && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
-	if *injectAuth || (*claudeMode && !useBedrock) {
+	useBedrock := claudeLike && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
+	if *injectAuth || (claudeLike && !useBedrock) {
 		switch {
 		case *anthropicKeyOverride != "" || *anthropicBearerOverride != "":
 			apiKey = *anthropicKeyOverride
@@ -570,13 +573,17 @@ func mainErr() error {
 	if *mapWorkspace {
 		cfg.Binds = append(cfg.Binds, workspaceBinds(cwd)...)
 	}
-	if *claudeMode {
+	if claudeLike {
 		extra, err := claudeBinds(home)
 		if err != nil {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
-		cfg.Command = append([]string{"claude", "--dangerously-skip-permissions"}, flag.Args()...)
+		if *claudeMode {
+			cfg.Command = append([]string{"claude", "--dangerously-skip-permissions"}, flag.Args()...)
+		} else if args := flag.Args(); len(args) > 0 {
+			cfg.Command = args
+		}
 		if bearer != "" || apiKey != "" {
 			if err := writeStubCredentials(filepath.Join(cacheDir, "home", ".claude")); err != nil {
 				return err
@@ -595,8 +602,6 @@ func mainErr() error {
 			return err
 		}
 		cfg.Binds = append(cfg.Binds, settingsBinds...)
-	} else if args := flag.Args(); len(args) > 0 {
-		cfg.Command = args
 	}
 	if len(cfg.Command) == 0 {
 		cfg.Command = []string{"bash"}
@@ -611,8 +616,13 @@ func mainErr() error {
 		"--", self,
 	)
 	containerEnv := os.Environ()
-	if useBedrock {
+	if claudeLike {
+		// Always strip AWS credential vars in claude mode: applyClaudeSettingsEnv
+		// may have injected them from settings.json into our own process env, and
+		// we don't want them leaking into the container (the MITM handles signing).
 		containerEnv = scrubAWSCreds(containerEnv)
+	}
+	if useBedrock {
 		// Stub credentials so the in-container aws-sdk doesn't refuse to
 		// construct a request. The MITM strips these and signs with the real
 		// host credentials before forwarding.
@@ -837,12 +847,19 @@ func childMain() error {
 		}
 	}
 
-	boundSeen := map[string]bool{}
+	// Deduplicate by dest, keeping the last bind (later entries override earlier
+	// ones, so overlays appended after a directory bind take effect).
+	dedupedBinds := make([]Bind, 0, len(cfg.Binds))
+	seenDest := map[string]int{}
 	for _, d := range cfg.Binds {
-		if boundSeen[d.dest()] {
-			continue
+		if i, ok := seenDest[d.dest()]; ok {
+			dedupedBinds[i] = d
+		} else {
+			seenDest[d.dest()] = len(dedupedBinds)
+			dedupedBinds = append(dedupedBinds, d)
 		}
-		boundSeen[d.dest()] = true
+	}
+	for _, d := range dedupedBinds {
 		dest := filepath.Join(cfg.Rootfs, d.dest())
 		info, err := os.Stat(d.Path)
 		if err != nil {
