@@ -317,6 +317,34 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
 	io.Copy(w, resp.Body)
 }
 
+// newMitmReverseProxy builds the reverse proxy used by the MITM path. The
+// Director here is the single place where runclaude rewrites outgoing
+// requests; tests exercise it directly to verify no header drift.
+func newMitmReverseProxy(host string, target *url.URL, inject func(string, *http.Request), logger *log.Logger) *httputil.ReverseProxy {
+	rp := httputil.NewSingleHostReverseProxy(target)
+	origDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = host
+		req.Header.Del("Proxy-Connection")
+		inject(host, req)
+		// Suppress httputil.ReverseProxy's automatic X-Forwarded-For
+		// injection so the upstream request matches the client byte-for-byte
+		// (modulo bedrock re-signing). The explicit nil signals "omit".
+		// Set *after* inject so the v4 signer doesn't see (and sign) the
+		// placeholder.
+		req.Header["X-Forwarded-For"] = nil
+		logger.Printf("mitm req  %s %s", req.Method, req.URL.String())
+	}
+	rp.FlushInterval = 50 * time.Millisecond
+	rp.ErrorLog = logger
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Printf("mitm upstream %s %s: %v", host, r.URL.Path, err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+	}
+	return rp
+}
+
 func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), logger *log.Logger) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -346,21 +374,7 @@ func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leaf
 	}
 
 	target, _ := url.Parse("https://" + host)
-	rp := httputil.NewSingleHostReverseProxy(target)
-	origDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = host
-		req.Header.Del("Proxy-Connection")
-		inject(host, req)
-		logger.Printf("mitm req  %s %s", req.Method, req.URL.String())
-	}
-	rp.FlushInterval = 50 * time.Millisecond
-	rp.ErrorLog = logger
-	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Printf("mitm upstream %s %s: %v", host, r.URL.Path, err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
-	}
+	rp := newMitmReverseProxy(host, target, inject, logger)
 
 	logger.Printf("mitm tls  %s alpn=%q", host, tlsConn.ConnectionState().NegotiatedProtocol)
 	ln := &singleConnListener{conn: tlsConn, block: make(chan struct{})}
@@ -683,6 +697,35 @@ func setupNetwork(cfg *Config) (int, error) {
 	return port, nil
 }
 
+// hopByHopHeaders are the RFC 7230 §6.1 end-to-end forbidden headers that
+// httputil.ReverseProxy removes between hops. We strip them ourselves before
+// re-signing so the signature covers exactly the header set the upstream
+// will see.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func stripHopByHopHeaders(h http.Header) {
+	if conn := h.Get("Connection"); conn != "" {
+		for _, name := range strings.Split(conn, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+}
+
 // ---------- AWS Bedrock (SigV4) ----------
 
 func isBedrockHost(host string) bool {
@@ -706,11 +749,21 @@ func bedrockRegion(host string) string {
 // signed with stub credentials we set in the container env; we strip those and
 // recompute SigV4 against the real credentials. Body is unchanged.
 func injectBedrock(host string, r *http.Request, provider aws.CredentialsProvider, signer *v4.Signer, logger *log.Logger) {
+	injectBedrockAt(host, r, provider, signer, time.Now(), logger)
+}
+
+func injectBedrockAt(host string, r *http.Request, provider aws.CredentialsProvider, signer *v4.Signer, now time.Time, logger *log.Logger) {
 	region := bedrockRegion(host)
 	if region == "" {
 		logger.Printf("bedrock: malformed host %q", host)
 		return
 	}
+	// httputil.ReverseProxy strips hop-by-hop headers after the Director
+	// runs. If we re-signed with them present, our SignedHeaders list
+	// would name headers the upstream never sees, and Bedrock would
+	// reject the signature. Strip them first so we sign exactly what
+	// goes on the wire.
+	stripHopByHopHeaders(r.Header)
 	for _, h := range []string{
 		"Authorization",
 		"X-Amz-Date",
@@ -738,7 +791,7 @@ func injectBedrock(host string, r *http.Request, provider aws.CredentialsProvide
 		logger.Printf("bedrock: retrieve credentials: %v", err)
 		return
 	}
-	if err := signer.SignHTTP(ctx, creds, r, hash, "bedrock", region, time.Now()); err != nil {
+	if err := signer.SignHTTP(ctx, creds, r, hash, "bedrock", region, now); err != nil {
 		logger.Printf("bedrock: sign: %v", err)
 		return
 	}
