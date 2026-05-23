@@ -388,8 +388,6 @@ func mainErr() error {
 	mapWorkspace := flag.Bool("map-workspace", true, "for git/jj workspaces map the originating repository")
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
-	injectAuth := flag.Bool("inject-auth", false,
-		"MITM api.anthropic.com and inject $ANTHROPIC_API_KEY when the client doesn't supply credentials")
 	proxyLog := flag.String("proxy-log", "",
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	var mitmUpstream stringSlice
@@ -428,13 +426,10 @@ func mainErr() error {
 	if hasExplicitAnthropicCreds {
 		apiKey = *anthropicKeyOverride
 		bearer = *anthropicBearerOverride
-	} else if *injectAuth || (claudeLike && !useBedrock) {
+	} else if claudeLike && !useBedrock {
 		var err error
 		apiKey, bearer, err = readClaudeAuth(home)
 		if err != nil {
-			if *injectAuth {
-				return fmt.Errorf("--inject-auth: %w", err)
-			}
 			log.Printf("warning: --claude: %v", err)
 		}
 	}
@@ -698,10 +693,10 @@ func mainErr() error {
 // variables. Callers re-add the ones needed for the specific mode.
 func scrubAWSCreds(env []string) []string {
 	skip := map[string]bool{
-		"AWS_ACCESS_KEY_ID":     true,
-		"AWS_SECRET_ACCESS_KEY": true,
-		"AWS_SESSION_TOKEN":     true,
-		"AWS_SECURITY_TOKEN":    true,
+		"AWS_ACCESS_KEY_ID":           true,
+		"AWS_SECRET_ACCESS_KEY":       true,
+		"AWS_SESSION_TOKEN":           true,
+		"AWS_SECURITY_TOKEN":          true,
 		"AWS_PROFILE":                 true,
 		"AWS_CONFIG_FILE":             true,
 		"AWS_SHARED_CREDENTIALS_FILE": true,

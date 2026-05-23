@@ -3,7 +3,7 @@
 set -eux
 TMP=$(mktemp -d)
 
-go run ./ --inject-auth bash -xc './agent-claude-cred.sh' >& $TMP/log
+go run ./ --claude-config bash -xc './agent-claude-cred.sh' >& $TMP/log
 
 grep '"role":"assistant"' $TMP/log
 echo SUCCESS
