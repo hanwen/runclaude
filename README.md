@@ -28,20 +28,21 @@ This jail is made with the following assumptions/requirements:
 # How does it work?
 
 The jail uses a user namespace to become root.  It sets up bind-mounts
-so the host file system (but not /home) is visible, and then pivots to
+so the host file system (but not `/home`) is visible, and then pivots to
 the new root, dropping capabilities.
 
-Each sandbox has its own view of $HOME, stored under ~/.cache. This
-means that development caches (bazel cache, go module cache, etc.)
-survive across sessions.
+Each sandbox has its own view of `$HOME`, stored under
+`~/.cache`. This means that development caches (bazel cache, go module
+cache, etc.)  survive across sessions.
 
-The UID inside the container is the same as your own, so all files
-that end up in your source checkout are owned by you.
+The UID inside the container is the same as your own, so the file
+system looks the same inside and outside the container.
 
 The container runs in a network namespace, forcing all outgoing
 traffic through an HTTPS proxy. Credentials for Claude are injected in
 outgoing traffic, so Claude itself doesn't have access to the
-credential.
+credential. The proxy supports both Anthropic bearer credentials and
+AWS bedrock authentication.
 
 It has no runtime dependencies.
 
@@ -50,10 +51,18 @@ It has no runtime dependencies.
 
 * Git worktrees/jj workspaces are mapped into the container automatically
 
-* Entries from $PATH are mapped into the container automatically
+* Entries from `$PATH` are mapped into the container automatically
 
-* Claude automatically runs with --dangerously-skip-permissions, as it
+* Claude automatically runs with `--dangerously-skip-permissions`, as it
   runs in a sandbox anyway.
+
+
+# Known incompatibilities
+
+* The container is setup without `newuidmap`, so that need multiple
+  UIDs (eg. rootless podman) can't work
+
+* Tools packaged with snap don't work.
 
 
 # How secure is it?
