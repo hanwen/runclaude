@@ -658,18 +658,24 @@ func mainErr() error {
 	if err != nil {
 		return err
 	}
-	// We shell out to unshare(1) rather than using SysProcAttr.Cloneflags
-	// because of --map-auto: it invokes the setuid newuidmap/newgidmap
-	// helpers to install a full subuid range (from /etc/subuid) into the
-	// new user ns, so builds and nested containers inside have more than
-	// one uid available. An unprivileged process writing /proc/self/uid_map
-	// directly is restricted to a single-line self-mapping; reproducing
-	// --map-auto in-process means reimplementing the newuidmap fork/sync
-	// dance, which isn't worth it for one exec at session start.
-	cmd := exec.Command("unshare",
-		"--user", "--map-current-user", "--map-auto", "--keep-caps", "--mount",
-		"--", self,
-	)
+	// Single-uid mapping: the container only ever needs the user's own uid
+	// (see README). That lets us create the user+mount ns directly via
+	// Cloneflags instead of shelling out to unshare(1) + newuidmap.
+	// AmbientCaps preserves the caps we gain from creating the user ns
+	// across execve, equivalent to `unshare --keep-caps`.
+	uid := os.Getuid()
+	gid := os.Getgid()
+	ambient := make([]uintptr, 0, 41)
+	for c := uintptr(0); c < 41; c++ {
+		ambient = append(ambient, c)
+	}
+	cmd := exec.Command(self)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: uid, HostID: uid, Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: gid, HostID: gid, Size: 1}},
+		AmbientCaps: ambient,
+	}
 	containerEnv := os.Environ()
 	if claudeLike {
 		// Strip all AWS/Bedrock vars that applyClaudeSettingsEnv may have

@@ -9,8 +9,7 @@
 #
 # Prerequisites:
 #   - The `claude` CLI installed and on $PATH.
-#   - Working unprivileged user namespaces (newuidmap setuid-installed,
-#     /etc/subuid + /etc/subgid entries for $USER).
+#   - Working unprivileged user namespaces.
 #
 # For the deterministic, sandboxed equivalent that exercises the same
 # MITM + signing + fake-server stack without launching a container, see
@@ -23,11 +22,6 @@ if ! command -v claude >/dev/null 2>&1; then
     echo "skipping: claude CLI not on PATH"
     exit 0
 fi
-if ! command -v newuidmap >/dev/null 2>&1; then
-    echo "skipping: newuidmap not installed (required by runclaude)"
-    exit 0
-fi
-
 # Extra flags forwarded to runclaude per case (set by callers below).
 EXTRA_RC_FLAGS=()
 

@@ -17,7 +17,7 @@ go test ./...                       # unit + in-process e2e (TestMitmE2E*)
 go test -run TestName ./...         # single test
 ```
 
-Shell-level end-to-end tests (require `claude` on `$PATH`, working unprivileged user namespaces, and `newuidmap`):
+Shell-level end-to-end tests (require `claude` on `$PATH` and working unprivileged user namespaces):
 
 ```
 ./test-mitm.sh              # full MITM e2e: fake-anthropic + claude, both Anthropic and Bedrock auth paths
@@ -35,9 +35,9 @@ For deterministic MITM coverage that does not need the `claude` CLI, prefer `Tes
 
 ### Re-exec state machine (`main.go`)
 
-The binary runs in three modes, distinguished by env vars. Each mode re-execs the next via `unshare` or `exec.Command(self, ...)`:
+The binary runs in three modes, distinguished by env vars. Each mode re-execs the next via `exec.Command(self, ...)` with `SysProcAttr.Cloneflags`:
 
-1. **`mainErr`** (no env set) — host-side entry. Parses flags, builds a `Config`, sets up the host-side proxy + DNS goroutines, creates a socketpair, then `unshare --user --mount` re-execs itself with `_RUNCLAUDE_CHILD=<json config>`.
+1. **`mainErr`** (no env set) — host-side entry. Parses flags, builds a `Config`, sets up the host-side proxy + DNS goroutines, creates a socketpair, then re-execs itself with `Cloneflags = CLONE_NEWUSER|CLONE_NEWNS` and single-uid `UidMappings`/`GidMappings` (the container only ever needs the user's own uid — see README). All caps are added to `AmbientCaps` so the new ns retains mount privileges across execve. `_RUNCLAUDE_CHILD=<json config>` is passed via env.
 2. **`childMain`** (`_RUNCLAUDE_CHILD`) — inside user+mount ns. Bind-mounts host `/` (minus `/home`, `/tmp`, `/run`, `/dev`) into the rootfs, overlays cache dirs and user-specified binds, then re-execs itself with `SysProcAttr.Cloneflags = CLONE_NEWPID|NEWIPC|NEWUTS|NEWCGROUP[|NEWNET]` and `_RUNCLAUDE_INIT=<json>` — the new process is pid 1 of a fresh pid ns.
 3. **`initMain`** (`_RUNCLAUDE_INIT`) — mounts `/proc`, `pivot_root`s into the rootfs, sets up network inside the new netns (if `RestrictNet`), drops all caps, sets `HTTPS_PROXY` + CA env vars, then `execve`s the user command.
 
