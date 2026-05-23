@@ -206,7 +206,6 @@ func workspaceBinds(cwd string) []Bind {
 		if fi, err := os.Stat(filepath.Join(primary, ".git")); err == nil && fi.IsDir() {
 			out = append(out, Bind{Path: filepath.Join(primary, ".git")})
 		}
-		out = append(out, jjConfigBinds()...)
 	}
 	return out
 }
@@ -216,14 +215,20 @@ func workspaceBinds(cwd string) []Bind {
 // signing keys, etc.) the host user already has.
 func jjConfigBinds() []Bind {
 	var paths []string
+
 	if v := os.Getenv("JJ_CONFIG"); v != "" {
 		paths = append(paths, v)
 	}
 	cfgHome := os.Getenv("XDG_CONFIG_HOME")
-	if cfgHome == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			cfgHome = filepath.Join(home, ".config")
-		}
+	userHome := os.Getenv("HOME")
+	if h, err := os.UserHomeDir(); err == nil {
+		userHome = h
+	}
+	if userHome != "" {
+		paths = append(paths, filepath.Join(userHome, ".jjconfig.toml"))
+	}
+	if cfgHome == "" && userHome != "" {
+		cfgHome = filepath.Join(userHome, ".config")
 	}
 	if cfgHome != "" {
 		paths = append(paths, filepath.Join(cfgHome, "jj"))
@@ -605,6 +610,10 @@ func mainErr() error {
 	}
 	if *mapWorkspace {
 		cfg.Binds = append(cfg.Binds, workspaceBinds(cwd)...)
+	}
+
+	if _, err := os.Stat(".jj"); err == nil {
+		cfg.Binds = append(cfg.Binds, jjConfigBinds()...)
 	}
 	if claudeLike {
 		extra, err := claudeBinds(home)
