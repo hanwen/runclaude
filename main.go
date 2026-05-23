@@ -658,6 +658,14 @@ func mainErr() error {
 	if err != nil {
 		return err
 	}
+	// We shell out to unshare(1) rather than using SysProcAttr.Cloneflags
+	// because of --map-auto: it invokes the setuid newuidmap/newgidmap
+	// helpers to install a full subuid range (from /etc/subuid) into the
+	// new user ns, so builds and nested containers inside have more than
+	// one uid available. An unprivileged process writing /proc/self/uid_map
+	// directly is restricted to a single-line self-mapping; reproducing
+	// --map-auto in-process means reimplementing the newuidmap fork/sync
+	// dance, which isn't worth it for one exec at session start.
 	cmd := exec.Command("unshare",
 		"--user", "--map-current-user", "--map-auto", "--keep-caps", "--mount",
 		"--", self,
