@@ -35,12 +35,11 @@ For deterministic MITM coverage that does not need the `claude` CLI, prefer `Tes
 
 ### Re-exec state machine (`main.go`)
 
-The binary runs in four modes, distinguished by env vars / argv. Each mode re-execs the next via `unshare` or `exec.Command(self, ...)`:
+The binary runs in three modes, distinguished by env vars. Each mode re-execs the next via `unshare` or `exec.Command(self, ...)`:
 
 1. **`mainErr`** (no env set) — host-side entry. Parses flags, builds a `Config`, sets up the host-side proxy + DNS goroutines, creates a socketpair, then `unshare --user --mount` re-execs itself with `_RUNCLAUDE_CHILD=<json config>`.
-2. **`childMain`** (`_RUNCLAUDE_CHILD`) — inside user+mount ns. Bind-mounts host `/` (minus `/home`, `/tmp`, `/run`, `/dev`) into the rootfs, overlays cache dirs and user-specified binds, then execs `self --clone-init` with `_RUNCLAUDE_INIT=<json>`.
-3. **`cloneInitMain`** (`_RUNCLAUDE_INIT` + `--clone-init`) — `clone(CLONE_NEWPID|NEWIPC|NEWUTS|NEWCGROUP[|NEWNET])` to become pid 1 of a new pid ns.
-4. **`initMain`** (`_RUNCLAUDE_INIT`, no flag) — mounts `/proc`, `pivot_root`s into the rootfs, sets up network inside the new netns (if `RestrictNet`), drops all caps, sets `HTTPS_PROXY` + CA env vars, then `execve`s the user command.
+2. **`childMain`** (`_RUNCLAUDE_CHILD`) — inside user+mount ns. Bind-mounts host `/` (minus `/home`, `/tmp`, `/run`, `/dev`) into the rootfs, overlays cache dirs and user-specified binds, then re-execs itself with `SysProcAttr.Cloneflags = CLONE_NEWPID|NEWIPC|NEWUTS|NEWCGROUP[|NEWNET]` and `_RUNCLAUDE_INIT=<json>` — the new process is pid 1 of a fresh pid ns.
+3. **`initMain`** (`_RUNCLAUDE_INIT`) — mounts `/proc`, `pivot_root`s into the rootfs, sets up network inside the new netns (if `RestrictNet`), drops all caps, sets `HTTPS_PROXY` + CA env vars, then `execve`s the user command.
 
 The host-side proxy listener / DNS sockets are created by `initMain` inside the new netns, then their fds are sent over the socketpair (fd 3) back to `mainErr`, which runs the proxy goroutines on the host. The container sees `127.0.0.1:<port>` because the netns has its own loopback.
 

@@ -960,40 +960,6 @@ func childMain() error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(self, "--clone-init")
-	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-	cmd.Stdin = os.Stdin
-	// fd 3 (if present) is the comm socket back to mainErr; forward it.
-	if comm := os.NewFile(3, "comm"); comm != nil {
-		var st syscall.Stat_t
-		if err := syscall.Fstat(3, &st); err == nil {
-			cmd.ExtraFiles = []*os.File{comm}
-		}
-	}
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			os.Exit(ee.ExitCode())
-		}
-		return err
-	}
-	return nil
-}
-
-// cloneInitMain forks the container's init process into a fresh PID / IPC /
-// UTS / cgroup namespace (and, when --restrict-net is on, a fresh net ns).
-// The init process is what binds the proxy + DNS sockets and ships their fds
-// back to mainErr via the inherited comm socket on fd 3.
-func cloneInitMain() error {
-	cfg, err := loadConfig(initEnv)
-	if err != nil {
-		return err
-	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
 	cmd := exec.Command(self)
 	cmd.Env = append(os.Environ(), initEnv+"="+encodeConfig(cfg))
 	flags := uintptr(syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWCGROUP)
@@ -1004,6 +970,7 @@ func cloneInitMain() error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
+	// fd 3 (if present) is the comm socket back to mainErr; forward it.
 	if comm := os.NewFile(3, "comm"); comm != nil {
 		var st syscall.Stat_t
 		if err := syscall.Fstat(3, &st); err == nil {
@@ -1092,11 +1059,8 @@ func initMain() error {
 }
 
 func main() {
-	cloneInit := len(os.Args) > 1 && os.Args[1] == "--clone-init"
 	var err error
 	switch {
-	case os.Getenv(initEnv) != "" && cloneInit:
-		err = cloneInitMain()
 	case os.Getenv(initEnv) != "":
 		err = initMain()
 	case os.Getenv(childEnv) != "":
