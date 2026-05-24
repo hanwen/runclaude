@@ -46,7 +46,7 @@ func TestMitmE2EAnthropic(t *testing.T) {
 			r.Header.Set("anthropic-version", "2023-06-01")
 		}
 	}
-	rp := newMitmReverseProxy("api.anthropic.com", upstreamURL, inject, logger)
+	rp := newMitmReverseProxy("api.anthropic.com", upstreamURL, inject, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 
@@ -100,7 +100,7 @@ func TestMitmE2EBedrock(t *testing.T) {
 	inject := func(h string, r *http.Request) {
 		injectBedrock(h, r, credsProvider, signer, logger)
 	}
-	rp := newMitmReverseProxy(host, upstreamURL, inject, logger)
+	rp := newMitmReverseProxy(host, upstreamURL, inject, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 

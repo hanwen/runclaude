@@ -115,6 +115,32 @@ run_case anthropic api.anthropic.com '{}' \
     --anthropic-api-key "$TEST_BEARER"
 EXTRA_RC_FLAGS=()
 
+# --- Anthropic OAuth refresh path ---
+# Starts runclaude with a stale bearer; the fake server rejects it with 401,
+# runclaude's refresh transport hits /v1/oauth/token (via the env-overridden
+# URL pointing at the fake server) using the supplied refresh token, gets
+# the real bearer back, and replays the request.
+TEST_NEW_BEARER="sk-ant-oat01-new-$$-$(date +%s)"
+TEST_OLD_BEARER="sk-ant-oat01-stale-$$-$(date +%s)"
+TEST_REFRESH="sk-ant-ort01-refresh-$$-$(date +%s)"
+
+# Pick a fixed port for the fake server in this case so we can pass its URL
+# via env before the server is started. The fake server is told to listen on
+# that exact port.
+REFRESH_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+
+EXTRA_RC_FLAGS=(
+    --anthropic-bearer "$TEST_OLD_BEARER"
+    --anthropic-refresh "$TEST_REFRESH"
+)
+RUNCLAUDE_CLAUDE_TOKEN_URL="http://127.0.0.1:$REFRESH_PORT/v1/oauth/token" \
+    run_case anthropic-refresh \
+        api.anthropic.com '{}' \
+        --addr "127.0.0.1:$REFRESH_PORT" \
+        --anthropic-api-key "$TEST_NEW_BEARER" \
+        --oauth-refresh-token "$TEST_REFRESH"
+EXTRA_RC_FLAGS=()
+
 # --- Bedrock SigV4 path ---
 REGION="us-east-1"
 ACCESS_KEY="AKIAFAKE$(date +%s)"

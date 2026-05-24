@@ -25,13 +25,20 @@ const FixedReply = "I am a fake anthropic API server"
 // Config controls credential validation. Set APIKey to enable the
 // Anthropic native API route; set AWSAccessKey/AWSSecretKey to enable the
 // Bedrock InvokeModel route. Both may be enabled simultaneously.
+//
+// To exercise the OAuth refresh path, set OAuthRefreshToken: the server
+// will treat APIKey as the *post-refresh* access token (so requests
+// presenting any other bearer fail with 401), and /v1/oauth/token will
+// accept that refresh token and return APIKey as the new access token.
 type Config struct {
-	APIKey          string
-	AWSAccessKey    string
-	AWSSecretKey    string
-	AWSSessionToken string
-	AWSRegion       string
-	Logger          *log.Logger
+	APIKey            string
+	AWSAccessKey      string
+	AWSSecretKey      string
+	AWSSessionToken   string
+	AWSRegion         string
+	OAuthRefreshToken string
+	OAuthNewRefresh   string // optional; rotates the refresh token too
+	Logger            *log.Logger
 }
 
 // Handler returns an http.Handler implementing a minimal Anthropic /
@@ -43,6 +50,7 @@ func Handler(cfg Config) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", anthropicMessages(cfg))
+	mux.HandleFunc("/v1/oauth/token", oauthToken(cfg))
 	mux.HandleFunc("/model/", bedrockInvoke(cfg))
 	mux.HandleFunc("/", catchAll(cfg))
 	return mux
@@ -103,6 +111,43 @@ func anthropicMessages(cfg Config) http.HandlerFunc {
 		} else {
 			writeAnthropicJSON(w)
 		}
+	}
+}
+
+func oauthToken(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cfg.OAuthRefreshToken == "" {
+			http.Error(w, `{"error":"server not configured for oauth refresh"}`, http.StatusNotFound)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			GrantType    string `json:"grant_type"`
+			RefreshToken string `json:"refresh_token"`
+			ClientID     string `json:"client_id"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			cfg.Logger.Printf("oauth: bad json: %v", err)
+			http.Error(w, `{"error":"invalid_request"}`, http.StatusBadRequest)
+			return
+		}
+		if req.GrantType != "refresh_token" || req.RefreshToken != cfg.OAuthRefreshToken {
+			cfg.Logger.Printf("oauth: bad grant/refresh (grant=%q refresh=%q)", req.GrantType, req.RefreshToken)
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusUnauthorized)
+			return
+		}
+		newRefresh := cfg.OAuthNewRefresh
+		if newRefresh == "" {
+			newRefresh = cfg.OAuthRefreshToken
+		}
+		cfg.Logger.Printf("oauth: refresh ok client=%q", req.ClientID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  cfg.APIKey,
+			"refresh_token": newRefresh,
+			"expires_in":    28800,
+			"token_type":    "Bearer",
+		})
 	}
 }
 

@@ -235,6 +235,9 @@ type proxySetup struct {
 	// upstream maps a MITM-intercepted host to an override target URL.
 	// Empty/missing entries fall back to "https://<host>".
 	upstream map[string]string
+	// transports lets a host install a custom RoundTripper around the
+	// upstream call (e.g. to handle 401-driven OAuth refresh). Optional.
+	transports map[string]http.RoundTripper
 }
 
 func openProxyLogger(logPath string) (*log.Logger, error) {
@@ -262,7 +265,7 @@ func serveProxy(p *proxySetup, ln net.Listener, logger *log.Logger) {
 				proxyHTTP(w, r, logger)
 				return
 			}
-			proxyMitm(w, r, host, p.leaves, p.inject, p.upstream[host], logger)
+			proxyMitm(w, r, host, p.leaves, p.inject, p.upstream[host], p.transports[host], logger)
 		case matchDomain(host, p.allowed):
 			logger.Printf("allow %s %s", r.Method, host)
 			if r.Method == http.MethodConnect {
@@ -328,8 +331,11 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, logger *log.Logger) {
 // newMitmReverseProxy builds the reverse proxy used by the MITM path. The
 // Director here is the single place where runclaude rewrites outgoing
 // requests; tests exercise it directly to verify no header drift.
-func newMitmReverseProxy(host string, target *url.URL, inject func(string, *http.Request), logger *log.Logger) *httputil.ReverseProxy {
+func newMitmReverseProxy(host string, target *url.URL, inject func(string, *http.Request), transport http.RoundTripper, logger *log.Logger) *httputil.ReverseProxy {
 	rp := httputil.NewSingleHostReverseProxy(target)
+	if transport != nil {
+		rp.Transport = transport
+	}
 	origDirector := rp.Director
 	rp.Director = func(req *http.Request) {
 		origDirector(req)
@@ -353,7 +359,7 @@ func newMitmReverseProxy(host string, target *url.URL, inject func(string, *http
 	return rp
 }
 
-func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), upstreamOverride string, logger *log.Logger) {
+func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leafCache, inject func(string, *http.Request), upstreamOverride string, transport http.RoundTripper, logger *log.Logger) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
@@ -390,7 +396,7 @@ func proxyMitm(w http.ResponseWriter, r *http.Request, host string, leaves *leaf
 		logger.Printf("mitm: bad upstream %q: %v", targetStr, err)
 		return
 	}
-	rp := newMitmReverseProxy(host, target, inject, logger)
+	rp := newMitmReverseProxy(host, target, inject, transport, logger)
 
 	logger.Printf("mitm tls  %s alpn=%q", host, tlsConn.ConnectionState().NegotiatedProtocol)
 	ln := &singleConnListener{conn: tlsConn, block: make(chan struct{})}

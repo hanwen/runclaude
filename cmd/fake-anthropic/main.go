@@ -19,15 +19,19 @@ func main() {
 	awsSecretKey := flag.String("aws-secret-access-key", "", "expected AWS secret access key")
 	awsSessionToken := flag.String("aws-session-token", "", "expected AWS session token (optional)")
 	awsRegion := flag.String("aws-region", "us-east-1", "AWS region used to verify SigV4")
+	oauthRefresh := flag.String("oauth-refresh-token", "", "expected refresh token at /v1/oauth/token (enables OAuth refresh route)")
+	oauthNewRefresh := flag.String("oauth-new-refresh-token", "", "if set, /v1/oauth/token returns this as the rotated refresh token")
 	flag.Parse()
 
 	cfg := fakeapi.Config{
-		APIKey:          *apiKey,
-		AWSAccessKey:    *awsAccessKey,
-		AWSSecretKey:    *awsSecretKey,
-		AWSSessionToken: *awsSessionToken,
-		AWSRegion:       *awsRegion,
-		Logger:          log.New(os.Stderr, "fake-anthropic: ", log.LstdFlags|log.Lmicroseconds),
+		APIKey:            *apiKey,
+		AWSAccessKey:      *awsAccessKey,
+		AWSSecretKey:      *awsSecretKey,
+		AWSSessionToken:   *awsSessionToken,
+		AWSRegion:         *awsRegion,
+		OAuthRefreshToken: *oauthRefresh,
+		OAuthNewRefresh:   *oauthNewRefresh,
+		Logger:            log.New(os.Stderr, "fake-anthropic: ", log.LstdFlags|log.Lmicroseconds),
 	}
 	if cfg.APIKey == "" && cfg.AWSSecretKey == "" {
 		log.Fatal("must set -anthropic-api-key or -aws-secret-access-key (or both)")

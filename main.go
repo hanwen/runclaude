@@ -296,31 +296,35 @@ func writeStubCredentials(claudeDir string) error {
 
 // readClaudeAuth returns either an OAuth bearer token or an API key extracted
 // from ~/.claude/.credentials.json (preferred) or $ANTHROPIC_API_KEY.
-func readClaudeAuth(home string) (apiKey, bearer string, err error) {
+// If a bearer is returned from a credentials file, refreshToken and credPath
+// are populated so the caller can rotate the token in place on a 401.
+func readClaudeAuth(home string) (apiKey, bearer, refreshToken, credPath string, err error) {
 	for _, name := range []string{".credentials.json", "credentials.json"} {
-		data, rerr := os.ReadFile(filepath.Join(home, ".claude", name))
+		p := filepath.Join(home, ".claude", name)
+		data, rerr := os.ReadFile(p)
 		if rerr != nil {
 			continue
 		}
 		var creds struct {
 			ClaudeAiOauth struct {
-				AccessToken string `json:"accessToken"`
+				AccessToken  string `json:"accessToken"`
+				RefreshToken string `json:"refreshToken"`
 			} `json:"claudeAiOauth"`
 			APIKey string `json:"apiKey"`
 		}
 		if json.Unmarshal(data, &creds) == nil {
 			if creds.ClaudeAiOauth.AccessToken != "" {
-				return "", creds.ClaudeAiOauth.AccessToken, nil
+				return "", creds.ClaudeAiOauth.AccessToken, creds.ClaudeAiOauth.RefreshToken, p, nil
 			}
 			if creds.APIKey != "" {
-				return creds.APIKey, "", nil
+				return creds.APIKey, "", "", "", nil
 			}
 		}
 	}
 	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
-		return k, "", nil
+		return k, "", "", "", nil
 	}
-	return "", "", fmt.Errorf("no claude credentials found (looked in ~/.claude/.credentials.json and $ANTHROPIC_API_KEY)")
+	return "", "", "", "", fmt.Errorf("no claude credentials found (looked in ~/.claude/.credentials.json and $ANTHROPIC_API_KEY)")
 }
 
 // checkUserNS verifies that unprivileged user namespaces are permitted by the
@@ -402,6 +406,8 @@ func mainErr() error {
 		"override the Anthropic API key the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	anthropicBearerOverride := flag.String("anthropic-bearer", "",
 		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
+	anthropicRefreshOverride := flag.String("anthropic-refresh", "",
+		"OAuth refresh token to use with --anthropic-bearer for 401-triggered refresh; for testing")
 	flag.Parse()
 
 	claudeLike := *claudeMode || *claudeConfig
@@ -412,9 +418,11 @@ func mainErr() error {
 	}
 
 	var (
-		mitmDomains []string
-		apiKey      string
-		bearer      string
+		mitmDomains  []string
+		apiKey       string
+		bearer       string
+		refreshToken string
+		credPath     string
 	)
 	// Pull env from .claude/settings.json into the host process. The
 	// in-container claude reads settings.json itself; this lets runclaude
@@ -431,9 +439,10 @@ func mainErr() error {
 	if hasExplicitAnthropicCreds {
 		apiKey = *anthropicKeyOverride
 		bearer = *anthropicBearerOverride
+		refreshToken = *anthropicRefreshOverride
 	} else if claudeLike && !useBedrock {
 		var err error
-		apiKey, bearer, err = readClaudeAuth(home)
+		apiKey, bearer, refreshToken, credPath, err = readClaudeAuth(home)
 		if err != nil {
 			log.Printf("warning: --claude: %v", err)
 		}
@@ -536,14 +545,24 @@ func mainErr() error {
 			cfg.BundlePath = "/tmp/runclaude-bundle.crt"
 			cfg.CAPath = "/tmp/runclaude-ca.crt"
 			setup.leaves = newLeafCache(ca)
+			// If we have a refresh token, install a token source so we
+			// can rotate the access token on a 401. Otherwise the bearer
+			// is constant for the lifetime of the process.
+			var tokens *tokenSource
+			if bearer != "" && refreshToken != "" {
+				tokens = newTokenSource(bearer, refreshToken, credPath)
+			}
 			setup.inject = func(host string, r *http.Request) {
 				switch {
 				case host == "api.anthropic.com" && (bearer != "" || apiKey != ""):
 					r.Header.Del("Authorization")
 					r.Header.Del("x-api-key")
-					if bearer != "" {
+					switch {
+					case tokens != nil:
+						r.Header.Set("Authorization", "Bearer "+tokens.Bearer())
+					case bearer != "":
 						r.Header.Set("Authorization", "Bearer "+bearer)
-					} else {
+					default:
 						r.Header.Set("x-api-key", apiKey)
 					}
 					if r.Header.Get("anthropic-version") == "" {
@@ -551,6 +570,16 @@ func mainErr() error {
 					}
 				case isBedrockHost(host) && awsCreds != nil:
 					injectBedrock(host, r, awsCreds, awsSigner, logger)
+				}
+			}
+			if tokens != nil {
+				setup.transports = map[string]http.RoundTripper{
+					"api.anthropic.com": &refreshTransport{
+						base:     http.DefaultTransport,
+						tokens:   tokens,
+						reinject: func(r *http.Request) { setup.inject("api.anthropic.com", r) },
+						logger:   logger,
+					},
 				}
 			}
 		}
