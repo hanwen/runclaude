@@ -390,7 +390,7 @@ func mainErr() error {
 	var exposed stringSlice
 	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
 	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
-	claudeMode := flag.Bool("claude", false, "bind files needed for `claude` and run it as the default command")
+	claudeMode := flag.Bool("claude", true, "bind files needed for `claude` and run it as the default command")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
