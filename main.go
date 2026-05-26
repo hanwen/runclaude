@@ -842,13 +842,22 @@ func childMain() error {
 	}
 
 	homePrefix := "/" + strings.SplitN(strings.TrimPrefix(cfg.Home, "/"), "/", 2)[0]
+	// /mnt and /media are excluded because admins commonly mount additional
+	// filesystems there, and recursive bind-mounting them risks aliasing the
+	// volume that backs the cache home/tmp/run (e.g. a btrfs whose subvol=/
+	// is mounted at /mnt/data and whose subvol=/cache is mounted at $HOME).
+	// The post-bind containment check below catches any remaining aliases.
+	excluded := map[string]bool{
+		homePrefix: true, "/proc": true, "/tmp": true, "/run": true, "/dev": true,
+		"/mnt": true, "/media": true,
+	}
 	entries, err := os.ReadDir("/")
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
 		src := "/" + e.Name()
-		if src == homePrefix || src == "/proc" || src == "/tmp" || src == "/run" || src == "/dev" {
+		if excluded[src] {
 			continue
 		}
 		dest := filepath.Join(cfg.Rootfs, src)
@@ -997,6 +1006,14 @@ func childMain() error {
 				return fmt.Errorf("remount-ro %s: %w", dest, err)
 			}
 		}
+	}
+
+	if err := checkContainment(cfg.Rootfs, []string{
+		filepath.Join(cfg.Rootfs, cfg.Home),
+		filepath.Join(cfg.Rootfs, "tmp"),
+		filepath.Join(cfg.Rootfs, "run"),
+	}); err != nil {
+		return err
 	}
 
 	self, err := os.Executable()
