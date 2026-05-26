@@ -38,6 +38,10 @@ var awsClaudeSettingsTopLevelScrub = []string{
 
 type claudeSettings struct {
 	Env map[string]string `json:"env"`
+	// AwsAuthRefresh is a shell command runclaude executes when AWS
+	// credentials fail to load (e.g. expired SSO). Read host-side; stripped
+	// from the in-container settings.json.
+	AwsAuthRefresh string `json:"awsAuthRefresh"`
 }
 
 // claudeSettingsPaths returns the settings.json files that claude itself
@@ -50,11 +54,10 @@ func claudeSettingsPaths(home, cwd string) []string {
 	}
 }
 
-// loadClaudeSettingsEnv merges env maps from claude's settings files
-// (user-level then project-level), with later files overriding earlier
-// ones.
-func loadClaudeSettingsEnv(home, cwd string) map[string]string {
-	out := map[string]string{}
+// loadClaudeSettings merges claude's settings files (user-level then
+// project-level), with later files overriding earlier ones.
+func loadClaudeSettings(home, cwd string) claudeSettings {
+	out := claudeSettings{Env: map[string]string{}}
 	for _, p := range claudeSettingsPaths(home, cwd) {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -65,7 +68,10 @@ func loadClaudeSettingsEnv(home, cwd string) map[string]string {
 			continue
 		}
 		for k, v := range s.Env {
-			out[k] = v
+			out.Env[k] = v
+		}
+		if s.AwsAuthRefresh != "" {
+			out.AwsAuthRefresh = s.AwsAuthRefresh
 		}
 	}
 	return out

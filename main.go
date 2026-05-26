@@ -429,8 +429,10 @@ func mainErr() error {
 	// see the same effective env (CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE,
 	// etc.) without the user having to also export them in their shell.
 	// Host env still wins — settings.json only fills unset variables.
+	var settings claudeSettings
 	if claudeLike {
-		applyClaudeSettingsEnv(loadClaudeSettingsEnv(home, cwd))
+		settings = loadClaudeSettings(home, cwd)
+		applyClaudeSettingsEnv(settings.Env)
 	}
 	// Explicit key/bearer overrides force the Anthropic path even on a
 	// Bedrock host (e.g. test-mitm.sh passing --anthropic-bearer).
@@ -470,10 +472,16 @@ func mainErr() error {
 		if err != nil {
 			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: load AWS config: %w", err)
 		}
-		if _, err := awsCfg.Credentials.Retrieve(context.Background()); err != nil {
-			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: %w (try 'aws sso login')", err)
+		provider := &refreshingCredentialProvider{
+			cfg:     awsCfg,
+			refresh: settings.AwsAuthRefresh,
+			logger:  log.Default(),
 		}
-		awsCreds = awsCfg.Credentials
+		// Validate credentials (running awsAuthRefresh if needed) before start.
+		if _, err := provider.Retrieve(context.Background()); err != nil {
+			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: %w", err)
+		}
+		awsCreds = provider
 		awsSigner = v4.NewSigner()
 		pattern := "bedrock-runtime.*.amazonaws.com"
 		mitmDomains = append(mitmDomains, pattern)

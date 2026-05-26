@@ -81,6 +81,38 @@ func TestSanitizeSettingsNoEnvNoBind(t *testing.T) {
 	}
 }
 
+func TestLoadClaudeSettings(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, ".claude"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{
+  "awsAuthRefresh": "aws sso login --profile user",
+  "env": {"AWS_PROFILE": "user", "FOO": "bar"}
+}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".claude", "settings.json"), []byte(`{
+  "env": {"AWS_PROFILE": "project"}
+}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := loadClaudeSettings(home, cwd)
+	if s.AwsAuthRefresh != "aws sso login --profile user" {
+		t.Errorf("AwsAuthRefresh = %q", s.AwsAuthRefresh)
+	}
+	if s.Env["AWS_PROFILE"] != "project" {
+		t.Errorf("project should override user; AWS_PROFILE = %q", s.Env["AWS_PROFILE"])
+	}
+	if s.Env["FOO"] != "bar" {
+		t.Errorf("user-level entry lost: FOO = %q", s.Env["FOO"])
+	}
+}
+
 func TestSanitizeSettingsNoAWSNoBind(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(src, []byte(`{"env":{"FOO":"bar"}}`), 0644); err != nil {
