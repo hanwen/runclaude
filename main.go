@@ -550,7 +550,7 @@ func mainErr() error {
 			// is constant for the lifetime of the process.
 			var tokens *tokenSource
 			if bearer != "" && refreshToken != "" {
-				tokens = newTokenSource(bearer, refreshToken, credPath)
+				tokens = newTokenSource(bearer, refreshToken, credPath, logger)
 			}
 			setup.inject = func(host string, r *http.Request) {
 				switch {
