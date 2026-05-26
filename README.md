@@ -1,5 +1,14 @@
 # A simple jail for Claude
 
+
+## TL;DR
+
+Use
+
+	runclaude
+
+instead of `claude`, to protect your home directory against Claude reading it. 
+
 ## Why
 
 I love how LLMs speed up writing code, but the security model has me
@@ -86,8 +95,8 @@ It has no runtime dependencies and starts up in ~20ms.
 
 * Some nested sandboxing tools (eg. snap) don't work.
 
-* Networking tools that do certificate pinning may refuse to work with
-  the HTTPS proxy.
+* Networking tools that pin certificates may refuse to work with the
+  HTTPS proxy.
 
 ## Comparisons
 
