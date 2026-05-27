@@ -40,10 +40,14 @@ func projectSettingsHasAWS(cwd string) bool {
 
 // buildMergedClaudeDir produces a merged copy of the user's ~/.claude/ and
 // the project's <cwd>/.claude/ at destDir. The user tree is copied first
-// (skipping credential files and any pre-existing destDir contents), then
-// the project tree is overlaid on top; project entries shadow user entries
-// at the same relative path. settings.json gets a deep-merge with AWS
-// env keys and awsAuthRefresh stripped.
+// (skipping credential files, live-state entries, and any pre-existing
+// destDir contents), then the project tree is overlaid on top; project
+// entries shadow user entries at the same relative path. settings.json gets
+// a deep-merge with AWS env keys and awsAuthRefresh stripped.
+//
+// Live-state entries (history.jsonl, projects/, sessions/, etc.) are NOT
+// copied; the caller bind-mounts them directly from ~/.claude on top of
+// destDir so writes persist across invocations.
 //
 // destDir is bind-mounted as $HOME/.claude inside the container while
 // claude is launched with --setting-sources user, so the in-container
@@ -58,10 +62,10 @@ func buildMergedClaudeDir(home, cwd, destDir string) error {
 	userClaude := filepath.Join(home, ".claude")
 	projClaude := filepath.Join(cwd, ".claude")
 
-	if err := copyClaudeTree(userClaude, destDir, true); err != nil {
+	if err := copyClaudeTree(userClaude, destDir, true, true); err != nil {
 		return err
 	}
-	if err := copyClaudeTree(projClaude, destDir, false); err != nil {
+	if err := copyClaudeTree(projClaude, destDir, false, false); err != nil {
 		return err
 	}
 
@@ -79,8 +83,9 @@ func buildMergedClaudeDir(home, cwd, destDir string) error {
 // copyClaudeTree recursively copies src into dst. Existing entries at the
 // same relative path are overwritten (so callers can layer trees by
 // invoking with the lower-precedence tree first). Credential files at the
-// top level are skipped when skipCreds is true.
-func copyClaudeTree(src, dst string, skipCreds bool) error {
+// top level are skipped when skipCreds is true. Live-state entries at the
+// top level are skipped when skipLive is true.
+func copyClaudeTree(src, dst string, skipCreds, skipLive bool) error {
 	info, err := os.Stat(src)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -102,11 +107,19 @@ func copyClaudeTree(src, dst string, skipCreds bool) error {
 		if rel == "." {
 			return nil
 		}
-		if skipCreds && filepath.Dir(rel) == "." && credentialFiles[d.Name()] {
-			if d.IsDir() {
-				return fs.SkipDir
+		if filepath.Dir(rel) == "." {
+			if skipCreds && credentialFiles[d.Name()] {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
-			return nil
+			if skipLive && claudeLiveState[d.Name()] {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
 		}
 		out := filepath.Join(dst, rel)
 		if d.IsDir() {

@@ -141,6 +141,28 @@ var credentialFiles = map[string]bool{
 	"credentials.json":  true,
 }
 
+// claudeLiveState is the set of top-level entries inside ~/.claude that hold
+// mutable runtime state (history, sessions, stats, caches). On the merged-
+// .claude path these are bind-mounted directly from ~/.claude rather than
+// copied into the merged dir, so writes from inside the container persist
+// and the RemoveAll on each invocation doesn't lose data.
+var claudeLiveState = map[string]bool{
+	"history.jsonl":   true,
+	"projects":        true,
+	"sessions":        true,
+	"stats-cache.json": true,
+	"file-history":    true,
+	"session-env":     true,
+	"backups":         true,
+	"debug":           true,
+	"paste-cache":     true,
+	"shell-snapshots": true,
+	"plans":           true,
+	"todos":           true,
+	"cache":           true,
+	"downloads":       true,
+}
+
 func claudeBinds(home string) ([]Bind, error) {
 	var binds []string
 	claudeDir := filepath.Join(home, ".claude")
@@ -679,6 +701,17 @@ func mainErr() error {
 			}
 			extra = append(filtered, Bind{Path: mergedDir, Dest: filepath.Join(home, ".claude")})
 			credDir = mergedDir
+			// Bind live-state entries directly from ~/.claude so writes
+			// persist; they are not copied into mergedDir.
+			for name := range claudeLiveState {
+				src := filepath.Join(home, ".claude", name)
+				if _, err := os.Stat(src); err == nil {
+					extra = append(extra, Bind{
+						Path: src,
+						Dest: filepath.Join(home, ".claude", name),
+					})
+				}
+			}
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
 		if *claudeMode {

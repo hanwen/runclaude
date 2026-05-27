@@ -162,4 +162,71 @@ if [ "$PROJ3_BEFORE" != "$PROJ3_AFTER" ]; then
   exit 1
 fi
 
+# ---- Case 4: live-state entries are bind-mounted from ~/.claude, not copied ----
+# On the merged path (project settings has AWS fields), history.jsonl,
+# projects/, sessions/, etc. must be bind-mounted directly from the real
+# ~/.claude rather than copied into the ephemeral merged dir. Two things to
+# verify: (a) pre-existing content is visible inside the container, and (b)
+# writes from inside the container land in the real ~/.claude and survive
+# across invocations (i.e. the RemoveAll of the merged dir doesn't lose them).
+FAKEHOME="$TMP/home4"
+PROJ4="$TMP/proj4"
+mkdir -p "$FAKEHOME/.claude/projects" "$PROJ4/.claude"
+
+# Project settings with AWS so the merged path fires.
+cat > "$PROJ4/.claude/settings.json" <<'EOF'
+{
+  "env": {
+    "AWS_PROFILE": "proj4-profile"
+  }
+}
+EOF
+
+# Pre-seed history.jsonl and a projects/ entry.
+echo '{"role":"user","content":"pre-existing"}' > "$FAKEHOME/.claude/history.jsonl"
+echo "pre-existing-project" > "$FAKEHOME/.claude/projects/old.txt"
+
+# First invocation: verify pre-existing content is readable and append a new entry.
+run_in_container "$FAKEHOME" "$PROJ4" '
+  cat "$HOME/.claude/history.jsonl"
+  echo "{\"role\":\"user\",\"content\":\"new-entry\"}" >> "$HOME/.claude/history.jsonl"
+  echo "new-project" > "$HOME/.claude/projects/new.txt"
+' >/dev/null
+
+# Pre-existing history line must still be in the host file.
+if ! grep -q "pre-existing" "$FAKEHOME/.claude/history.jsonl"; then
+  echo "case4 FAIL: pre-existing history.jsonl content lost"
+  cat "$FAKEHOME/.claude/history.jsonl"
+  exit 1
+fi
+
+# Write from inside the container must have landed in the host file.
+if ! grep -q "new-entry" "$FAKEHOME/.claude/history.jsonl"; then
+  echo "case4 FAIL: history.jsonl write from container not persisted to ~/.claude"
+  cat "$FAKEHOME/.claude/history.jsonl"
+  exit 1
+fi
+
+# File created in projects/ inside container must be in the real projects/.
+if [ ! -f "$FAKEHOME/.claude/projects/new.txt" ]; then
+  echo "case4 FAIL: projects/ write from container not persisted to ~/.claude"
+  ls "$FAKEHOME/.claude/projects/"
+  exit 1
+fi
+
+# Second invocation: the merged dir is rebuilt (RemoveAll), but the host
+# history.jsonl must still contain both lines — proving we don't lose
+# data written in the first invocation.
+OUT2=$(run_in_container "$FAKEHOME" "$PROJ4" 'cat "$HOME/.claude/history.jsonl"')
+if ! echo "$OUT2" | grep -q "pre-existing"; then
+  echo "case4 FAIL: pre-existing history lost after second invocation (merged dir RemoveAll)"
+  echo "$OUT2"
+  exit 1
+fi
+if ! echo "$OUT2" | grep -q "new-entry"; then
+  echo "case4 FAIL: first-invocation history lost after second invocation (merged dir RemoveAll)"
+  echo "$OUT2"
+  exit 1
+fi
+
 echo SUCCESS
