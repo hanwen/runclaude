@@ -56,13 +56,14 @@ The host-side proxy listener / DNS sockets are created by `initMain` inside the 
 - `claudeBinds` (main.go) — exposes `~/.claude/` (minus `.credentials.json`!), `~/.claude.json`, and the dirs containing the `claude` binary. Credentials never enter the container.
 - `writeStubCredentials` — drops a fake `.credentials.json` into the container's `$HOME/.claude/` so claude thinks it's logged in; the real token is held only by the host proxy.
 - `claudesettings.go` — reads `.claude/settings.json` env into the host process (so runclaude sees `CLAUDE_CODE_USE_BEDROCK` etc. without the user exporting them), and `materializeClaudeSettings` overlays a sanitized copy into the container with all AWS env stripped (the in-container claude must not do its own AWS auth).
+- `claudemerge.go` — handles the case where the **project's** `.claude/settings.json` carries AWS-related env. Rewriting it in place fights with VCS (jj/git keep restoring the original), so when `projectSettingsHasAWS(cwd)` is true, `buildMergedClaudeDir` builds a fresh merged user+project `.claude/` tree under `<cacheDir>/claude-merged/`: user tree first (skipping credential files), project tree overlaid on top (project wins on path collisions including subdirs like `skills/`, `agents/`, `commands/`), then `settings.json` is deep-merged with AWS env keys and `awsAuthRefresh` stripped. The merged dir is bind-mounted as `$HOME/.claude` inside the container, claude is launched with `--setting-sources user` so it ignores the project's `.claude/`, and the in-place sanitize + VCS-exclude paths are skipped (no host-side mutation, nothing to hide from VCS). For projects without AWS fields the existing in-place sanitize path is unchanged.
 - `gitconfig.go` — `materializeGitConfig` copies the user's `~/.gitconfig` into the container's cache home with credential helpers / userinfo URLs stripped.
-- `vcs.go` — `vcsExcludeBinds` overlays per-clone git/jj `info/exclude` with extra patterns (e.g. `.claude/settings.json`) so claude's runtime mutations don't show up as repo changes.
+- `vcs.go` — `vcsExcludeBinds` overlays per-clone git/jj `info/exclude` with extra patterns (e.g. `.claude/settings.json`) so claude's runtime mutations don't show up as repo changes. Only used on the non-merged path; the merged path doesn't touch the host project file at all.
 - `workspaceBinds` (main.go) — detects linked git worktrees (`.git` file → `gitdir:`) and jj workspaces (`.jj/repo` → repo path), binds the underlying repo storage so VCS works inside the container.
 
 ### Cache layout
 
-Per-cwd cache at `~/.cache/runclaude/<sha256(cwd)[:16]>/` with subdirs `home/`, `tmp/`, `run/`, `vcs/`, `claude/`. These are bind-mounted to `$HOME`, `/tmp`, `/run` inside the container — so build/module/auth caches persist across sessions for the same working directory.
+Per-cwd cache at `~/.cache/runclaude/<sha256(cwd)[:16]>/` with subdirs `home/`, `tmp/`, `run/`, `vcs/`, `claude/`, `claude-merged/`. These are bind-mounted to `$HOME`, `/tmp`, `/run` inside the container — so build/module/auth caches persist across sessions for the same working directory. `claude-merged/` is rebuilt from scratch on each invocation when the merged-`.claude/` path engages.
 
 ### Bedrock path
 

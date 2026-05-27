@@ -657,28 +657,57 @@ func mainErr() error {
 		if err != nil {
 			return err
 		}
+		// When the project's .claude/settings.json carries AWS-related fields,
+		// rewriting it in place fights with VCS (jj/git keep restoring the
+		// original). Instead, build a merged user+project .claude/ tree under
+		// the cache, mount it as the in-container ~/.claude, and tell claude
+		// to ignore project settings via --setting-sources user.
+		mergeProjectClaude := projectSettingsHasAWS(cwd)
+		credDir := filepath.Join(cacheDir, "home", ".claude")
+		if mergeProjectClaude {
+			mergedDir := filepath.Join(cacheDir, "claude-merged")
+			if err := buildMergedClaudeDir(home, cwd, mergedDir); err != nil {
+				return fmt.Errorf("merge .claude/: %w", err)
+			}
+			userClaudePrefix := filepath.Join(home, ".claude") + string(filepath.Separator)
+			filtered := extra[:0]
+			for _, b := range extra {
+				if strings.HasPrefix(b.Path, userClaudePrefix) {
+					continue
+				}
+				filtered = append(filtered, b)
+			}
+			extra = append(filtered, Bind{Path: mergedDir, Dest: filepath.Join(home, ".claude")})
+			credDir = mergedDir
+		}
 		cfg.Binds = append(cfg.Binds, extra...)
 		if *claudeMode {
-			cfg.Command = append([]string{"claude", "--dangerously-skip-permissions"}, flag.Args()...)
+			cmd := []string{"claude", "--dangerously-skip-permissions"}
+			if mergeProjectClaude {
+				cmd = append(cmd, "--setting-sources", "user")
+			}
+			cfg.Command = append(cmd, flag.Args()...)
 		}
 		if bearer != "" || apiKey != "" {
-			if err := writeStubCredentials(filepath.Join(cacheDir, "home", ".claude")); err != nil {
+			if err := writeStubCredentials(credDir); err != nil {
 				return err
 			}
 		}
-		excludeBinds, err := vcsExcludeBinds(cwd, filepath.Join(cacheDir, "vcs"), ".claude/settings.json")
-		if err != nil {
-			return err
+		if !mergeProjectClaude {
+			excludeBinds, err := vcsExcludeBinds(cwd, filepath.Join(cacheDir, "vcs"), ".claude/settings.json")
+			if err != nil {
+				return err
+			}
+			cfg.Binds = append(cfg.Binds, excludeBinds...)
+			// Overlay a sanitized settings.json into the container so claude
+			// doesn't see AWS_PROFILE etc. and try to authenticate itself —
+			// the host proxy handles signing.
+			settingsBinds, err := materializeClaudeSettings(home, cwd, filepath.Join(cacheDir, "claude"))
+			if err != nil {
+				return err
+			}
+			cfg.Binds = append(cfg.Binds, settingsBinds...)
 		}
-		cfg.Binds = append(cfg.Binds, excludeBinds...)
-		// Overlay a sanitized settings.json into the container so claude
-		// doesn't see AWS_PROFILE etc. and try to authenticate itself —
-		// the host proxy handles signing.
-		settingsBinds, err := materializeClaudeSettings(home, cwd, filepath.Join(cacheDir, "claude"))
-		if err != nil {
-			return err
-		}
-		cfg.Binds = append(cfg.Binds, settingsBinds...)
 	}
 	if len(cfg.Command) == 0 {
 		if args := flag.Args(); len(args) > 0 {
