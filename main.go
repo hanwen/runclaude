@@ -493,7 +493,7 @@ func mainErr() error {
 	if err != nil {
 		return err
 	}
-	cacheDir := filepath.Join(cacheBase, "runclaude", hex.EncodeToString(sum[:])[:16])
+	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
 	for _, sub := range []string{"home", "tmp", "run"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, sub), 0700); err != nil {
 			return err
