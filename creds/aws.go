@@ -1,4 +1,4 @@
-package main
+package creds
 
 import (
 	"context"
@@ -12,17 +12,26 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
-// refreshingCredentialProvider wraps an AWS credential provider and
-// transparently re-runs awsAuthRefresh when credentials have expired.
-// Only one refresh runs at a time; other goroutines block until it finishes.
-type refreshingCredentialProvider struct {
+// RefreshingCredentialProvider wraps an AWS credential provider and
+// transparently re-runs a refresh command (e.g. `aws sso login`) when the
+// underlying credentials have expired. Only one refresh runs at a time;
+// other goroutines block until it finishes.
+type RefreshingCredentialProvider struct {
 	mu      sync.Mutex
 	cfg     aws.Config
 	refresh string
 	logger  *log.Logger
 }
 
-func (p *refreshingCredentialProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+// NewRefreshingCredentialProvider returns a provider that retrieves
+// credentials from cfg, falling back to running refresh (under `sh -c`) and
+// reloading the default AWS config when retrieval fails. refresh may be empty
+// to disable fallback. logger must be non-nil.
+func NewRefreshingCredentialProvider(cfg aws.Config, refresh string, logger *log.Logger) *RefreshingCredentialProvider {
+	return &RefreshingCredentialProvider{cfg: cfg, refresh: refresh, logger: logger}
+}
+
+func (p *RefreshingCredentialProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	creds, err := p.cfg.Credentials.Retrieve(ctx)
 	if err == nil {
 		return creds, nil

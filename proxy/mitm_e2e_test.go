@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"bytes"
@@ -46,7 +46,7 @@ func TestMitmE2EAnthropic(t *testing.T) {
 			r.Header.Set("anthropic-version", "2023-06-01")
 		}
 	}
-	rp := newMitmReverseProxy("api.anthropic.com", upstreamURL, inject, nil, logger)
+	rp := NewMitmReverseProxy("api.anthropic.com", upstreamURL, inject, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 
@@ -98,9 +98,9 @@ func TestMitmE2EBedrock(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	signer := v4.NewSigner()
 	inject := func(h string, r *http.Request) {
-		injectBedrock(h, r, credsProvider, signer, logger)
+		InjectBedrock(h, r, credsProvider, signer, logger)
 	}
-	rp := newMitmReverseProxy(host, upstreamURL, inject, nil, logger)
+	rp := NewMitmReverseProxy(host, upstreamURL, inject, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 

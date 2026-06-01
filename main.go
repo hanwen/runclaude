@@ -21,6 +21,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+
+	"github.com/hanwen/runclaude/creds"
+	"github.com/hanwen/runclaude/proxy"
 )
 
 const (
@@ -436,7 +439,7 @@ func mainErr() error {
 
 	allowedDomains := allowDomain.items
 	if !allowDomain.set {
-		allowedDomains = defaultAllowedDomains
+		allowedDomains = proxy.DefaultAllowedDomains
 	}
 
 	var (
@@ -473,17 +476,17 @@ func mainErr() error {
 	}
 	if apiKey != "" || bearer != "" {
 		mitmDomains = append(mitmDomains, "api.anthropic.com")
-		if !matchDomain("api.anthropic.com", allowedDomains) {
+		if !proxy.MatchDomain("api.anthropic.com", allowedDomains) {
 			allowedDomains = append(allowedDomains, "api.anthropic.com")
 		}
 	}
 	// Hosts mentioned via --mitm-upstream should also be MITM'd and on
 	// the allowlist; the override is meaningless otherwise.
 	for host := range parseMitmUpstream(mitmUpstream) {
-		if !matchDomain(host, mitmDomains) {
+		if !proxy.MatchDomain(host, mitmDomains) {
 			mitmDomains = append(mitmDomains, host)
 		}
-		if !matchDomain(host, allowedDomains) {
+		if !proxy.MatchDomain(host, allowedDomains) {
 			allowedDomains = append(allowedDomains, host)
 		}
 	}
@@ -494,11 +497,7 @@ func mainErr() error {
 		if err != nil {
 			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: load AWS config: %w", err)
 		}
-		provider := &refreshingCredentialProvider{
-			cfg:     awsCfg,
-			refresh: settings.AwsAuthRefresh,
-			logger:  log.Default(),
-		}
+		provider := creds.NewRefreshingCredentialProvider(awsCfg, settings.AwsAuthRefresh, log.Default())
 		// Validate credentials (running awsAuthRefresh if needed) before start.
 		if _, err := provider.Retrieve(context.Background()); err != nil {
 			return fmt.Errorf("--claude+CLAUDE_CODE_USE_BEDROCK: %w", err)
@@ -546,20 +545,20 @@ func mainErr() error {
 		if logPath == "" {
 			logPath = filepath.Join(cacheDir, "proxy.log")
 		}
-		logger, err := openProxyLogger(logPath)
+		logger, err := proxy.OpenLogger(logPath)
 		if err != nil {
 			return err
 		}
 		log.Printf("proxy log: %s", logPath)
 
-		setup := &proxySetup{
-			allowed:  allowedDomains,
-			mitm:     mitmDomains,
-			inject:   func(string, *http.Request) {},
-			upstream: cfg.MitmUpstream,
+		setup := &proxy.Setup{
+			Allowed:  allowedDomains,
+			Mitm:     mitmDomains,
+			Inject:   func(string, *http.Request) {},
+			Upstream: cfg.MitmUpstream,
 		}
 		if len(mitmDomains) > 0 {
-			ca, err := loadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
+			ca, err := proxy.LoadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
 			if err != nil {
 				return fmt.Errorf("load CA: %w", err)
 			}
@@ -569,20 +568,20 @@ func mainErr() error {
 				return err
 			}
 			bundleCopy := filepath.Join(cacheDir, "tmp", "runclaude-bundle.crt")
-			if err := writeBundle(caPEM, bundleCopy); err != nil {
+			if err := proxy.WriteBundle(caPEM, bundleCopy); err != nil {
 				return err
 			}
 			cfg.BundlePath = "/tmp/runclaude-bundle.crt"
 			cfg.CAPath = "/tmp/runclaude-ca.crt"
-			setup.leaves = newLeafCache(ca)
+			setup.Leaves = proxy.NewLeafCache(ca)
 			// If we have a refresh token, install a token source so we
 			// can rotate the access token on a 401. Otherwise the bearer
 			// is constant for the lifetime of the process.
-			var tokens *tokenSource
+			var tokens *creds.TokenSource
 			if bearer != "" && refreshToken != "" {
-				tokens = newTokenSource(bearer, refreshToken, credPath, logger)
+				tokens = creds.NewTokenSource(bearer, refreshToken, credPath, logger)
 			}
-			setup.inject = func(host string, r *http.Request) {
+			setup.Inject = func(host string, r *http.Request) {
 				switch {
 				case host == "api.anthropic.com" && (bearer != "" || apiKey != ""):
 					r.Header.Del("Authorization")
@@ -598,17 +597,17 @@ func mainErr() error {
 					if r.Header.Get("anthropic-version") == "" {
 						r.Header.Set("anthropic-version", "2023-06-01")
 					}
-				case isBedrockHost(host) && awsCreds != nil:
-					injectBedrock(host, r, awsCreds, awsSigner, logger)
+				case proxy.IsBedrockHost(host) && awsCreds != nil:
+					proxy.InjectBedrock(host, r, awsCreds, awsSigner, logger)
 				}
 			}
 			if tokens != nil {
-				setup.transports = map[string]http.RoundTripper{
-					"api.anthropic.com": &refreshTransport{
-						base:     http.DefaultTransport,
-						tokens:   tokens,
-						reinject: func(r *http.Request) { setup.inject("api.anthropic.com", r) },
-						logger:   logger,
+				setup.Transports = map[string]http.RoundTripper{
+					"api.anthropic.com": &creds.RefreshTransport{
+						Base:     http.DefaultTransport,
+						Tokens:   tokens,
+						Reinject: func(r *http.Request) { setup.Inject("api.anthropic.com", r) },
+						Logger:   logger,
 					},
 				}
 			}
@@ -652,9 +651,9 @@ func mainErr() error {
 			// DNS allowlist covers both passthrough and mitm targets.
 			dnsAllow := append([]string{}, allowedDomains...)
 			dnsAllow = append(dnsAllow, mitmDomains...)
-			go serveDNSUDP(dnsUDP, dnsAllow, logger)
-			go serveDNSTCP(dnsTCP, dnsAllow, logger)
-			serveProxy(setup, proxyLn, logger)
+			go proxy.ServeDNSUDP(dnsUDP, dnsAllow, logger)
+			go proxy.ServeDNSTCP(dnsTCP, dnsAllow, logger)
+			proxy.Serve(setup, proxyLn, logger)
 		}()
 	}
 	for _, e := range exposed {

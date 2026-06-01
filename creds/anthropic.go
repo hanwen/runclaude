@@ -1,4 +1,8 @@
-package main
+// Package creds provides credential providers and HTTP transports for the
+// proxy package. The Anthropic side handles OAuth refresh of long-lived
+// access tokens; the AWS side wraps an aws-sdk-go-v2 credential provider so
+// expired SSO sessions can be re-established mid-process.
+package creds
 
 import (
 	"bytes"
@@ -23,11 +27,11 @@ const claudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 // RUNCLAUDE_CLAUDE_TOKEN_URL for tests.
 const claudeOAuthTokenURL = "https://console.anthropic.com/v1/oauth/token"
 
-// tokenSource owns the live Anthropic OAuth credential. It is the only place
-// in runclaude that knows how to swap a stale access token for a fresh one;
-// the proxy's inject path calls Bearer() and refreshTransport calls Refresh()
-// reactively on a 401.
-type tokenSource struct {
+// TokenSource owns the live Anthropic OAuth credential. It is the only place
+// that knows how to swap a stale access token for a fresh one; the proxy's
+// inject path calls Bearer() and RefreshTransport calls Refresh() reactively
+// on a 401.
+type TokenSource struct {
 	mu           sync.Mutex
 	accessToken  string
 	refreshToken string
@@ -42,7 +46,10 @@ type tokenSource struct {
 	lastRefresh time.Time
 }
 
-func newTokenSource(accessToken, refreshToken, path string, logger *log.Logger) *tokenSource {
+// NewTokenSource builds a TokenSource seeded with an access+refresh token
+// pair. If path is non-empty, refreshed tokens are persisted there
+// (typically ~/.claude/.credentials.json).
+func NewTokenSource(accessToken, refreshToken, path string, logger *log.Logger) *TokenSource {
 	cid := os.Getenv("RUNCLAUDE_CLAUDE_CLIENT_ID")
 	if cid == "" {
 		cid = claudeOAuthClientID
@@ -56,7 +63,7 @@ func newTokenSource(accessToken, refreshToken, path string, logger *log.Logger) 
 	}
 	logger.Printf("oauth: token source initialized url=%s client=%s access=%s refresh=%s persisted=%v",
 		url, cid, redactToken(accessToken), redactToken(refreshToken), path != "")
-	return &tokenSource{
+	return &TokenSource{
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
 		path:         path,
@@ -81,16 +88,17 @@ func redactToken(tok string) string {
 	return fmt.Sprintf("…(len=%d)", n)
 }
 
-func (t *tokenSource) Bearer() string {
+// Bearer returns the current access token.
+func (t *TokenSource) Bearer() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.accessToken
 }
 
 // Refresh exchanges the refresh token for a new access+refresh pair. If
-// staleBearer matches the token we currently hold, we actually hit the network;
-// otherwise another goroutine has already refreshed and we just return.
-func (t *tokenSource) Refresh(ctx context.Context, staleBearer string) error {
+// staleBearer matches the token we currently hold, the network is hit;
+// otherwise another goroutine has already refreshed and Refresh returns nil.
+func (t *TokenSource) Refresh(ctx context.Context, staleBearer string) error {
 	rt, clientID, tokenURL, proceed, err := t.snapshot(staleBearer)
 	if err != nil {
 		t.logger.Printf("oauth: refresh aborted: %v", err)
@@ -150,8 +158,8 @@ func (t *tokenSource) Refresh(ctx context.Context, staleBearer string) error {
 		redactToken(access), parsed.RefreshToken != "" && parsed.RefreshToken != rt, parsed.ExpiresIn)
 	if path != "" {
 		if err := writeCredentialsFile(path, access, refresh, expiresAtMs); err != nil {
-			// Non-fatal: in-memory copy is updated; the next runclaude
-			// invocation will just re-refresh from the old file.
+			// Non-fatal: in-memory copy is updated; the next invocation will
+			// just re-refresh from the old file.
 			t.logger.Printf("oauth: write credentials %s failed: %v", path, err)
 			return fmt.Errorf("oauth refresh: write %s: %w", path, err)
 		}
@@ -170,7 +178,7 @@ func truncate(s string, n int) string {
 
 // snapshot returns the inputs needed for a refresh call, or (proceed=false)
 // when another goroutine has already rotated past staleBearer.
-func (t *tokenSource) snapshot(staleBearer string) (rt, clientID, tokenURL string, proceed bool, err error) {
+func (t *TokenSource) snapshot(staleBearer string) (rt, clientID, tokenURL string, proceed bool, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.refreshToken == "" {
@@ -184,7 +192,7 @@ func (t *tokenSource) snapshot(staleBearer string) (rt, clientID, tokenURL strin
 
 // commit installs the refreshed tokens and returns the values the caller
 // needs to persist to disk.
-func (t *tokenSource) commit(newAccess, newRefresh string, expiresIn int64) (access, refresh, path string, expiresAtMs int64) {
+func (t *TokenSource) commit(newAccess, newRefresh string, expiresIn int64) (access, refresh, path string, expiresAtMs int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.accessToken = newAccess
@@ -255,17 +263,23 @@ func writeCredentialsFile(path, access, refresh string, expiresAtMs int64) error
 	return nil
 }
 
-// refreshTransport wraps a RoundTripper so that a single 401 from upstream
+// RefreshTransport wraps a RoundTripper so that a single 401 from upstream
 // triggers an OAuth refresh and a one-shot replay of the request with the
 // freshly-injected bearer.
-type refreshTransport struct {
-	base     http.RoundTripper
-	tokens   *tokenSource
-	reinject func(*http.Request) // re-runs the proxy's inject(host, r)
-	logger   *log.Logger
+type RefreshTransport struct {
+	// Base is the underlying transport used for both the initial request and
+	// the post-refresh retry.
+	Base http.RoundTripper
+	// Tokens is the credential the transport refreshes on a 401.
+	Tokens *TokenSource
+	// Reinject re-runs the proxy's inject(host, r) on the cloned retry
+	// request so it picks up the freshly-rotated bearer.
+	Reinject func(*http.Request)
+	// Logger is used for one-line audit entries on each refresh attempt.
+	Logger *log.Logger
 }
 
-func (t *refreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *RefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Buffer the body once so we can replay it. Anthropic request bodies
 	// are small JSON; the cost is negligible.
 	var body []byte
@@ -279,10 +293,10 @@ func (t *refreshTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
-	stale := t.tokens.Bearer()
-	resp, err := t.base.RoundTrip(req)
+	stale := t.Tokens.Bearer()
+	resp, err := t.Base.RoundTrip(req)
 	if err != nil {
-		t.logger.Printf("anthropic %s %s upstream error: %v", req.Method, req.URL.Path, err)
+		t.Logger.Printf("anthropic %s %s upstream error: %v", req.Method, req.URL.Path, err)
 		return resp, err
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -294,10 +308,10 @@ func (t *refreshTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	failBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	t.logger.Printf("anthropic 401 on %s %s with bearer %s — attempting OAuth refresh; upstream body=%s",
+	t.Logger.Printf("anthropic 401 on %s %s with bearer %s — attempting OAuth refresh; upstream body=%s",
 		req.Method, req.URL.Path, redactToken(stale), truncate(string(failBody), 512))
-	if err := t.tokens.Refresh(req.Context(), stale); err != nil {
-		t.logger.Printf("refresh failed: %v", err)
+	if err := t.Tokens.Refresh(req.Context(), stale); err != nil {
+		t.Logger.Printf("refresh failed: %v", err)
 		// Synthesize a 401 response so the client sees the original
 		// failure rather than a connection error.
 		return &http.Response{
@@ -316,16 +330,16 @@ func (t *refreshTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		req2.Body = io.NopCloser(bytes.NewReader(body))
 		req2.ContentLength = int64(len(body))
 	}
-	t.reinject(req2)
-	t.logger.Printf("retrying %s %s with refreshed token %s", req2.Method, req2.URL.Path, redactToken(t.tokens.Bearer()))
-	resp2, err := t.base.RoundTrip(req2)
+	t.Reinject(req2)
+	t.Logger.Printf("retrying %s %s with refreshed token %s", req2.Method, req2.URL.Path, redactToken(t.Tokens.Bearer()))
+	resp2, err := t.Base.RoundTrip(req2)
 	switch {
 	case err != nil:
-		t.logger.Printf("retry transport error: %v", err)
+		t.Logger.Printf("retry transport error: %v", err)
 	case resp2.StatusCode == http.StatusUnauthorized:
-		t.logger.Printf("retry still 401 after refresh — refreshed token rejected by upstream")
+		t.Logger.Printf("retry still 401 after refresh — refreshed token rejected by upstream")
 	default:
-		t.logger.Printf("retry succeeded: status=%d", resp2.StatusCode)
+		t.Logger.Printf("retry succeeded: status=%d", resp2.StatusCode)
 	}
 	return resp2, err
 }
