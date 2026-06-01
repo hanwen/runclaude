@@ -324,32 +324,11 @@ func writeStubCredentials(claudeDir string) error {
 // If a bearer is returned from a credentials file, refreshToken and credPath
 // are populated so the caller can rotate the token in place on a 401.
 func readClaudeAuth(home string) (apiKey, bearer, refreshToken, credPath string, err error) {
-	for _, name := range []string{".credentials.json", "credentials.json"} {
-		p := filepath.Join(home, ".claude", name)
-		data, rerr := os.ReadFile(p)
-		if rerr != nil {
-			continue
-		}
-		var creds struct {
-			ClaudeAiOauth struct {
-				AccessToken  string `json:"accessToken"`
-				RefreshToken string `json:"refreshToken"`
-			} `json:"claudeAiOauth"`
-			APIKey string `json:"apiKey"`
-		}
-		if json.Unmarshal(data, &creds) == nil {
-			if creds.ClaudeAiOauth.AccessToken != "" {
-				return "", creds.ClaudeAiOauth.AccessToken, creds.ClaudeAiOauth.RefreshToken, p, nil
-			}
-			if creds.APIKey != "" {
-				return creds.APIKey, "", "", "", nil
-			}
-		}
+	c, err := creds.LoadAnthropicCredentials(home)
+	if err != nil {
+		return "", "", "", "", err
 	}
-	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
-		return k, "", "", "", nil
-	}
-	return "", "", "", "", fmt.Errorf("no claude credentials found (looked in ~/.claude/.credentials.json and $ANTHROPIC_API_KEY)")
+	return c.APIKey, c.Bearer, c.RefreshToken, c.Path, nil
 }
 
 // checkUserNS verifies that unprivileged user namespaces are permitted by the
