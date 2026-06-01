@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -1163,7 +1164,65 @@ func initMain() error {
 	if err != nil {
 		return fmt.Errorf("lookup %s: %w", cfg.Command[0], err)
 	}
-	return syscall.Exec(bin, cfg.Command, os.Environ())
+	return runAsInit(bin, cfg.Command)
+}
+
+// runAsInit forks the user command as a child of this process (which is pid
+// 1 of the new PID namespace) and stays around to forward signals and reap
+// zombies. Staying as pid 1 ourselves is what lets the child receive
+// SIGTSTP/SIGTTIN/SIGTTOU from the controlling tty — the kernel silently
+// drops those for pid 1 of a PID ns when no handler is installed, which is
+// what froze claude on ^Z before this shim was added.
+func runAsInit(bin string, argv []string) error {
+	cmd := exec.Command(bin)
+	cmd.Args = argv
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start %s: %w", argv[0], err)
+	}
+	childPid := cmd.Process.Pid
+
+	// Forward signals delivered to us (pid 1) onto the child. ^C / ^Z from
+	// the tty go to the foreground process group directly and reach the
+	// child without our help; this catches the explicit `kill <pid1>` case.
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs,
+		syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP,
+		syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2)
+	go func() {
+		for s := range sigs {
+			_ = cmd.Process.Signal(s)
+		}
+	}()
+
+	// Reap the child plus any orphans that got reparented to us. waitpid(-1)
+	// blocks until any child changes state; we exit when the original child
+	// terminates, propagating its exit code (or 128+signo on signal death,
+	// matching shell convention).
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, 0, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("wait4: %w", err)
+		}
+		if pid != childPid {
+			continue
+		}
+		switch {
+		case ws.Exited():
+			os.Exit(ws.ExitStatus())
+		case ws.Signaled():
+			os.Exit(128 + int(ws.Signal()))
+		default:
+			os.Exit(0)
+		}
+	}
 }
 
 func main() {
