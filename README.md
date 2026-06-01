@@ -86,6 +86,14 @@ It has no runtime dependencies and starts up in ~20ms.
 * Credentials refresh automatically (both for AWS and Anthropic bearer
   tokens.)
 
+## Standalone proxy (`runproxy`)
+
+The credential-injecting MITM proxy is also available as a standalone
+binary for sandboxes that aren't runclaude — for example, a Docker
+container. See [`cmd/runproxy/README.md`](cmd/runproxy/README.md) for
+the build, the Docker integration recipe, and how to lock down
+container egress so the proxy is the only reachable host.
+
 ## Limitations
 
 * Linux-only
