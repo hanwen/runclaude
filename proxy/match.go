@@ -20,7 +20,8 @@ var DefaultAllowedDomains = []string{
 	"proxy.golang.org", "sum.golang.org", "go.dev",
 	"proxy.golang.org", "sum.golang.org", "go.dev", "*.go.dev",
 	"dl.google.com", "storage.googleapis.com",
-	"releases.bazel.build", "bcr.bazel.build",
+	"*.bazel.build", "*.azul.com", "*.maven.org",
+	"bcr.cloudflaremirrors.com",
 }
 
 // MatchDomain reports whether host matches any of patterns.
