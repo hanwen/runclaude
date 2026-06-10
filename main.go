@@ -394,6 +394,8 @@ func mainErr() error {
 
 	var exposed stringSlice
 	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
+	var only stringSlice
+	flag.Var(&only, "only", "if set, only these paths (relative to cwd or absolute) are visible from cwd inside the container; cwd is backed by the cache dir, no git/jj repos are mapped (repeatable)")
 	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
 	claudeMode := flag.Bool("claude", true, "bind files needed for `claude` and run it as the default command")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
@@ -515,12 +517,25 @@ func mainErr() error {
 		return err
 	}
 
+	// When --only is active, the container's cwd is backed by a fresh cache
+	// subdir (not the real cwd tree). Only the explicitly listed items are
+	// bind-mounted on top, and no git/jj repo storage is mapped.
+	onlyMode := len(only) > 0
+	cwdBind := cwd
+	if onlyMode {
+		cwdCacheDir := filepath.Join(cacheDir, "cwd")
+		if err := os.MkdirAll(cwdCacheDir, 0700); err != nil {
+			return err
+		}
+		cwdBind = cwdCacheDir
+	}
+
 	cfg := &Config{
 		Rootfs:         rootfs,
 		Home:           home,
 		CacheDir:       cacheDir,
 		Cwd:            cwd,
-		Binds:          []Bind{{Path: cwd}},
+		Binds:          []Bind{{Path: cwdBind, Dest: cwd}},
 		RestrictNet:    *restrictNet,
 		AllowedDomains: allowedDomains,
 		MitmDomains:    mitmDomains,
@@ -654,15 +669,27 @@ func mainErr() error {
 		}
 		cfg.Binds = append(cfg.Binds, Bind{Path: abs})
 	}
+	if onlyMode {
+		for _, e := range only {
+			abs := e
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(cwd, e)
+			}
+			abs = filepath.Clean(abs)
+			cfg.Binds = append(cfg.Binds, Bind{Path: abs})
+		}
+	}
 	if *mapPath {
 		cfg.Binds = append(cfg.Binds, pathBinds(home)...)
 	}
-	if *mapWorkspace {
+	if !onlyMode && *mapWorkspace {
 		cfg.Binds = append(cfg.Binds, workspaceBinds(cwd)...)
 	}
 
-	if _, err := os.Stat(".jj"); err == nil {
-		cfg.Binds = append(cfg.Binds, jjConfigBinds()...)
+	if !onlyMode {
+		if _, err := os.Stat(".jj"); err == nil {
+			cfg.Binds = append(cfg.Binds, jjConfigBinds()...)
+		}
 	}
 	if claudeLike {
 		extra, err := claudeBinds(home)
@@ -717,11 +744,13 @@ func mainErr() error {
 			}
 		}
 		if !mergeProjectClaude {
-			excludeBinds, err := vcsExcludeBinds(cwd, filepath.Join(cacheDir, "vcs"), ".claude/settings.json")
-			if err != nil {
-				return err
+			if !onlyMode {
+				excludeBinds, err := vcsExcludeBinds(cwd, filepath.Join(cacheDir, "vcs"), ".claude/settings.json")
+				if err != nil {
+					return err
+				}
+				cfg.Binds = append(cfg.Binds, excludeBinds...)
 			}
-			cfg.Binds = append(cfg.Binds, excludeBinds...)
 			// Overlay a sanitized settings.json into the container so claude
 			// doesn't see AWS_PROFILE etc. and try to authenticate itself —
 			// the host proxy handles signing.
