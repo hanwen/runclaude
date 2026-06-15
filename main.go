@@ -497,17 +497,6 @@ func mainErr() error {
 		return err
 	}
 	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
-	if err := os.MkdirAll(cacheDir, 0700); err != nil {
-		return err
-	}
-	lockFile, err := os.OpenFile(filepath.Join(cacheDir, "lock"), os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("open lock: %w", err)
-	}
-	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return fmt.Errorf("another runclaude is already running in %s", cwd)
-	}
 	for _, sub := range []string{"home", "tmp", "run"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, sub), 0700); err != nil {
 			return err
