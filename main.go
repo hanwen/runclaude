@@ -93,6 +93,12 @@ type Bind struct {
 	// bound tree without modifying the host original.
 	Dest     string `json:"dest,omitempty"`
 	ReadOnly bool   `json:"ro,omitempty"`
+	// Tmpfs mounts a fresh, empty, per-container tmpfs at Dest instead of
+	// bind-mounting Path. Used for ephemeral scratch dirs (see claudeScratch)
+	// so each invocation gets its own copy with no sharing across concurrent
+	// or sequential sessions — even when they share a per-cwd cache home.
+	// When set, Path is ignored and Dest must be non-empty.
+	Tmpfs bool `json:"tmpfs,omitempty"`
 }
 
 func (b Bind) dest() string {
@@ -151,20 +157,53 @@ var credentialFiles = map[string]bool{
 // copied into the merged dir, so writes from inside the container persist
 // and the RemoveAll on each invocation doesn't lose data.
 var claudeLiveState = map[string]bool{
-	"history.jsonl":   true,
-	"projects":        true,
-	"sessions":        true,
+	"history.jsonl":    true,
+	"projects":         true,
+	"sessions":         true,
+	"file-history":     true,
+	"backups":          true,
+	"plans":            true,
+	"todos":            true,
+	"downloads":        true,
 	"stats-cache.json": true,
-	"file-history":    true,
+}
+
+// claudeScratch is the set of top-level *directories* inside ~/.claude that
+// hold purely ephemeral, regenerable scratch state (caches, logs, per-session
+// snapshots) with no cross-instance value. Each is backed by a fresh, private
+// per-container tmpfs (see claudeScratchBinds), so every runclaude invocation
+// gets its own empty copy — nothing is shared with the host, nor with another
+// sandbox running in the same cwd (which would otherwise share the per-cwd
+// cache home).
+//
+// session-env in particular is the trigger for a directory-deletion race: the
+// claude CLI's retention sweep does `rm -rf` on stale per-session subdirs and
+// then `rmdir`s session-env itself when it ends up empty, while another
+// instance may be mid-mkdir of its own subdir there. Two claude instances
+// sharing one physical session-env — host+sandbox, or two same-cwd sandboxes —
+// surfaces an ENOENT on mkdir (".../session-env/<uuid>"). A per-container
+// tmpfs removes all sharing; nothing here feeds the global session list (that
+// lives in projects/), so isolating it costs nothing.
+var claudeScratch = map[string]bool{
 	"session-env":     true,
-	"backups":         true,
-	"debug":           true,
 	"paste-cache":     true,
 	"shell-snapshots": true,
-	"plans":           true,
-	"todos":           true,
 	"cache":           true,
-	"downloads":       true,
+	"debug":           true,
+}
+
+// claudeScratchBinds returns a tmpfs Bind for each scratch directory, mounted
+// at $HOME/.claude/<name>. These overlay whatever is bound at $HOME/.claude
+// (the cache home on the normal path, or the merged dir), giving each session
+// a private, empty scratch dir. dedup-by-dest in childMain keeps the last
+// bind, so appending these after the .claude bind makes the tmpfs win.
+func claudeScratchBinds(home string) []Bind {
+	claudeDir := filepath.Join(home, ".claude")
+	out := make([]Bind, 0, len(claudeScratch))
+	for name := range claudeScratch {
+		out = append(out, Bind{Dest: filepath.Join(claudeDir, name), Tmpfs: true})
+	}
+	return out
 }
 
 func claudeBinds(home string) ([]Bind, error) {
@@ -173,6 +212,11 @@ func claudeBinds(home string) ([]Bind, error) {
 	if entries, err := os.ReadDir(claudeDir); err == nil {
 		for _, e := range entries {
 			if credentialFiles[e.Name()] {
+				continue
+			}
+			// Scratch dirs (e.g. session-env) are never shared with the host;
+			// the container creates its own under the cache home on demand.
+			if claudeScratch[e.Name()] {
 				continue
 			}
 			binds = append(binds, filepath.Join(claudeDir, e.Name()))
@@ -375,6 +419,9 @@ func mainErr() error {
 	if err != nil {
 		return err
 	}
+	// Per-session scratch (rootfs skeleton, merged .claude tree); the container
+	// runs synchronously below, so it's safe to remove on return.
+	defer os.RemoveAll(dir)
 	rootfs := filepath.Join(dir, "rootfs")
 	if err := os.Mkdir(rootfs, 0755); err != nil {
 		return err
@@ -693,7 +740,15 @@ func mainErr() error {
 		mergeProjectClaude := projectSettingsHasAWS(cwd)
 		credDir := filepath.Join(cacheDir, "home", ".claude")
 		if mergeProjectClaude {
-			mergedDir := filepath.Join(cacheDir, "claude-merged")
+			// Per-session, NOT per-cwd: buildMergedClaudeDir starts with
+			// RemoveAll(mergedDir), so a per-cwd path would let a second
+			// runclaude in the same cwd wipe the tree the first one has
+			// bind-mounted live as $HOME/.claude — deleting it out from under
+			// the running container (ENOENT on session-env mkdir, cross-session
+			// leakage). dir is the per-invocation MkdirTemp dir, so each
+			// session gets its own merged tree. Cleaned up when the container
+			// exits (see defer below).
+			mergedDir := filepath.Join(dir, "claude-merged")
 			if err := buildMergedClaudeDir(home, cwd, mergedDir); err != nil {
 				return fmt.Errorf("merge .claude/: %w", err)
 			}
@@ -720,6 +775,11 @@ func mainErr() error {
 			}
 		}
 		cfg.Binds = append(cfg.Binds, extra...)
+		// Overlay each ephemeral scratch dir with a private per-container
+		// tmpfs. Appended after the .claude bind so the parent mounts first
+		// and these children land on top; not shared with the host or with
+		// another sandbox in the same cwd.
+		cfg.Binds = append(cfg.Binds, claudeScratchBinds(home)...)
 		if *claudeMode {
 			cmd := []string{"claude", "--dangerously-skip-permissions"}
 			if mergeProjectClaude {
@@ -1046,6 +1106,17 @@ func childMain() error {
 	}
 	for _, d := range dedupedBinds {
 		dest := filepath.Join(cfg.Rootfs, d.dest())
+		if d.Tmpfs {
+			// Fresh per-container scratch dir; no host source, nothing shared.
+			if err := os.MkdirAll(dest, 0700); err != nil {
+				return err
+			}
+			if err := syscall.Mount("tmpfs", dest, "tmpfs",
+				syscall.MS_NOSUID|syscall.MS_NODEV, "mode=700"); err != nil {
+				return fmt.Errorf("tmpfs %s: %w", dest, err)
+			}
+			continue
+		}
 		info, err := os.Stat(d.Path)
 		if err != nil {
 			return err

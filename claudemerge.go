@@ -114,7 +114,7 @@ func copyClaudeTree(src, dst string, skipCreds, skipLive bool) error {
 				}
 				return nil
 			}
-			if skipLive && claudeLiveState[d.Name()] {
+			if skipLive && (claudeLiveState[d.Name()] || claudeScratch[d.Name()]) {
 				if d.IsDir() {
 					return fs.SkipDir
 				}
