@@ -817,6 +817,10 @@ func mainErr() error {
 			cfg.Command = []string{"bash"}
 		}
 	}
+	// Record this session and warn if other runclaude sessions share this
+	// cwd's cache (they share $HOME cache, /tmp and the merged ~/.claude tree).
+	cleanupSession := registerSession(cacheDir, cfg.Command)
+	defer cleanupSession()
 	if err := checkUserNS(); err != nil {
 		return err
 	}
