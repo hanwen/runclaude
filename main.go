@@ -440,9 +440,11 @@ func mainErr() error {
 	}
 
 	var exposed stringSlice
-	flag.Var(&exposed, "e", "expose host path into the container (repeatable)")
+	flag.Var(&exposed, "expose", "expose host path into the container (repeatable)")
+	flag.Var(&exposed, "e", "alias for --expose")
 	var only stringSlice
 	flag.Var(&only, "only", "if set, only these paths (relative to cwd or absolute) are visible from cwd inside the container; cwd is backed by the cache dir, no git/jj repos are mapped (repeatable)")
+	flag.Var(&only, "o", "alias for --only")
 	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
 	claudeMode := flag.Bool("claude", true, "bind files needed for `claude` and run it as the default command")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
@@ -451,6 +453,7 @@ func mainErr() error {
 	mapWorkspace := flag.Bool("map-workspace", true, "for git/jj workspaces map the originating repository")
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
+	flag.Var(&allowDomain, "a", "alias for --allow-domain")
 	proxyLog := flag.String("proxy-log", "",
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	var mitmUpstream stringSlice
