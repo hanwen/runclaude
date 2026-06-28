@@ -28,10 +28,17 @@
     <main id="transcript" aria-live="polite"></main>
     <aside id="source" hidden>
       <div class="source-head">
-        <span>source · <code>jj show @</code></span>
+        <span class="source-title">source ·
+          <select id="source-view" title="Which view of the checkout">
+            <option value="show">working copy (jj show @)</option>
+            <option value="diff">diff vs trunk</option>
+            <option value="log">log</option>
+            <option value="files">files</option>
+          </select>
+        </span>
         <button id="source-expand" class="ghost" title="Maximize / restore the source panel">⤢ expand</button>
       </div>
-      <pre id="source-body">loading…</pre>
+      <div id="source-body">loading…</div>
     </aside>
   </div>
 

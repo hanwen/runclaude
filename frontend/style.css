@@ -52,10 +52,20 @@ aside#source.expanded { flex-basis: 100%; max-width: none; }
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
 .source-head code { color: var(--accent); }
+#source-view {
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; font: inherit; font-size: 12px; padding: 2px 4px;
+}
 #source-body {
   margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word;
   font: 12.5px/1.5 ui-monospace, monospace; color: var(--fg);
 }
+.file-link {
+  display: inline; background: none; border: 0; padding: 0; height: auto;
+  color: var(--accent); font: inherit; cursor: pointer; text-align: left;
+}
+.file-link:hover { text-decoration: underline; }
+.file-name { color: var(--muted); margin: 6px 0; font-weight: 600; }
 .msg { display: flex; flex-direction: column; gap: 4px; }
 .msg .meta { font-size: 11px; color: var(--muted); }
 .bubble {

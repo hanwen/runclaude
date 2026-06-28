@@ -28,9 +28,11 @@ type Config struct {
 	Hub      *sessionhub.Hub
 	Identity Identifier
 	Policy   Policy
-	// Source, if set, returns the current source-checkout view (e.g. jj show @)
-	// run in the session cwd. nil disables the read-only source panel.
-	Source func(context.Context) (string, error)
+	// Source, if set, returns a read-only source-checkout view run in the
+	// session cwd: view selects which (e.g. "show", "diff", "log", "files"),
+	// path names a file for the "file" view. Output may contain ANSI color
+	// codes (the frontend renders them). nil disables the source panel.
+	Source func(ctx context.Context, view, path string) (string, error)
 }
 
 // Server routes HTTP requests for one session.
@@ -38,7 +40,7 @@ type Server struct {
 	hub    *sessionhub.Hub
 	ident  Identifier
 	policy Policy
-	source func(context.Context) (string, error)
+	source func(ctx context.Context, view, path string) (string, error)
 	mux    *http.ServeMux
 }
 
@@ -70,7 +72,8 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no source view", http.StatusNotFound)
 		return
 	}
-	out, err := s.source(r.Context())
+	q := r.URL.Query()
+	out, err := s.source(r.Context(), q.Get("view"), q.Get("path"))
 	if err != nil {
 		http.Error(w, "source unavailable", http.StatusServiceUnavailable)
 		return

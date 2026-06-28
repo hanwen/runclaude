@@ -45,17 +45,19 @@ func TestSourcePanel(t *testing.T) {
 	// Provider -> its text.
 	withSrc := httptest.NewServer(New(Config{
 		Hub: hub, Identity: ident, Policy: AllowlistPolicy{},
-		Source: func(context.Context) (string, error) { return "jj show @ output", nil },
+		Source: func(_ context.Context, view, path string) (string, error) {
+			return "jj " + view + " output", nil
+		},
 	}))
 	defer withSrc.Close()
-	res, err := http.Get(withSrc.URL + "/source")
+	res, err := http.Get(withSrc.URL + "/source?view=diff")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(res.Body)
-	if string(body) != "jj show @ output" {
-		t.Errorf("/source body = %q", body)
+	if string(body) != "jj diff output" {
+		t.Errorf("/source body = %q (view should reach the provider)", body)
 	}
 }
 

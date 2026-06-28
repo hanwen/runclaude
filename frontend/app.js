@@ -35,6 +35,61 @@ function el(tag, cls, text) {
   return e;
 }
 
+// --- ANSI (SGR) -> HTML, for the colored jj source views ---
+const ANSI16 = ["#000000","#cd3131","#0dbc79","#e5e510","#2472c8","#bc3fbc","#11a8cd","#e5e5e5",
+                "#666666","#f14c4c","#23d18b","#f5f543","#3b8eea","#d670d6","#29b8db","#ffffff"];
+function rgbHex(r,g,b){ return "#"+[r,g,b].map(x=>(x&255).toString(16).padStart(2,"0")).join(""); }
+function xterm256(n){
+  if (n < 16) return ANSI16[n];
+  if (n <= 231){ n -= 16; const f=v=>v?55+v*40:0; return rgbHex(f((n/36|0)),f(((n/6|0)%6)),f(n%6)); }
+  const v = 8 + (n-232)*10; return rgbHex(v,v,v);
+}
+function escHtml(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+// Convert text with ANSI SGR escapes to safe HTML (text is escaped; only our
+// own <span style> tags are emitted, so repo content can't inject markup).
+function ansiToHtml(input){
+  let out="", fg=null, bg=null, bold=false, ul=false;
+  const flush = (t) => {
+    if (!t) return;
+    let st = "";
+    if (fg) st += "color:"+fg+";";
+    if (bg) st += "background:"+bg+";";
+    if (bold) st += "font-weight:600;";
+    if (ul) st += "text-decoration:underline;";
+    out += st ? `<span style="${st}">${escHtml(t)}</span>` : escHtml(t);
+  };
+  const re = /\x1b\[([0-9;]*)m/g;
+  let last = 0, m;
+  while ((m = re.exec(input))){
+    flush(input.slice(last, m.index));
+    last = re.lastIndex;
+    const codes = m[1] === "" ? [0] : m[1].split(";").map(Number);
+    for (let i = 0; i < codes.length; i++){
+      const c = codes[i];
+      if (c === 0){ fg=bg=null; bold=ul=false; }
+      else if (c === 1) bold = true;
+      else if (c === 22) bold = false;
+      else if (c === 4) ul = true;
+      else if (c === 24) ul = false;
+      else if (c >= 30 && c <= 37) fg = ANSI16[c-30];
+      else if (c >= 90 && c <= 97) fg = ANSI16[c-90+8];
+      else if (c === 39) fg = null;
+      else if (c >= 40 && c <= 47) bg = ANSI16[c-40];
+      else if (c >= 100 && c <= 107) bg = ANSI16[c-100+8];
+      else if (c === 49) bg = null;
+      else if (c === 38 || c === 48){
+        const isFg = c === 38, mode = codes[i+1];
+        let col = null;
+        if (mode === 5){ col = xterm256(codes[i+2]); i += 2; }
+        else if (mode === 2){ col = rgbHex(codes[i+2],codes[i+3],codes[i+4]); i += 4; }
+        if (isFg) fg = col; else bg = col;
+      }
+    }
+  }
+  flush(input.slice(last));
+  return out;
+}
+
 function atBottom() {
   return transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
 }
@@ -244,23 +299,59 @@ async function loadIdentity() {
   applyControl(state.controller, state.controllerName);
 }
 
-// Read-only source panel: polls `jj show @` while open. Inherently read-only,
-// so it sidesteps the control gate entirely.
+// Read-only source panel: polls a jj view (show @ / diff / log / files) while
+// open and renders its ANSI color. Inherently read-only, so it sidesteps the
+// control gate entirely.
 function wireSourcePanel() {
   const toggle = document.getElementById("source-toggle");
   const panel = document.getElementById("source");
   const body = document.getElementById("source-body");
+  const select = document.getElementById("source-view");
   let timer = null;
+  let filePath = null; // when set, show one file's contents (drill-in from "files")
+
+  async function fetchView() {
+    const p = new URLSearchParams(qs ? qs.slice(1) : "");
+    p.set("view", filePath ? "file" : select.value);
+    if (filePath) p.set("path", filePath);
+    return fetch("/source?" + p.toString());
+  }
 
   async function refresh() {
     try {
-      const res = await fetch("/source" + qs);
+      const res = await fetchView();
       if (res.status === 404) { body.textContent = "(no jj repo for this session)"; stop(); return; }
       if (!res.ok) { body.textContent = "(source unavailable)"; return; }
-      body.textContent = (await res.text()) || "(empty)";
+      render(await res.text());
     } catch { body.textContent = "(source unavailable)"; }
   }
+
+  function render(text) {
+    if (filePath) {
+      // One file's contents, with a way back to the list.
+      body.replaceChildren();
+      const back = el("button", "file-link", "← files");
+      back.onclick = () => { filePath = null; refresh(); };
+      body.append(back, el("div", "file-name", filePath), document.createTextNode(text || "(empty)"));
+    } else if (select.value === "files") {
+      // Clickable list of tracked files.
+      body.replaceChildren();
+      const files = text.split("\n").filter(Boolean);
+      if (!files.length) { body.textContent = "(no tracked files)"; return; }
+      for (const f of files) {
+        const link = el("button", "file-link", f);
+        link.onclick = () => { filePath = f; refresh(); };
+        body.append(link, document.createTextNode("\n"));
+      }
+    } else {
+      // show / diff / log: render the ANSI color jj emits.
+      body.innerHTML = ansiToHtml(text) || "(empty)";
+    }
+  }
+
   function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  select.onchange = () => { filePath = null; if (!panel.hidden) refresh(); };
 
   toggle.onclick = () => {
     const show = panel.hidden;

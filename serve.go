@@ -154,19 +154,25 @@ func echoEvent(raw []byte, sessionLogged *bool) {
 	}
 }
 
-// jjSource returns a provider for the read-only source panel: it runs
-// `jj show @` in the session cwd (the host sees the same working-copy tree the
-// sandboxed agent edits, since cwd is bind-mounted in). Returns nil when cwd is
-// not a jj repo, which disables the panel. Each call snapshots and shows the
-// current working-copy change, so viewers see the agent's edits as they land.
-func jjSource(cwd string) func(context.Context) (string, error) {
+// jjSource returns a provider for the read-only source panel, running jj in the
+// session cwd (the host sees the same working-copy tree the sandboxed agent
+// edits, since cwd is bind-mounted in). Returns nil when cwd is not a jj repo,
+// which disables the panel. Output carries ANSI color (--color always); the
+// frontend renders it. Views:
+//
+//	show  (default) jj show @           — the agent's in-progress change
+//	diff            jj diff trunk()..@  — everything the branch changed
+//	log             jj log  trunk()..@  — the session's commit graph
+//	files           jj file list        — tracked files (clickable in the UI)
+//	file  + path    jj file show <path> — one file's contents at @
+func jjSource(cwd string) func(ctx context.Context, view, path string) (string, error) {
 	if _, err := os.Stat(filepath.Join(cwd, ".jj")); err != nil {
 		return nil
 	}
-	return func(ctx context.Context) (string, error) {
+	run := func(ctx context.Context, args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "jj", "show", "@", "--color", "never")
+		cmd := exec.CommandContext(ctx, "jj", args...)
 		cmd.Dir = cwd
 		out, err := cmd.Output()
 		if err != nil {
@@ -174,6 +180,41 @@ func jjSource(cwd string) func(context.Context) (string, error) {
 		}
 		return string(out), nil
 	}
+	color := []string{"--color", "always"}
+	return func(ctx context.Context, view, path string) (string, error) {
+		switch view {
+		case "", "show":
+			return run(ctx, append(append([]string{}, color...), "show", "@")...)
+		case "diff":
+			return run(ctx, append(append([]string{}, color...), "diff", "-r", "trunk()..@")...)
+		case "log":
+			return run(ctx, append(append([]string{}, color...), "log", "-r", "trunk()..@")...)
+		case "files":
+			return run(ctx, "file", "list")
+		case "file":
+			if !safeRelPath(path) {
+				return "", fmt.Errorf("invalid path %q", path)
+			}
+			return run(ctx, "file", "show", path)
+		default:
+			return "", fmt.Errorf("unknown view %q", view)
+		}
+	}
+}
+
+// safeRelPath rejects empty, absolute, or parent-escaping paths before they
+// reach `jj file show`. jj already scopes reads to tracked repo files, but this
+// keeps the surface obviously bounded to the checkout.
+func safeRelPath(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // feedPromptsFromTerminal sends each non-blank line from the host terminal as a
