@@ -47,6 +47,69 @@ control plane. Validate it on a host with open egress and a tailnet:
 `TS_AUTHKEY=… runclaude --serve --serve-tailnet myhost --serve-writer you@example.com`.
 Localhost mode (`--serve-addr`, optionally `--serve-dev`) is fully exercised.
 
+## How to test
+
+```
+go build -o runclaude .
+go test ./...          # unit + in-process e2e; agentclient/sessionhub/serve
+```
+
+**Protocol spike (no sandbox, no web)** — sanity-check the stream-json port
+against the real CLI:
+
+```
+go run ./cmd/agentspike "what is 2+2?" "now multiply that by 3"
+```
+
+**Localhost, single user** — run a sandboxed session and open the web UI:
+
+```
+cd <a project dir>
+runclaude --serve --serve-addr 127.0.0.1:8711
+# browse http://127.0.0.1:8711 ; type prompts in the terminal too (operator path)
+# the web header shows the session id (copy button). To continue it later, in the
+# SAME cwd: runclaude --serve --serve-resume <id>
+```
+
+**Localhost, simulate multiple writers from one machine** — `--serve-dev` lets
+each browser tab pick an identity via `?as=<login>`; everyone is write-eligible
+unless you pass `--serve-writer`:
+
+```
+runclaude --serve --serve-dev
+# tab A: http://127.0.0.1:8711/?as=alice   tab B: .../?as=bob
+# take control in A, watch B's prompt box gate; take control in B -> A sees
+# "you lost control to bob". Add --serve-writer alice to make bob's take 403.
+```
+
+Same flow via curl (note `?as=` rides on every request; the participant `id` in
+the body is per-tab):
+
+```
+b=http://127.0.0.1:8711
+curl -s "$b/whoami?as=alice"                                   # {"login":"alice",...,"mayWrite":true}
+curl -s -XPOST -d '{"id":"A","name":"alice"}'        "$b/take-control?as=alice"
+curl -s -XPOST -d '{"id":"A","name":"alice","text":"hello"}' "$b/prompt?as=alice"   # 204
+curl -s -XPOST -d '{"id":"B","name":"bob","text":"hi"}'      "$b/prompt?as=bob"     # 409 (not controller)
+curl -s -XPOST -d '{"id":"A"}'                        "$b/interrupt?as=alice"       # stop a running turn
+curl -sN "$b/events?as=carol"                                 # SSE transcript stream (read-only)
+curl -s  "$b/source"                                          # jj show @ (read-only panel)
+```
+
+If your shell itself runs inside runclaude, clear the proxy for these:
+`http_proxy= https_proxy= curl …`. Prompt/audit lines (who drove, what they
+asked) print to the runclaude stderr.
+
+**Tailnet (real identities)** — on a host with open egress + a tailnet:
+
+```
+TS_AUTHKEY=tskey-… runclaude --serve --serve-tailnet myhost \
+    --serve-writer you@example.com --serve-writer teammate@example.com
+# without TS_AUTHKEY, a login URL is printed; open it once to register the node.
+# then browse http://myhost/ from any tailnet device; identity = WhoIs login,
+# only the --serve-writer logins may take control.
+```
+
 ## Key decisions (locked unless noted)
 
 1. **UI is web-rendered from the stream-json event stream, not the TUI.** Headless
