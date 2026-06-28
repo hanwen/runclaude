@@ -44,10 +44,12 @@ aside#source {
   flex: 0 0 42%; max-width: 560px; overflow: auto;
   background: var(--panel); border-left: 1px solid var(--border);
 }
+aside#source.expanded { flex-basis: 100%; max-width: none; }
 .source-head {
   position: sticky; top: 0; background: var(--panel);
   padding: 8px 12px; border-bottom: 1px solid var(--border);
   font-size: 12px; color: var(--muted);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
 .source-head code { color: var(--accent); }
 #source-body {

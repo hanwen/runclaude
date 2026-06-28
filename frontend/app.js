@@ -267,6 +267,13 @@ function wireSourcePanel() {
     panel.hidden = !show;
     if (show) { refresh(); timer = setInterval(refresh, 4000); } else { stop(); }
   };
+
+  // Maximize the panel to full width (and back), for reading wide diffs.
+  const expand = document.getElementById("source-expand");
+  expand.onclick = () => {
+    const max = panel.classList.toggle("expanded");
+    expand.textContent = max ? "⤡ restore" : "⤢ expand";
+  };
 }
 
 // Copy the session id (for `runclaude --serve --serve-resume <id>`).
