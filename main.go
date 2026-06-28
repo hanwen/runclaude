@@ -23,6 +23,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
+	"github.com/hanwen/runclaude/agentclient"
 	"github.com/hanwen/runclaude/creds"
 	"github.com/hanwen/runclaude/proxy"
 )
@@ -84,6 +85,19 @@ type Config struct {
 	MitmUpstream map[string]string `json:"mitmUpstream,omitempty"`
 	BundlePath   string            `json:"bundlePath"`
 	CAPath       string            `json:"caPath"`
+
+	// Inherited-fd numbers threaded through the re-exec chain via ExtraFiles.
+	// ExtraFiles[i] lands at fd 3+i in the child, and childMain re-passes the
+	// same fds in the same ascending order, so these numbers stay valid all the
+	// way to initMain. 0 means absent (these never use fds 0-2).
+	//
+	// CommFd is the proxy fd-passing socket (see setupNetwork). ServeInFd /
+	// ServeOutFd are claude's stdin (read end) and stdout (write end) in
+	// --serve mode; the host keeps the matching pipe ends to run the session
+	// hub. See serve.go.
+	CommFd     int `json:"commFd,omitempty"`
+	ServeInFd  int `json:"serveInFd,omitempty"`
+	ServeOutFd int `json:"serveOutFd,omitempty"`
 }
 
 type Bind struct {
@@ -447,6 +461,7 @@ func mainErr() error {
 	flag.Var(&only, "o", "alias for --only")
 	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
 	claudeMode := flag.Bool("claude", true, "bind files needed for `claude` and run it as the default command")
+	serve := flag.Bool("serve", false, "drive the sandboxed claude headless over the stream-json protocol and run a host-side session hub instead of attaching a terminal (implies --claude)")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
@@ -470,6 +485,10 @@ func mainErr() error {
 	flag.Parse()
 
 	claudeLike := *claudeMode || *claudeConfig
+
+	if *serve && !*claudeMode {
+		return fmt.Errorf("--serve requires --claude (it drives claude headless)")
+	}
 
 	allowedDomains := allowDomain.items
 	if !allowDomain.set {
@@ -809,7 +828,15 @@ func mainErr() error {
 			if mergeProjectClaude {
 				cmd = append(cmd, "--setting-sources", "user")
 			}
-			cfg.Command = append(cmd, flag.Args()...)
+			if *serve {
+				// Headless multi-turn mode: claude reads prompt turns and writes
+				// events as JSON lines over the pipes we wire up below. No
+				// positional prompt — those arrive over the wire from the hub.
+				cmd = append(cmd, agentclient.StreamJSONFlags...)
+				cfg.Command = cmd
+			} else {
+				cfg.Command = append(cmd, flag.Args()...)
+			}
 		}
 		if bearer != "" || apiKey != "" {
 			if err := writeStubCredentials(credDir); err != nil {
@@ -893,18 +920,60 @@ func mainErr() error {
 			containerEnv = append(containerEnv, "AWS_DEFAULT_REGION="+r)
 		}
 	}
+	// Assemble inherited fds in a fixed ascending order so their numbers
+	// (3, 4, 5, ...) survive the re-exec chain — childMain re-passes them in the
+	// same order. Record each number in cfg before encoding it into the env.
+	var extraFiles []*os.File
+	if commChildFile != nil {
+		cfg.CommFd = 3 + len(extraFiles)
+		extraFiles = append(extraFiles, commChildFile)
+	}
+	var hostStdinW, hostStdoutR *os.File
+	if *serve {
+		// host -> claude (prompt turns): host writes hostStdinW, the sandboxed
+		// claude reads claudeStdinR.
+		claudeStdinR, w, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		hostStdinW = w
+		// claude -> host (events): claude writes claudeStdoutW, host reads
+		// hostStdoutR.
+		r, claudeStdoutW, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		hostStdoutR = r
+		cfg.ServeInFd = 3 + len(extraFiles)
+		extraFiles = append(extraFiles, claudeStdinR)
+		cfg.ServeOutFd = 3 + len(extraFiles)
+		extraFiles = append(extraFiles, claudeStdoutW)
+	}
+
 	cmd.Env = append(containerEnv, childEnv+"="+encodeConfig(cfg))
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	cmd.Stdin = os.Stdin
-	if commChildFile != nil {
-		cmd.ExtraFiles = []*os.File{commChildFile}
+	// In --serve mode claude's stdin is a pipe wired up in runAsInit; nothing in
+	// the container reads the host terminal, so leave it free for the hub.
+	if !*serve {
+		cmd.Stdin = os.Stdin
 	}
-	err = cmd.Run()
-	if commChildFile != nil {
-		commChildFile.Close()
+	cmd.ExtraFiles = extraFiles
+
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	return err
+	// The sandbox-side ends now live in the child; close our copies so EOF
+	// propagates (e.g. host closing hostStdinW becomes the only remaining writer
+	// to claude's stdin, and the container exiting closes the last writer to
+	// claude's stdout so the hub sees EOF).
+	for _, f := range extraFiles {
+		f.Close()
+	}
+	if *serve {
+		runServe(hostStdinW, hostStdoutR)
+	}
+	return cmd.Wait()
 }
 
 // scrubAWSCreds returns env without AWS credential and Bedrock-routing
@@ -992,6 +1061,19 @@ func setupDev(rootfs string) error {
 		}
 	}
 	return nil
+}
+
+// inheritedFds returns the fd numbers passed down the re-exec chain via
+// ExtraFiles, in ascending order (the order mainErr assigned and childMain must
+// preserve). 0 entries are absent.
+func inheritedFds(cfg *Config) []int {
+	var fds []int
+	for _, fd := range []int{cfg.CommFd, cfg.ServeInFd, cfg.ServeOutFd} {
+		if fd != 0 {
+			fds = append(fds, fd)
+		}
+	}
+	return fds
 }
 
 func childMain() error {
@@ -1207,12 +1289,16 @@ func childMain() error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
-	// fd 3 (if present) is the comm socket back to mainErr; forward it.
-	if comm := os.NewFile(3, "comm"); comm != nil {
+	// Forward the inherited fds (proxy comm socket, --serve stdio pipes) on to
+	// init in ascending fd order. Mirrors the order mainErr assigned, so the
+	// fd numbers recorded in cfg stay valid for initMain/runAsInit.
+	for _, fd := range inheritedFds(cfg) {
+		f := os.NewFile(uintptr(fd), "inherited")
 		var st syscall.Stat_t
-		if err := syscall.Fstat(3, &st); err == nil {
-			cmd.ExtraFiles = []*os.File{comm}
+		if err := syscall.Fstat(fd, &st); err != nil {
+			return fmt.Errorf("inherited fd %d missing: %w", fd, err)
 		}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, f)
 	}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -1292,7 +1378,7 @@ func initMain() error {
 	if err != nil {
 		return fmt.Errorf("lookup %s: %w", cfg.Command[0], err)
 	}
-	return runAsInit(bin, cfg.Command)
+	return runAsInit(bin, cfg.Command, cfg)
 }
 
 // runAsInit forks the user command as a child of this process (which is pid
@@ -1301,15 +1387,36 @@ func initMain() error {
 // SIGTSTP/SIGTTIN/SIGTTOU from the controlling tty — the kernel silently
 // drops those for pid 1 of a PID ns when no handler is installed, which is
 // what froze claude on ^Z before this shim was added.
-func runAsInit(bin string, argv []string) error {
+func runAsInit(bin string, argv []string, cfg *Config) error {
 	cmd := exec.Command(bin)
 	cmd.Args = argv
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
+	// In --serve mode claude's stdin/stdout are the inherited pipe ends back to
+	// the host hub (stream-json), not the terminal. stderr stays on the terminal
+	// for logs either way.
+	var serveFiles []*os.File
+	if cfg.ServeInFd != 0 {
+		f := os.NewFile(uintptr(cfg.ServeInFd), "claude-stdin")
+		cmd.Stdin = f
+		serveFiles = append(serveFiles, f)
+	} else {
+		cmd.Stdin = os.Stdin
+	}
+	if cfg.ServeOutFd != 0 {
+		f := os.NewFile(uintptr(cfg.ServeOutFd), "claude-stdout")
+		cmd.Stdout = f
+		serveFiles = append(serveFiles, f)
+	} else {
+		cmd.Stdout = os.Stdout
+	}
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", argv[0], err)
+	}
+	// Drop our copies of the pipe ends now that claude owns them, so we aren't a
+	// spurious extra holder keeping them open.
+	for _, f := range serveFiles {
+		f.Close()
 	}
 	childPid := cmd.Process.Pid
 
