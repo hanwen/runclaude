@@ -22,7 +22,7 @@ import (
 // Phase 2 serves read-only over plain localhost (addr); the terminal operator
 // drives the session and browsers watch. Phase 2b swaps the listener for tsnet
 // and adds per-connection identity; Phase 3 enables web prompt submission.
-func runServe(stdinW, stdoutR *os.File, addr string, dev bool) {
+func runServe(stdinW, stdoutR *os.File, addr string, dev bool, writers []string) {
 	client := agentclient.New(stdinW, stdoutR)
 	hub := sessionhub.New(client)
 
@@ -36,10 +36,24 @@ func runServe(stdinW, stdoutR *os.File, addr string, dev bool) {
 		ident = web.DevIdentifier{Base: operator}
 	}
 
+	// Write-eligibility policy: the local operator plus any explicitly allowed
+	// logins. In dev mode with no allowlist, everyone is eligible so the
+	// take-control flow can be exercised from one machine; pass --serve-writer
+	// to instead test denials.
+	logins := map[string]bool{}
+	for _, l := range writers {
+		logins[l] = true
+	}
+	policy := web.AllowlistPolicy{
+		Logins:     logins,
+		AllowLocal: true,
+		AllowAll:   dev && len(writers) == 0,
+	}
+
 	// The local terminal operator drives the session; web viewers watch.
 	go feedPromptsFromTerminal(hub, client)
 
-	srv := &http.Server{Addr: addr, Handler: web.New(hub, ident)}
+	srv := &http.Server{Addr: addr, Handler: web.New(hub, ident, policy)}
 	go func() {
 		log.Printf("serve: web UI on http://%s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

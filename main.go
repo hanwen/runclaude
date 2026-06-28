@@ -464,6 +464,8 @@ func mainErr() error {
 	serve := flag.Bool("serve", false, "drive the sandboxed claude headless over the stream-json protocol and run a host-side session hub instead of attaching a terminal (implies --claude)")
 	serveAddr := flag.String("serve-addr", "127.0.0.1:8711", "address for the --serve web UI (localhost for now; a tailnet listener lands in a later phase)")
 	serveDev := flag.Bool("serve-dev", false, "dev only: let --serve clients pick their identity via ?as=<login> (for testing the identity/control flow from one machine). Never use with a real tailnet listener.")
+	var serveWriters stringSlice
+	flag.Var(&serveWriters, "serve-writer", "login allowed to take control in --serve mode (repeatable); the local operator is always allowed")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
@@ -973,7 +975,7 @@ func mainErr() error {
 		f.Close()
 	}
 	if *serve {
-		runServe(hostStdinW, hostStdoutR, *serveAddr, *serveDev)
+		runServe(hostStdinW, hostStdoutR, *serveAddr, *serveDev, serveWriters)
 	}
 	return cmd.Wait()
 }

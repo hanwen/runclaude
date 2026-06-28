@@ -74,3 +74,7 @@ button {
   padding: 0 16px; font-weight: 600; cursor: pointer;
 }
 button:disabled { opacity: .4; cursor: default; }
+.who button {
+  font-size: 12px; padding: 4px 10px; height: 28px;
+}
+#release { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }

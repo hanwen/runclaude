@@ -22,27 +22,37 @@ import (
 
 // Server routes HTTP requests for one session.
 type Server struct {
-	hub   *sessionhub.Hub
-	ident Identifier
-	mux   *http.ServeMux
+	hub    *sessionhub.Hub
+	ident  Identifier
+	policy Policy
+	mux    *http.ServeMux
 }
 
 // New builds the HTTP handler for hub. ident resolves the caller identity for
-// each request (LocalIdentifier on localhost, a tailnet WhoIs identifier later).
-func New(hub *sessionhub.Hub, ident Identifier) *Server {
-	s := &Server{hub: hub, ident: ident, mux: http.NewServeMux()}
+// each request (LocalIdentifier on localhost, a tailnet WhoIs identifier later);
+// policy decides who is write-eligible (may take control).
+func New(hub *sessionhub.Hub, ident Identifier, policy Policy) *Server {
+	s := &Server{hub: hub, ident: ident, policy: policy, mux: http.NewServeMux()}
 	s.mux.Handle("/", http.FileServer(http.FS(frontend.FS)))
 	s.mux.HandleFunc("/events", s.handleEvents)
 	s.mux.HandleFunc("/whoami", s.handleWhoami)
+	s.mux.HandleFunc("/take-control", s.handleTakeControl)
+	s.mux.HandleFunc("/release-control", s.handleReleaseControl)
+	s.mux.HandleFunc("/prompt", s.handlePrompt)
+	s.mux.HandleFunc("/interrupt", s.handleInterrupt)
 	return s
 }
 
-// handleWhoami reports the caller's resolved identity so the frontend can show
-// who you are. Identity is not yet a gate in Phase 2 (read-only for everyone);
-// Phase 3 uses it to decide who may take control.
+// handleWhoami reports the caller's resolved identity and whether they are
+// write-eligible, so the frontend knows whether to offer the take-control
+// button.
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	id := s.ident.Identify(r)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.ident.Identify(r))
+	_ = json.NewEncoder(w).Encode(struct {
+		Identity
+		MayWrite bool `json:"mayWrite"`
+	}{id, s.policy.MayWrite(id)})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +87,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		writeEvent(w, i, raw)
 	}
+	// Mark the history/live boundary so the client can tell replay from live
+	// events (e.g. to suppress "you lost control" notices while catching up).
+	fmt.Fprint(w, "data: {\"type\":\"synced\"}\n\n")
 	flusher.Flush()
 
 	// Live events get ids continuing past the history snapshot.

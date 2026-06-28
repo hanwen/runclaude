@@ -3,6 +3,7 @@ package agentclient
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -13,9 +14,10 @@ import (
 // directly (see Spawn), Phase 1 hands it the ends of pipes that cross the
 // sandbox re-execs — so the same reader/writer logic serves both.
 type Client struct {
-	mu     sync.Mutex // serializes writes to w
+	mu     sync.Mutex // serializes writes to w and guards reqSeq
 	w      io.Writer
 	events chan Event
+	reqSeq int // monotonic id for control requests
 }
 
 // New starts reading events from r in a background goroutine and returns a
@@ -88,5 +90,37 @@ func (c *Client) SendPrompt(text string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err = c.w.Write(b)
+	return err
+}
+
+// controlRequest is a bidirectional control-channel message written to claude's
+// stdin. Only the "interrupt" subtype is used (to stop a running turn); the rest
+// of the control subprotocol is intentionally out of scope.
+type controlRequest struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	Request   struct {
+		Subtype string `json:"subtype"`
+	} `json:"request"`
+}
+
+// Interrupt asks claude to stop the in-flight turn. claude acknowledges with a
+// control_response event on the stream and ends the turn with a result whose
+// subtype reports the interruption. Fire-and-forget: we don't block on the ack.
+func (c *Client) Interrupt() error {
+	c.mu.Lock()
+	c.reqSeq++
+	var req controlRequest
+	req.Type = "control_request"
+	req.RequestID = fmt.Sprintf("req_int_%d", c.reqSeq)
+	req.Request.Subtype = "interrupt"
+	b, err := json.Marshal(req)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	b = append(b, '\n')
+	_, err = c.w.Write(b)
+	c.mu.Unlock()
 	return err
 }

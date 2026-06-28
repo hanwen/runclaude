@@ -81,6 +81,62 @@ func TestHubFanoutAndHistory(t *testing.T) {
 	}
 }
 
+func TestControlStealAndSubmit(t *testing.T) {
+	pr, pw := io.Pipe()
+	client := agentclient.New(&bytes.Buffer{}, pr)
+	h := New(client)
+	go h.Run()
+	_ = pw // keep the stream open so Run blocks rather than ending
+
+	sub := h.Subscribe()
+	defer sub.Close()
+
+	// Nobody controls yet: a non-controller submit is rejected.
+	if err := h.Submit("alice", "alice", "alice", "hi"); err != ErrNotController {
+		t.Fatalf("submit with no controller = %v, want ErrNotController", err)
+	}
+
+	// Alice takes control; a control event is broadcast.
+	h.TakeControl("alice", "Alice", "alice@x")
+	if got := recv(t, sub.C); !bytes.Contains(got, []byte(`"controller":"alice"`)) {
+		t.Errorf("control event = %s", got)
+	}
+	if h.Controller() != "alice" {
+		t.Errorf("controller = %q, want alice", h.Controller())
+	}
+	if err := h.Submit("alice", "Alice", "alice@x", "do thing"); err != nil {
+		t.Errorf("alice submit = %v, want nil", err)
+	}
+
+	// Bob steals; the prior controller (alice) is displaced.
+	prev := h.TakeControl("bob", "Bob", "bob@x")
+	if prev != "Alice" {
+		t.Errorf("displaced = %q, want Alice", prev)
+	}
+	recv(t, sub.C) // the bob control event
+	if err := h.Submit("alice", "Alice", "alice@x", "still me?"); err != ErrNotController {
+		t.Errorf("displaced alice submit = %v, want ErrNotController", err)
+	}
+
+	// Interrupt is gated on the same token: alice (displaced) cannot, bob can.
+	if err := h.Interrupt("alice"); err != ErrNotController {
+		t.Errorf("displaced alice interrupt = %v, want ErrNotController", err)
+	}
+	if err := h.Interrupt("bob"); err != nil {
+		t.Errorf("controller bob interrupt = %v, want nil", err)
+	}
+
+	// Release by a non-holder is a no-op; by the holder clears the token.
+	h.ReleaseControl("alice")
+	if h.Controller() != "bob" {
+		t.Errorf("controller after non-holder release = %q, want bob", h.Controller())
+	}
+	h.ReleaseControl("bob")
+	if h.Controller() != "" {
+		t.Errorf("controller after release = %q, want empty", h.Controller())
+	}
+}
+
 func TestSubscribeAfterEnd(t *testing.T) {
 	h, emit, pw := newTestHub(t)
 	emit(`{"type":"system","subtype":"init","session_id":"s2"}`)

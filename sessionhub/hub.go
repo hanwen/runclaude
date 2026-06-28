@@ -6,10 +6,17 @@
 package sessionhub
 
 import (
+	"encoding/json"
+	"errors"
+	"log"
 	"sync"
 
 	"github.com/hanwen/runclaude/agentclient"
 )
+
+// ErrNotController is returned by Submit when a non-controller tries to send a
+// prompt — the single-writer token is held by someone else (or nobody).
+var ErrNotController = errors.New("not the controller")
 
 // subBuffer is the per-subscriber queue depth. A viewer that can't keep up past
 // this is dropped (its channel closed); the browser reconnects and replays the
@@ -26,6 +33,13 @@ type Hub struct {
 	subs       map[int]chan []byte
 	nextID     int
 	done       bool
+
+	// Single-writer control token. ctrlID is the participant id currently
+	// allowed to submit prompts ("" = nobody); ctrlName is its display name for
+	// the UI. Take-control steals the token atomically (no pending/grant state).
+	ctrlMu   sync.Mutex
+	ctrlID   string
+	ctrlName string
 }
 
 // New returns a Hub over client. Call Run (once) to start consuming events.
@@ -105,8 +119,89 @@ func (s *Subscription) Close() {
 	}
 }
 
-// SendPrompt forwards a prompt turn to claude. Phase 3 adds the controller gate
-// and identity attribution on top of this.
+// SendPrompt forwards a prompt turn to claude with no control gate. It is the
+// local terminal operator's path — the operator physically owns the session, so
+// it is always allowed. Web prompts go through Submit instead.
 func (h *Hub) SendPrompt(text string) error {
 	return h.client.SendPrompt(text)
+}
+
+// Controller returns the participant id currently holding the writer token
+// ("" if nobody).
+func (h *Hub) Controller() string {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	return h.ctrlID
+}
+
+// TakeControl atomically transfers the single writer token to participant id
+// (display name name, authenticated login for the audit log). Any previous
+// controller is displaced — clients compare the broadcast holder to their own
+// id and the loser drops to viewer. Eligibility (may this login write at all)
+// is enforced by the caller before calling this. Returns the displaced
+// controller's name, if any.
+func (h *Hub) TakeControl(id, name, login string) string {
+	h.ctrlMu.Lock()
+	prev := h.ctrlName
+	h.ctrlID = id
+	h.ctrlName = name
+	h.ctrlMu.Unlock()
+	log.Printf("audit: control taken by id=%q name=%q login=%q (displaced %q)", id, name, login, prev)
+	h.emit(map[string]any{"type": "control", "controller": id, "controllerName": name})
+	return prev
+}
+
+// ReleaseControl drops the token if id currently holds it (a controller
+// voluntarily stepping down). No-op otherwise.
+func (h *Hub) ReleaseControl(id string) {
+	h.ctrlMu.Lock()
+	if h.ctrlID != id {
+		h.ctrlMu.Unlock()
+		return
+	}
+	h.ctrlID = ""
+	h.ctrlName = ""
+	h.ctrlMu.Unlock()
+	log.Printf("audit: control released by id=%q", id)
+	h.emit(map[string]any{"type": "control", "controller": "", "controllerName": ""})
+}
+
+// Submit sends a prompt turn on behalf of participant id, enforcing the
+// single-writer token: only the current controller may submit. login/name are
+// recorded for the audit trail. Returns ErrNotController if id does not hold
+// the token.
+func (h *Hub) Submit(id, name, login, text string) error {
+	if id == "" || id != h.Controller() {
+		return ErrNotController
+	}
+	log.Printf("audit: prompt from id=%q name=%q login=%q: %q", id, name, login, truncate(text, 200))
+	return h.client.SendPrompt(text)
+}
+
+// Interrupt stops the in-flight turn. Only the current controller may interrupt
+// (it is a control action over the same single-writer token as prompting).
+func (h *Hub) Interrupt(id string) error {
+	if id == "" || id != h.Controller() {
+		return ErrNotController
+	}
+	log.Printf("audit: interrupt by id=%q", id)
+	return h.client.Interrupt()
+}
+
+// emit broadcasts a hub-synthesized event (e.g. a control change) into the same
+// transcript/fan-out stream as claude's events, so it is ordered, replayed to
+// late joiners, and part of the audit-visible record.
+func (h *Hub) emit(ev map[string]any) {
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	h.broadcast(raw)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

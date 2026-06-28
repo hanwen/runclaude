@@ -17,7 +17,7 @@ import (
 
 func TestWhoamiDevOverride(t *testing.T) {
 	hub := sessionhub.New(agentclient.New(&bytes.Buffer{}, strings.NewReader("")))
-	srv := httptest.NewServer(New(hub, DevIdentifier{Base: Identity{Login: "local", Name: "operator"}}))
+	srv := httptest.NewServer(New(hub, DevIdentifier{Base: Identity{Login: "local", Name: "operator"}}, AllowlistPolicy{AllowAll: true}))
 	defer srv.Close()
 
 	res, err := http.Get(srv.URL + "/whoami?as=alice@example.com")
@@ -40,7 +40,7 @@ func TestEventsReplayThenLive(t *testing.T) {
 	io.WriteString(pw, `{"type":"system","subtype":"init","session_id":"s1"}`+"\n")
 	time.Sleep(30 * time.Millisecond)
 
-	srv := httptest.NewServer(New(hub, LocalIdentifier{ID: Identity{Login: "local"}}))
+	srv := httptest.NewServer(New(hub, LocalIdentifier{ID: Identity{Login: "local"}}, AllowlistPolicy{AllowLocal: true}))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -14,15 +14,19 @@
       <span class="session" id="session">connecting…</span>
     </div>
     <div class="who">
+      <span id="control" class="me"></span>
       <span id="me" class="me"></span>
+      <button id="take" hidden>Take control</button>
+      <button id="release" hidden>Release</button>
       <span id="role" class="badge">read-only</span>
     </div>
   </header>
 
   <main id="transcript" aria-live="polite"></main>
 
-  <footer id="composer" hidden>
+  <footer id="composer">
     <textarea id="prompt" rows="1" placeholder="Take control to send a prompt…" disabled></textarea>
+    <button id="stop" disabled title="Stop the running turn">Stop</button>
     <button id="send" disabled>Send</button>
   </footer>
 

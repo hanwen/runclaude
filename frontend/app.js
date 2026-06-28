@@ -8,6 +8,21 @@ const transcriptEl = document.getElementById("transcript");
 const sessionEl = document.getElementById("session");
 const statusDot = document.getElementById("status-dot");
 
+// Per-connection participant id: coordination/attribution only, never the authz
+// gate (the server keys eligibility on the resolved Tailscale/dev identity).
+// Stable per tab so a reconnect keeps the same control token.
+const PID = (() => {
+  let v = sessionStorage.getItem("runclaude-pid");
+  if (!v) { v = Math.random().toString(36).slice(2) + Date.now().toString(36); sessionStorage.setItem("runclaude-pid", v); }
+  return v;
+})();
+
+const state = { mayWrite: false, myName: "", controller: null, wasController: false, caughtUp: false };
+
+// In dev mode the identity rides in the query string (?as=); forward it on
+// every request so the server resolves the same principal.
+const qs = window.location.search;
+
 function setStatus(state) {
   statusDot.className = "dot " + state;
   statusDot.title = state;
@@ -105,7 +120,72 @@ function handle(ev) {
     case "result":
       if (ev.is_error) addBlock(el("div", "result", "turn error: " + (ev.subtype || "")));
       break;
+    case "control":
+      applyControl(ev.controller || null, ev.controllerName || "");
+      break;
+    case "synced":
+      state.caughtUp = true;
+      break;
   }
+}
+
+// applyControl reconciles the UI with the broadcast control state: who drives,
+// whether the composer is live, and a notice when *we* are displaced.
+function applyControl(controllerPid, controllerName) {
+  const controlEl = document.getElementById("control");
+  const iControl = controllerPid && controllerPid === PID;
+
+  if (state.caughtUp && state.wasController && !iControl) {
+    addBlock(el("div", "notice", "you lost control" + (controllerName ? " to " + controllerName : "")));
+  }
+  state.controller = controllerPid;
+  state.wasController = iControl;
+
+  if (!controllerPid) controlEl.textContent = "no one is driving";
+  else if (iControl) controlEl.textContent = "you are driving";
+  else controlEl.textContent = controllerName + " is driving";
+
+  document.getElementById("role").textContent = iControl ? "controller" : "read-only";
+  document.getElementById("role").classList.toggle("controller", !!iControl);
+  document.getElementById("release").hidden = !iControl;
+  document.getElementById("take").hidden = !state.mayWrite || iControl;
+
+  const prompt = document.getElementById("prompt");
+  const send = document.getElementById("send");
+  prompt.disabled = !iControl;
+  send.disabled = !iControl;
+  document.getElementById("stop").disabled = !iControl;
+  prompt.placeholder = iControl ? "Send a prompt…" : "Take control to send a prompt…";
+}
+
+async function post(path, body) {
+  const res = await fetch(path + qs, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok && res.status !== 204) {
+    addBlock(el("div", "notice", path + " failed: " + (await res.text()).trim()));
+  }
+  return res;
+}
+
+function wireControls() {
+  document.getElementById("take").onclick = () => post("/take-control", { id: PID, name: state.myName });
+  document.getElementById("release").onclick = () => post("/release-control", { id: PID });
+  const prompt = document.getElementById("prompt");
+  const send = document.getElementById("send");
+  const submit = async () => {
+    const text = prompt.value.trim();
+    if (!text) return;
+    const res = await post("/prompt", { id: PID, name: state.myName, text });
+    if (res.ok || res.status === 204) prompt.value = "";
+  };
+  send.onclick = submit;
+  prompt.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+  });
+  document.getElementById("stop").onclick = () => post("/interrupt", { id: PID });
 }
 
 function connect() {
@@ -125,16 +205,21 @@ function connect() {
   });
 }
 
-// Show who the server thinks we are. In dev mode the identity can be chosen
-// with ?as=<login>; forward that query string to /whoami so it agrees.
+// Resolve who the server thinks we are and whether we may take control. In dev
+// mode the identity rides in ?as=<login>; forward it so /whoami agrees.
 async function loadIdentity() {
   try {
-    const res = await fetch("/whoami" + window.location.search);
+    const res = await fetch("/whoami" + qs);
     const me = await res.json();
-    document.getElementById("me").textContent = me.name || me.login || "";
-  } catch { /* identity is informational in Phase 2 */ }
+    state.myName = me.name || me.login || "";
+    state.mayWrite = !!me.mayWrite;
+    document.getElementById("me").textContent = state.myName ? "you: " + state.myName : "";
+  } catch { /* identity is informational; default to read-only */ }
+  // Reconcile button visibility now that mayWrite is known.
+  applyControl(state.controller, "");
 }
 
 setStatus("");
+wireControls();
 loadIdentity();
 connect();
