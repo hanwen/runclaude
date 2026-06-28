@@ -464,8 +464,9 @@ func mainErr() error {
 	serve := flag.Bool("serve", false, "drive the sandboxed claude headless over the stream-json protocol and run a host-side session hub instead of attaching a terminal (implies --claude)")
 	serveAddr := flag.String("serve-addr", "127.0.0.1:8711", "address for the --serve web UI (localhost for now; a tailnet listener lands in a later phase)")
 	serveDev := flag.Bool("serve-dev", false, "dev only: let --serve clients pick their identity via ?as=<login> (for testing the identity/control flow from one machine). Never use with a real tailnet listener.")
+	serveTailnet := flag.String("serve-tailnet", "", "expose --serve on the tailnet as an embedded tsnet node with this hostname (tailnet-only, never funnel); identity comes from WhoIs. Set TS_AUTHKEY for unattended login. Empty = localhost via --serve-addr.")
 	var serveWriters stringSlice
-	flag.Var(&serveWriters, "serve-writer", "login allowed to take control in --serve mode (repeatable); the local operator is always allowed")
+	flag.Var(&serveWriters, "serve-writer", "login allowed to take control in --serve mode (repeatable); on localhost the local operator is always allowed, on a tailnet only these logins may write")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
 	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
@@ -492,6 +493,9 @@ func mainErr() error {
 
 	if *serve && !*claudeMode {
 		return fmt.Errorf("--serve requires --claude (it drives claude headless)")
+	}
+	if *serveTailnet != "" && *serveDev {
+		return fmt.Errorf("--serve-dev must not be combined with --serve-tailnet: the ?as= override would let any tailnet user forge an identity")
 	}
 
 	allowedDomains := allowDomain.items
@@ -975,7 +979,14 @@ func mainErr() error {
 		f.Close()
 	}
 	if *serve {
-		runServe(hostStdinW, hostStdoutR, cwd, *serveAddr, *serveDev, serveWriters)
+		runServe(hostStdinW, hostStdoutR, serveOptions{
+			cwd:      cwd,
+			addr:     *serveAddr,
+			dev:      *serveDev,
+			writers:  serveWriters,
+			tailnet:  *serveTailnet,
+			tsnetDir: filepath.Join(cacheDir, "tsnet"),
+		})
 	}
 	return cmd.Wait()
 }

@@ -93,10 +93,13 @@ design. Components:
   WebSocket — the only client→server actions are discrete POSTs, so SSE keeps
   zero extra deps), `/whoami`, `/take-control`, `/release-control`, `/prompt`,
   `/interrupt`, and a read-only `/source` (`jj show @`). `Identifier` resolves
-  per-connection identity and `Policy` decides write-eligibility — both pluggable
-  so a tailnet `tsnet` `WhoIs` identifier + ACL policy drop in later (the tsnet
-  listener is the one piece of `SHARING_PLAN.md` still pending, gated on being
-  able to fetch the dependency).
+  per-connection identity and `Policy` decides write-eligibility — both pluggable.
+  `serve/tsnet.go` (`ListenTailnet`) brings up an embedded `tsnet` node
+  (tailnet-only, never funnel) whose `Identifier` resolves `LocalClient.WhoIs`;
+  on a tailnet only `--serve-writer` logins may write (`AllowLocal` is off). With
+  no `--serve-tailnet`, the server binds localhost (`--serve-addr`) and
+  `--serve-dev` enables a `?as=<login>` identity override for one-machine
+  testing.
 - **`frontend/`** — `go:embed`ed static HTML/JS that renders the transcript from
   the event stream, shows who holds control, and gates the prompt box on it.
 
@@ -108,9 +111,10 @@ keeps their order stable across the re-execs. `runAsInit` points claude's
 stdin/stdout at the pipe ends; the host keeps the other ends and runs the
 `sessionhub` + web server (`runServe`). This mirrors the proxy's
 "sandboxed process, host-side network surface" split — claude stays contained,
-the web server lives on the host. `--serve-dev` enables a `?as=<login>` identity
-override for testing the control flow from one machine; never use it with a real
-tailnet listener.
+the web server (and the tsnet node) lives on the host. `--serve-dev` enables a
+`?as=<login>` identity override for testing the control flow from one machine;
+it is rejected together with `--serve-tailnet`, since a forgeable identity must
+never reach a real tailnet.
 
 ### `fakeapi/` and `cmd/fake-anthropic/`
 

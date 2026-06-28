@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,40 +19,71 @@ import (
 	"github.com/hanwen/runclaude/sessionhub"
 )
 
+// serveOptions configures runServe.
+type serveOptions struct {
+	cwd      string   // session working directory (for the jj source panel)
+	addr     string   // localhost bind address (when not on a tailnet)
+	dev      bool     // dev ?as= identity override
+	writers  []string // logins allowed to take control
+	tailnet  string   // tsnet node hostname; empty = localhost
+	tsnetDir string   // tsnet state dir (node identity persistence)
+}
+
 // runServe is the host-side session: it owns the agentclient talking to the
 // sandboxed claude over the stream-json pipes (stdinW carries prompt turns in,
 // stdoutR carries events back), drives it through a sessionhub, and exposes the
-// transcript to web viewers.
-//
-// Phase 2 serves read-only over plain localhost (addr); the terminal operator
-// drives the session and browsers watch. Phase 2b swaps the listener for tsnet
-// and adds per-connection identity; Phase 3 enables web prompt submission.
-func runServe(stdinW, stdoutR *os.File, cwd, addr string, dev bool, writers []string) {
+// transcript to web viewers — over a localhost listener or, when opt.tailnet is
+// set, an embedded tsnet node with per-connection WhoIs identity.
+func runServe(stdinW, stdoutR *os.File, opt serveOptions) {
 	client := agentclient.New(stdinW, stdoutR)
 	hub := sessionhub.New(client)
 
-	// Identity layer. On localhost there is no per-connection identity, so
-	// everyone is the local operator; --serve-dev instead reads a ?as= label so
-	// distinct principals can be simulated from one machine. The tailnet WhoIs
-	// identifier will slot in here behind the same interface.
+	// Identity + listener. On a tailnet, identity is the real WhoIs login and
+	// the listener is the tsnet node. On localhost there is no per-connection
+	// identity (everyone is the local operator); --serve-dev reads a ?as= label
+	// so distinct principals can be simulated from one machine.
 	operator := web.Identity{Login: "local", Name: "operator"}
 	var ident web.Identifier = web.LocalIdentifier{ID: operator}
-	if dev {
+	if opt.dev {
 		ident = web.DevIdentifier{Base: operator}
 	}
 
-	// Write-eligibility policy: the local operator plus any explicitly allowed
-	// logins. In dev mode with no allowlist, everyone is eligible so the
-	// take-control flow can be exercised from one machine; pass --serve-writer
-	// to instead test denials.
+	var ln net.Listener
+	if opt.tailnet != "" {
+		ctx := context.Background()
+		l, tident, tn, err := web.ListenTailnet(ctx, opt.tailnet, opt.tsnetDir, os.Getenv("TS_AUTHKEY"), log.Printf)
+		if err != nil {
+			log.Printf("serve: tailnet: %v", err)
+			client.CloseStdin()
+			return
+		}
+		defer tn.Close()
+		ln, ident = l, tident
+		log.Printf("serve: tailnet node %q up; open http://%s/ from your tailnet", opt.tailnet, opt.tailnet)
+	} else {
+		l, err := net.Listen("tcp", opt.addr)
+		if err != nil {
+			log.Printf("serve: listen %s: %v", opt.addr, err)
+			client.CloseStdin()
+			return
+		}
+		ln = l
+		log.Printf("serve: web UI on http://%s", opt.addr)
+	}
+
+	// Write-eligibility policy: any explicitly allowed login, plus — only on
+	// localhost — the local operator. In dev mode with no allowlist, everyone is
+	// eligible so the take-control flow can be exercised from one machine; pass
+	// --serve-writer to test denials. On a tailnet AllowLocal never matches (the
+	// login is a real WhoIs identity), so only --serve-writer logins may write.
 	logins := map[string]bool{}
-	for _, l := range writers {
+	for _, l := range opt.writers {
 		logins[l] = true
 	}
 	policy := web.AllowlistPolicy{
 		Logins:     logins,
-		AllowLocal: true,
-		AllowAll:   dev && len(writers) == 0,
+		AllowLocal: opt.tailnet == "",
+		AllowAll:   opt.dev && len(opt.writers) == 0,
 	}
 
 	// The local terminal operator drives the session; web viewers watch.
@@ -60,15 +92,14 @@ func runServe(stdinW, stdoutR *os.File, cwd, addr string, dev bool, writers []st
 	// feedback without a browser (web viewers get the same via the hub).
 	go echoTranscript(hub)
 
-	srv := &http.Server{Addr: addr, Handler: web.New(web.Config{
+	srv := &http.Server{Handler: web.New(web.Config{
 		Hub:      hub,
 		Identity: ident,
 		Policy:   policy,
-		Source:   jjSource(cwd),
+		Source:   jjSource(opt.cwd),
 	})}
 	go func() {
-		log.Printf("serve: web UI on http://%s", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("serve: http: %v", err)
 		}
 	}()

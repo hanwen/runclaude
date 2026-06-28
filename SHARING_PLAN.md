@@ -22,30 +22,30 @@ It is *not* a terminal/TUI broadcast (that was the rejected Option 2).
 
 ## Implementation status
 
-Phases 0–5 are built and tested against the real CLI (2.1.183):
+All phases are built and tested against the real CLI (2.1.183):
 
 - **Phase 0** — `agentclient/`: stream-json transport port + `cmd/agentspike`.
 - **Phase 1** — `--serve`: sandbox stdio pipes threaded through the re-exec chain
   (`Config.{CommFd,ServeInFd,ServeOutFd}`, `runAsInit`).
 - **Phase 2** — `sessionhub/` (transcript + fan-out), `serve/` (SSE + `/whoami`),
   `frontend/`. Identity is a **pluggable `Identifier`/`Policy`** seam.
+- **Phase 2b** — `serve/tsnet.go`: embedded `tsnet` node via `--serve-tailnet
+  <hostname>` (tailnet-only, never funnel); `Identifier` resolves
+  `LocalClient.WhoIs`. `TS_AUTHKEY` for unattended login. Pinned
+  `tailscale.com@v1.98.0` (latest that builds with the repo's Go toolchain).
 - **Phase 3** — single-writer take-control (steal-immediately), web prompts,
   identity-gated eligibility, audit log.
 - **Phase 4** — controller-gated interrupt (`control_request`/`interrupt`).
 - **Phase 5** — read-only `jj show @` source panel (`/source`), terminal echo,
   this doc + `CLAUDE.md`.
 
-**Still pending: the tsnet listener (Phase 2b transport).** The transport and
-authz seams exist (`serve.Identifier`, `serve.Policy`); what remains is a
-`tsnet`-backed listener whose `Identifier` resolves `LocalClient.WhoIs`. It was
-not vendored because the build host here runs *inside* runclaude with an egress
-allowlist that blocks `proxy.golang.org`, so `tailscale.com/tsnet` can't be
-fetched. To finish: fetch the dep, add `serve/tsnet.go` exposing
-`ListenTailnet(...) (net.Listener, Identifier)`, and have `runServe` use it when
-a `--serve-tailnet <name>` flag is set (falling back to the localhost listener +
-`--serve-dev` for local testing). For now the web UI binds localhost
-(`--serve-addr`); expose it over a tailnet manually (e.g. `tailscale serve`)
-until the embedded listener lands.
+The tsnet path compiles, comes up, persists node state under
+`<cacheDir>/tsnet/`, and reaches the login step; a **live tailnet run** (auth +
+serving + WhoIs round-trip) could not be exercised from the build host here,
+which runs *inside* runclaude and whose egress allowlist blocks Tailscale's
+control plane. Validate it on a host with open egress and a tailnet:
+`TS_AUTHKEY=… runclaude --serve --serve-tailnet myhost --serve-writer you@example.com`.
+Localhost mode (`--serve-addr`, optionally `--serve-dev`) is fully exercised.
 
 ## Key decisions (locked unless noted)
 
