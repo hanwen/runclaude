@@ -2,54 +2,73 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"context"
 	"log"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/hanwen/runclaude/agentclient"
+	web "github.com/hanwen/runclaude/serve"
+	"github.com/hanwen/runclaude/sessionhub"
 )
 
-// runServe is the host-side session hub. It owns the agentclient talking to the
-// sandboxed claude over the stream-json pipes: stdinW carries prompt turns into
-// the sandbox, stdoutR carries events back out.
+// runServe is the host-side session: it owns the agentclient talking to the
+// sandboxed claude over the stream-json pipes (stdinW carries prompt turns in,
+// stdoutR carries events back), drives it through a sessionhub, and exposes the
+// transcript to web viewers.
 //
-// Phase 1 is deliberately minimal — a single local user, no web: read prompt
-// lines from the host terminal, print the transcript. Later phases replace the
-// body with the fan-out hub + tsnet web server while keeping this seam.
-func runServe(stdinW, stdoutR *os.File) {
+// Phase 2 serves read-only over plain localhost (addr); the terminal operator
+// drives the session and browsers watch. Phase 2b swaps the listener for tsnet
+// and adds per-connection identity; Phase 3 enables web prompt submission.
+func runServe(stdinW, stdoutR *os.File, addr string, dev bool) {
 	client := agentclient.New(stdinW, stdoutR)
+	hub := sessionhub.New(client)
 
-	// Feed the host terminal's lines in as prompt turns; terminal EOF (^D) ends
-	// the session by closing claude's stdin.
+	// Identity layer. On localhost there is no per-connection identity, so
+	// everyone is the local operator; --serve-dev instead reads a ?as= label so
+	// distinct principals can be simulated from one machine. The tailnet WhoIs
+	// identifier will slot in here behind the same interface.
+	operator := web.Identity{Login: "local", Name: "operator"}
+	var ident web.Identifier = web.LocalIdentifier{ID: operator}
+	if dev {
+		ident = web.DevIdentifier{Base: operator}
+	}
+
+	// The local terminal operator drives the session; web viewers watch.
+	go feedPromptsFromTerminal(hub, client)
+
+	srv := &http.Server{Addr: addr, Handler: web.New(hub, ident)}
 	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			if err := client.SendPrompt(line); err != nil {
-				log.Printf("serve: send prompt: %v", err)
-				return
-			}
+		log.Printf("serve: web UI on http://%s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("serve: http: %v", err)
 		}
-		client.CloseStdin()
 	}()
 
-	for ev := range client.Events() {
-		switch ev.Type {
-		case "system":
-			if ev.Subtype == "init" {
-				log.Printf("serve: session %s started", ev.SessionID)
-			}
-		case "assistant":
-			if t := ev.AssistantText(); t != "" {
-				fmt.Println(t)
-			}
-		case "result":
-			fmt.Printf("[result] %s\n", ev.ResultText())
+	hub.Run() // blocks until claude's event stream ends
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+	log.Printf("serve: session ended")
+}
+
+// feedPromptsFromTerminal sends each non-blank line from the host terminal as a
+// prompt turn; terminal EOF (^D) ends the session by closing claude's stdin.
+func feedPromptsFromTerminal(hub *sessionhub.Hub, client *agentclient.Client) {
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		if err := hub.SendPrompt(line); err != nil {
+			log.Printf("serve: send prompt: %v", err)
+			return
 		}
 	}
-	log.Printf("serve: session ended")
+	client.CloseStdin()
 }

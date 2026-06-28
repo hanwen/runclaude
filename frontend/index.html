@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>runclaude session</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span class="dot" id="status-dot" title="connecting"></span>
+      <strong>runclaude</strong>
+      <span class="session" id="session">connecting…</span>
+    </div>
+    <div class="who">
+      <span id="me" class="me"></span>
+      <span id="role" class="badge">read-only</span>
+    </div>
+  </header>
+
+  <main id="transcript" aria-live="polite"></main>
+
+  <footer id="composer" hidden>
+    <textarea id="prompt" rows="1" placeholder="Take control to send a prompt…" disabled></textarea>
+    <button id="send" disabled>Send</button>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
