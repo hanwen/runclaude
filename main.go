@@ -465,6 +465,7 @@ func mainErr() error {
 	serveAddr := flag.String("serve-addr", "127.0.0.1:8711", "address for the --serve web UI (localhost for now; a tailnet listener lands in a later phase)")
 	serveDev := flag.Bool("serve-dev", false, "dev only: let --serve clients pick their identity via ?as=<login> (for testing the identity/control flow from one machine). Never use with a real tailnet listener.")
 	serveTailnet := flag.String("serve-tailnet", "", "expose --serve on the tailnet as an embedded tsnet node with this hostname (tailnet-only, never funnel); identity comes from WhoIs. Set TS_AUTHKEY for unattended login. Empty = localhost via --serve-addr.")
+	serveResume := flag.String("serve-resume", "", "resume a previous claude session by id in --serve mode (shown in the web UI header of the original session)")
 	var serveWriters stringSlice
 	flag.Var(&serveWriters, "serve-writer", "login allowed to take control in --serve mode (repeatable); on localhost the local operator is always allowed, on a tailnet only these logins may write")
 	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
@@ -841,6 +842,11 @@ func mainErr() error {
 				// events as JSON lines over the pipes we wire up below. No
 				// positional prompt — those arrive over the wire from the hub.
 				cmd = append(cmd, agentclient.StreamJSONFlags...)
+				if *serveResume != "" {
+					// Continue a prior session (its history lives in the
+					// bind-mounted ~/.claude, keyed by this cwd).
+					cmd = append(cmd, "--resume", *serveResume)
+				}
 				cfg.Command = cmd
 			} else {
 				cfg.Command = append(cmd, flag.Args()...)

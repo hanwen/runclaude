@@ -114,27 +114,37 @@ func runServe(stdinW, stdoutR *os.File, opt serveOptions) {
 
 // echoTranscript prints assistant text and turn results from the hub to the
 // host terminal, so the local operator has visibility without opening the web
-// UI. It subscribes like any other viewer and ends when the session does.
+// UI. It also logs the session id once it is known (the system/init event), so
+// it can be copied to `--serve-resume` even without the web UI. It subscribes
+// like any other viewer and ends when the session does.
 func echoTranscript(hub *sessionhub.Hub) {
 	sub := hub.Subscribe()
 	defer sub.Close()
+	var sessionLogged bool
 	for _, raw := range sub.History {
-		echoEvent(raw)
+		echoEvent(raw, &sessionLogged)
 	}
 	for raw := range sub.C {
-		echoEvent(raw)
+		echoEvent(raw, &sessionLogged)
 	}
 }
 
-func echoEvent(raw []byte) {
+func echoEvent(raw []byte, sessionLogged *bool) {
 	var hdr struct {
-		Type string `json:"type"`
+		Type      string `json:"type"`
+		Subtype   string `json:"subtype"`
+		SessionID string `json:"session_id"`
 	}
 	if json.Unmarshal(raw, &hdr) != nil {
 		return
 	}
 	ev := agentclient.Event{Type: hdr.Type, Raw: raw}
 	switch hdr.Type {
+	case "system":
+		if hdr.Subtype == "init" && hdr.SessionID != "" && !*sessionLogged {
+			log.Printf("serve: session %s started (resume with --serve-resume %s)", hdr.SessionID, hdr.SessionID)
+			*sessionLogged = true
+		}
 	case "assistant":
 		if t := ev.AssistantText(); t != "" {
 			fmt.Println(t)

@@ -17,7 +17,7 @@ const PID = (() => {
   return v;
 })();
 
-const state = { mayWrite: false, myName: "", controller: null, controllerName: "", wasController: false, caughtUp: false };
+const state = { mayWrite: false, myName: "", controller: null, controllerName: "", wasController: false, caughtUp: false, sessionId: "" };
 
 // In dev mode the identity rides in the query string (?as=); forward it on
 // every request so the server resolves the same principal.
@@ -59,11 +59,32 @@ function addBlock(node) {
   scrollIfFollowing(wasBottom);
 }
 
+// collapsible renders monospace text clamped to `limit` lines with a toggle to
+// expand the rest. Tool inputs and outputs are noisy, so they default collapsed.
+function collapsible(text, limit = 3) {
+  const wrap = el("div", "collapsible");
+  const pre = el("pre");
+  const lines = text.split("\n");
+  const long = lines.length > limit;
+  const head = lines.slice(0, limit).join("\n");
+  pre.textContent = long ? head : text;
+  wrap.appendChild(pre);
+  if (long) {
+    let open = false;
+    const btn = el("button", "expand");
+    const label = () => { btn.textContent = open ? "▾ show less" : `▸ show ${lines.length - limit} more lines`; };
+    btn.onclick = () => { open = !open; pre.textContent = open ? text : head; label(); };
+    label();
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
 function toolCard(name, input) {
   const card = el("div", "tool");
   card.appendChild(el("span", "name", "⚒ " + name));
   if (input && Object.keys(input).length) {
-    card.appendChild(el("pre", null, JSON.stringify(input, null, 2)));
+    card.appendChild(collapsible(JSON.stringify(input, null, 2)));
   }
   return card;
 }
@@ -84,7 +105,7 @@ function renderUser(msg) {
         const text = typeof b.content === "string"
           ? b.content
           : (Array.isArray(b.content) ? b.content.map(c => c.text || "").join("") : "");
-        if (text) card.appendChild(el("pre", null, text));
+        if (text) card.appendChild(collapsible(text));
         addBlock(card);
       } else if (b.type === "text") {
         addMsg("user", [document.createTextNode(b.text)]);
@@ -108,7 +129,10 @@ function handle(ev) {
   switch (ev.type) {
     case "system":
       if (ev.subtype === "init") {
-        sessionEl.textContent = (ev.model ? ev.model + " · " : "") + (ev.session_id || "").slice(0, 8);
+        state.sessionId = ev.session_id || "";
+        sessionEl.textContent = (ev.model ? ev.model + " · " : "") + state.sessionId;
+        sessionEl.title = "session " + state.sessionId;
+        document.getElementById("copy-session").hidden = !state.sessionId;
       }
       break;
     case "user":
@@ -244,6 +268,16 @@ function wireSourcePanel() {
     if (show) { refresh(); timer = setInterval(refresh, 4000); } else { stop(); }
   };
 }
+
+// Copy the session id (for `runclaude --serve --serve-resume <id>`).
+document.getElementById("copy-session").onclick = async (e) => {
+  if (!state.sessionId) return;
+  try { await navigator.clipboard.writeText(state.sessionId); } catch { /* clipboard may be blocked over http */ }
+  const btn = e.target;
+  const was = btn.textContent;
+  btn.textContent = "copied";
+  setTimeout(() => { btn.textContent = was; }, 1200);
+};
 
 setStatus("");
 wireControls();

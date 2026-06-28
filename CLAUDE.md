@@ -101,7 +101,15 @@ design. Components:
   `--serve-dev` enables a `?as=<login>` identity override for one-machine
   testing.
 - **`frontend/`** — `go:embed`ed static HTML/JS that renders the transcript from
-  the event stream, shows who holds control, and gates the prompt box on it.
+  the event stream, shows who holds control, and gates the prompt box on it. The
+  header shows the full session id with a copy button (for `--serve-resume`), and
+  tool-call inputs / tool results render collapsed to 3 lines with an expand
+  toggle.
+
+`--serve-resume <id>` appends `--resume <id>` to the claude invocation to
+continue a prior session (its history lives in the bind-mounted `~/.claude`,
+keyed by cwd, so the same cwd must be used). The id is the one shown in the web
+header of the original session.
 
 **Data path (`main.go`, `serve.go`):** in `--serve` mode `mainErr` creates two
 `os.Pipe()`s and threads the sandbox-side ends through `childMain → initMain` via

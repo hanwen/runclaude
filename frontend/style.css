@@ -69,6 +69,16 @@ aside#source {
 }
 .tool .name { color: var(--accent); font-weight: 600; }
 .tool pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+.collapsible pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+button.expand {
+  margin-top: 4px; padding: 0; background: none; border: 0; cursor: pointer;
+  color: var(--accent); font: inherit; font-size: 12px; height: auto;
+}
+button.expand:hover { text-decoration: underline; }
+button.ghost {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  font-size: 11px; padding: 2px 8px; height: 24px;
+}
 .result { color: var(--muted); font-size: 12px; text-align: center; padding: 2px 0; }
 .notice { color: var(--muted); font-size: 12px; text-align: center; font-style: italic; }
 
