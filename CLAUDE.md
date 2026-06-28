@@ -70,6 +70,48 @@ Per-cwd cache at `~/.cache/runclaude/<sha256(cwd)[:16]>/` with subdirs `home/`, 
 
 When `--claude` + `CLAUDE_CODE_USE_BEDROCK=1`: the host calls `awsconfig.LoadDefaultConfig` (so SSO / profile / IMDS all work on the host), keeps the creds, and the in-container claude is given stub `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. The container's aws-sdk signs requests with the stub; the MITM strips the stub signature and re-signs with the real creds. `scrubAWSCreds` ensures no real AWS env leaks into the container.
 
+### Serve mode (`--serve`): share a session over the web
+
+`--serve` drives the sandboxed claude headless over its **stream-json protocol**
+and exposes the transcript to a web UI, instead of attaching a terminal. The
+existing interactive path is untouched. See `SHARING_PLAN.md` for the full
+design. Components:
+
+- **`agentclient/`** — a small Go port of the stream-json transport (the layer
+  the TS/Python SDKs wrap). claude is launched with `--print --input-format
+  stream-json --output-format stream-json --verbose --replay-user-messages`;
+  each user turn is one JSON line on stdin, each event one JSON line on stdout.
+  `Client` is transport-agnostic (`New(stdin, stdout)`) so it serves both the
+  standalone spike and the sandboxed pipes. `Interrupt()` writes a
+  `control_request`/`interrupt` to stop a turn.
+- **`sessionhub/`** — single source of truth: owns the `agentclient`, keeps the
+  canonical ordered transcript (so late joiners replay full history), fans every
+  event out to subscribers, and holds the single-writer control token
+  (`TakeControl` steals atomically; `Submit`/`Interrupt` are controller-gated;
+  control changes are emitted as synthetic transcript events for audit).
+- **`serve/`** — HTTP surface: embedded frontend, transcript over **SSE** (not
+  WebSocket — the only client→server actions are discrete POSTs, so SSE keeps
+  zero extra deps), `/whoami`, `/take-control`, `/release-control`, `/prompt`,
+  `/interrupt`, and a read-only `/source` (`jj show @`). `Identifier` resolves
+  per-connection identity and `Policy` decides write-eligibility — both pluggable
+  so a tailnet `tsnet` `WhoIs` identifier + ACL policy drop in later (the tsnet
+  listener is the one piece of `SHARING_PLAN.md` still pending, gated on being
+  able to fetch the dependency).
+- **`frontend/`** — `go:embed`ed static HTML/JS that renders the transcript from
+  the event stream, shows who holds control, and gates the prompt box on it.
+
+**Data path (`main.go`, `serve.go`):** in `--serve` mode `mainErr` creates two
+`os.Pipe()`s and threads the sandbox-side ends through `childMain → initMain` via
+`ExtraFiles` alongside the existing proxy comm socket. The inherited fd numbers
+are recorded in `Config` (`CommFd`/`ServeInFd`/`ServeOutFd`); `inheritedFds`
+keeps their order stable across the re-execs. `runAsInit` points claude's
+stdin/stdout at the pipe ends; the host keeps the other ends and runs the
+`sessionhub` + web server (`runServe`). This mirrors the proxy's
+"sandboxed process, host-side network surface" split — claude stays contained,
+the web server lives on the host. `--serve-dev` enables a `?as=<login>` identity
+override for testing the control flow from one machine; never use it with a real
+tailnet listener.
+
 ### `fakeapi/` and `cmd/fake-anthropic/`
 
 A fake Anthropic + Bedrock server used by both `go test` and `test-mitm.sh`. Validates credentials (so MITM injection is actually tested) and streams `FixedReply` ("I am a fake anthropic API server") back as SSE — tests grep for that string.

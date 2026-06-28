@@ -3,9 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -22,7 +26,7 @@ import (
 // Phase 2 serves read-only over plain localhost (addr); the terminal operator
 // drives the session and browsers watch. Phase 2b swaps the listener for tsnet
 // and adds per-connection identity; Phase 3 enables web prompt submission.
-func runServe(stdinW, stdoutR *os.File, addr string, dev bool, writers []string) {
+func runServe(stdinW, stdoutR *os.File, cwd, addr string, dev bool, writers []string) {
 	client := agentclient.New(stdinW, stdoutR)
 	hub := sessionhub.New(client)
 
@@ -52,8 +56,16 @@ func runServe(stdinW, stdoutR *os.File, addr string, dev bool, writers []string)
 
 	// The local terminal operator drives the session; web viewers watch.
 	go feedPromptsFromTerminal(hub, client)
+	// Mirror the transcript to the host terminal so the local operator gets
+	// feedback without a browser (web viewers get the same via the hub).
+	go echoTranscript(hub)
 
-	srv := &http.Server{Addr: addr, Handler: web.New(hub, ident, policy)}
+	srv := &http.Server{Addr: addr, Handler: web.New(web.Config{
+		Hub:      hub,
+		Identity: ident,
+		Policy:   policy,
+		Source:   jjSource(cwd),
+	})}
 	go func() {
 		log.Printf("serve: web UI on http://%s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -67,6 +79,60 @@ func runServe(stdinW, stdoutR *os.File, addr string, dev bool, writers []string)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	log.Printf("serve: session ended")
+}
+
+// echoTranscript prints assistant text and turn results from the hub to the
+// host terminal, so the local operator has visibility without opening the web
+// UI. It subscribes like any other viewer and ends when the session does.
+func echoTranscript(hub *sessionhub.Hub) {
+	sub := hub.Subscribe()
+	defer sub.Close()
+	for _, raw := range sub.History {
+		echoEvent(raw)
+	}
+	for raw := range sub.C {
+		echoEvent(raw)
+	}
+}
+
+func echoEvent(raw []byte) {
+	var hdr struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &hdr) != nil {
+		return
+	}
+	ev := agentclient.Event{Type: hdr.Type, Raw: raw}
+	switch hdr.Type {
+	case "assistant":
+		if t := ev.AssistantText(); t != "" {
+			fmt.Println(t)
+		}
+	case "result":
+		fmt.Printf("[result] %s\n", ev.ResultText())
+	}
+}
+
+// jjSource returns a provider for the read-only source panel: it runs
+// `jj show @` in the session cwd (the host sees the same working-copy tree the
+// sandboxed agent edits, since cwd is bind-mounted in). Returns nil when cwd is
+// not a jj repo, which disables the panel. Each call snapshots and shows the
+// current working-copy change, so viewers see the agent's edits as they land.
+func jjSource(cwd string) func(context.Context) (string, error) {
+	if _, err := os.Stat(filepath.Join(cwd, ".jj")); err != nil {
+		return nil
+	}
+	return func(ctx context.Context) (string, error) {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "jj", "show", "@", "--color", "never")
+		cmd.Dir = cwd
+		out, err := cmd.Output()
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	}
 }
 
 // feedPromptsFromTerminal sends each non-blank line from the host terminal as a

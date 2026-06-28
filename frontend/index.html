@@ -16,13 +16,20 @@
     <div class="who">
       <span id="control" class="me"></span>
       <span id="me" class="me"></span>
+      <button id="source-toggle" title="Show jj show @ for the session checkout">Source</button>
       <button id="take" hidden>Take control</button>
       <button id="release" hidden>Release</button>
       <span id="role" class="badge">read-only</span>
     </div>
   </header>
 
-  <main id="transcript" aria-live="polite"></main>
+  <div id="body">
+    <main id="transcript" aria-live="polite"></main>
+    <aside id="source" hidden>
+      <div class="source-head">source · <code>jj show @</code></div>
+      <pre id="source-body">loading…</pre>
+    </aside>
+  </div>
 
   <footer id="composer">
     <textarea id="prompt" rows="1" placeholder="Take control to send a prompt…" disabled></textarea>

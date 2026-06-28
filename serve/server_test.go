@@ -17,7 +17,7 @@ import (
 
 func TestWhoamiDevOverride(t *testing.T) {
 	hub := sessionhub.New(agentclient.New(&bytes.Buffer{}, strings.NewReader("")))
-	srv := httptest.NewServer(New(hub, DevIdentifier{Base: Identity{Login: "local", Name: "operator"}}, AllowlistPolicy{AllowAll: true}))
+	srv := httptest.NewServer(New(Config{Hub: hub, Identity: DevIdentifier{Base: Identity{Login: "local", Name: "operator"}}, Policy: AllowlistPolicy{AllowAll: true}}))
 	defer srv.Close()
 
 	res, err := http.Get(srv.URL + "/whoami?as=alice@example.com")
@@ -31,6 +31,34 @@ func TestWhoamiDevOverride(t *testing.T) {
 	}
 }
 
+func TestSourcePanel(t *testing.T) {
+	hub := sessionhub.New(agentclient.New(&bytes.Buffer{}, strings.NewReader("")))
+	ident := LocalIdentifier{ID: Identity{Login: "local"}}
+
+	// No provider -> 404.
+	noSrc := httptest.NewServer(New(Config{Hub: hub, Identity: ident, Policy: AllowlistPolicy{}}))
+	defer noSrc.Close()
+	if res, _ := http.Get(noSrc.URL + "/source"); res == nil || res.StatusCode != http.StatusNotFound {
+		t.Errorf("/source with no provider: got %v, want 404", res)
+	}
+
+	// Provider -> its text.
+	withSrc := httptest.NewServer(New(Config{
+		Hub: hub, Identity: ident, Policy: AllowlistPolicy{},
+		Source: func(context.Context) (string, error) { return "jj show @ output", nil },
+	}))
+	defer withSrc.Close()
+	res, err := http.Get(withSrc.URL + "/source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if string(body) != "jj show @ output" {
+		t.Errorf("/source body = %q", body)
+	}
+}
+
 func TestEventsReplayThenLive(t *testing.T) {
 	pr, pw := io.Pipe()
 	hub := sessionhub.New(agentclient.New(&bytes.Buffer{}, pr))
@@ -40,7 +68,7 @@ func TestEventsReplayThenLive(t *testing.T) {
 	io.WriteString(pw, `{"type":"system","subtype":"init","session_id":"s1"}`+"\n")
 	time.Sleep(30 * time.Millisecond)
 
-	srv := httptest.NewServer(New(hub, LocalIdentifier{ID: Identity{Login: "local"}}, AllowlistPolicy{AllowLocal: true}))
+	srv := httptest.NewServer(New(Config{Hub: hub, Identity: LocalIdentifier{ID: Identity{Login: "local"}}, Policy: AllowlistPolicy{AllowLocal: true}}))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

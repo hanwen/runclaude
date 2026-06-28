@@ -10,8 +10,10 @@
 package serve
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -20,19 +22,35 @@ import (
 	"github.com/hanwen/runclaude/sessionhub"
 )
 
+// Config wires a Server to its session. Hub, Identity and Policy are required;
+// Source is optional read-only context (jj show @) for the source panel.
+type Config struct {
+	Hub      *sessionhub.Hub
+	Identity Identifier
+	Policy   Policy
+	// Source, if set, returns the current source-checkout view (e.g. jj show @)
+	// run in the session cwd. nil disables the read-only source panel.
+	Source func(context.Context) (string, error)
+}
+
 // Server routes HTTP requests for one session.
 type Server struct {
 	hub    *sessionhub.Hub
 	ident  Identifier
 	policy Policy
+	source func(context.Context) (string, error)
 	mux    *http.ServeMux
 }
 
-// New builds the HTTP handler for hub. ident resolves the caller identity for
-// each request (LocalIdentifier on localhost, a tailnet WhoIs identifier later);
-// policy decides who is write-eligible (may take control).
-func New(hub *sessionhub.Hub, ident Identifier, policy Policy) *Server {
-	s := &Server{hub: hub, ident: ident, policy: policy, mux: http.NewServeMux()}
+// New builds the HTTP handler for the session described by cfg.
+func New(cfg Config) *Server {
+	s := &Server{
+		hub:    cfg.Hub,
+		ident:  cfg.Identity,
+		policy: cfg.Policy,
+		source: cfg.Source,
+		mux:    http.NewServeMux(),
+	}
 	s.mux.Handle("/", http.FileServer(http.FS(frontend.FS)))
 	s.mux.HandleFunc("/events", s.handleEvents)
 	s.mux.HandleFunc("/whoami", s.handleWhoami)
@@ -40,7 +58,26 @@ func New(hub *sessionhub.Hub, ident Identifier, policy Policy) *Server {
 	s.mux.HandleFunc("/release-control", s.handleReleaseControl)
 	s.mux.HandleFunc("/prompt", s.handlePrompt)
 	s.mux.HandleFunc("/interrupt", s.handleInterrupt)
+	s.mux.HandleFunc("/source", s.handleSource)
 	return s
+}
+
+// handleSource returns the current read-only source-checkout view as plain
+// text. The frontend polls it. 404 when no source provider is configured (not
+// a jj repo); 503 if the command fails transiently.
+func (s *Server) handleSource(w http.ResponseWriter, r *http.Request) {
+	if s.source == nil {
+		http.Error(w, "no source view", http.StatusNotFound)
+		return
+	}
+	out, err := s.source(r.Context())
+	if err != nil {
+		http.Error(w, "source unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = io.WriteString(w, out)
 }
 
 // handleWhoami reports the caller's resolved identity and whether they are

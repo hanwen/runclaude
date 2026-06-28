@@ -17,7 +17,7 @@ const PID = (() => {
   return v;
 })();
 
-const state = { mayWrite: false, myName: "", controller: null, wasController: false, caughtUp: false };
+const state = { mayWrite: false, myName: "", controller: null, controllerName: "", wasController: false, caughtUp: false };
 
 // In dev mode the identity rides in the query string (?as=); forward it on
 // every request so the server resolves the same principal.
@@ -139,6 +139,7 @@ function applyControl(controllerPid, controllerName) {
     addBlock(el("div", "notice", "you lost control" + (controllerName ? " to " + controllerName : "")));
   }
   state.controller = controllerPid;
+  state.controllerName = controllerName;
   state.wasController = iControl;
 
   if (!controllerPid) controlEl.textContent = "no one is driving";
@@ -216,10 +217,36 @@ async function loadIdentity() {
     document.getElementById("me").textContent = state.myName ? "you: " + state.myName : "";
   } catch { /* identity is informational; default to read-only */ }
   // Reconcile button visibility now that mayWrite is known.
-  applyControl(state.controller, "");
+  applyControl(state.controller, state.controllerName);
+}
+
+// Read-only source panel: polls `jj show @` while open. Inherently read-only,
+// so it sidesteps the control gate entirely.
+function wireSourcePanel() {
+  const toggle = document.getElementById("source-toggle");
+  const panel = document.getElementById("source");
+  const body = document.getElementById("source-body");
+  let timer = null;
+
+  async function refresh() {
+    try {
+      const res = await fetch("/source" + qs);
+      if (res.status === 404) { body.textContent = "(no jj repo for this session)"; stop(); return; }
+      if (!res.ok) { body.textContent = "(source unavailable)"; return; }
+      body.textContent = (await res.text()) || "(empty)";
+    } catch { body.textContent = "(source unavailable)"; }
+  }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  toggle.onclick = () => {
+    const show = panel.hidden;
+    panel.hidden = !show;
+    if (show) { refresh(); timer = setInterval(refresh, 4000); } else { stop(); }
+  };
 }
 
 setStatus("");
 wireControls();
+wireSourcePanel();
 loadIdentity();
 connect();

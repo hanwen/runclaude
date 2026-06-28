@@ -20,6 +20,33 @@ This is "Option 3" from the design discussion: drive `claude` headless via its
 **stream-json protocol** and build a web UI from the structured event stream.
 It is *not* a terminal/TUI broadcast (that was the rejected Option 2).
 
+## Implementation status
+
+Phases 0–5 are built and tested against the real CLI (2.1.183):
+
+- **Phase 0** — `agentclient/`: stream-json transport port + `cmd/agentspike`.
+- **Phase 1** — `--serve`: sandbox stdio pipes threaded through the re-exec chain
+  (`Config.{CommFd,ServeInFd,ServeOutFd}`, `runAsInit`).
+- **Phase 2** — `sessionhub/` (transcript + fan-out), `serve/` (SSE + `/whoami`),
+  `frontend/`. Identity is a **pluggable `Identifier`/`Policy`** seam.
+- **Phase 3** — single-writer take-control (steal-immediately), web prompts,
+  identity-gated eligibility, audit log.
+- **Phase 4** — controller-gated interrupt (`control_request`/`interrupt`).
+- **Phase 5** — read-only `jj show @` source panel (`/source`), terminal echo,
+  this doc + `CLAUDE.md`.
+
+**Still pending: the tsnet listener (Phase 2b transport).** The transport and
+authz seams exist (`serve.Identifier`, `serve.Policy`); what remains is a
+`tsnet`-backed listener whose `Identifier` resolves `LocalClient.WhoIs`. It was
+not vendored because the build host here runs *inside* runclaude with an egress
+allowlist that blocks `proxy.golang.org`, so `tailscale.com/tsnet` can't be
+fetched. To finish: fetch the dep, add `serve/tsnet.go` exposing
+`ListenTailnet(...) (net.Listener, Identifier)`, and have `runServe` use it when
+a `--serve-tailnet <name>` flag is set (falling back to the localhost listener +
+`--serve-dev` for local testing). For now the web UI binds localhost
+(`--serve-addr`); expose it over a tailnet manually (e.g. `tailscale serve`)
+until the embedded listener lands.
+
 ## Key decisions (locked unless noted)
 
 1. **UI is web-rendered from the stream-json event stream, not the TUI.** Headless

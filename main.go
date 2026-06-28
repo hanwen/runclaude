@@ -975,7 +975,7 @@ func mainErr() error {
 		f.Close()
 	}
 	if *serve {
-		runServe(hostStdinW, hostStdoutR, *serveAddr, *serveDev, serveWriters)
+		runServe(hostStdinW, hostStdoutR, cwd, *serveAddr, *serveDev, serveWriters)
 	}
 	return cmd.Wait()
 }
