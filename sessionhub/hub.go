@@ -127,15 +127,17 @@ func (h *Hub) SendPrompt(text string) error {
 	return h.client.SendPrompt(text)
 }
 
-// emitUserPrompt records a submitted prompt in the transcript immediately, so it
-// shows for every viewer the moment it is accepted rather than only when claude
-// echoes it back at the start of its reply. (We don't use claude's
-// --replay-user-messages; this is the single canonical echo.) by attributes the
-// prompt to a participant for display.
+// emitUserPrompt records a submitted prompt in the transcript immediately (as an
+// optimistic echo), so it shows for every viewer the moment it is accepted
+// rather than ~2s later when claude replays it at the start of its reply. The
+// optimistic flag tells the frontend to reconcile this bubble with claude's
+// later replay (which carries the durable uuid) instead of drawing a second
+// one. by attributes the prompt to a participant for display.
 func (h *Hub) emitUserPrompt(text, by string) {
 	ev := map[string]any{
-		"type":    "user",
-		"message": map[string]any{"role": "user", "content": text},
+		"type":       "user",
+		"optimistic": true,
+		"message":    map[string]any{"role": "user", "content": text},
 	}
 	if by != "" {
 		ev["by"] = by

@@ -79,21 +79,30 @@ design. Components:
 
 - **`agentclient/`** — a small Go port of the stream-json transport (the layer
   the TS/Python SDKs wrap). claude is launched with `--print --input-format
-  stream-json --output-format stream-json --verbose`; each user turn is one JSON
-  line on stdin, each event one JSON line on stdout. `Client` is
-  transport-agnostic (`New(stdin, stdout)`) so it serves both the standalone
-  spike and the sandboxed pipes. `Interrupt()` writes a
+  stream-json --output-format stream-json --verbose --replay-user-messages`;
+  each user turn is one JSON line on stdin, each event one JSON line on stdout.
+  `Client` is transport-agnostic (`New(stdin, stdout)`) so it serves both the
+  standalone spike and the sandboxed pipes. `Interrupt()` writes a
   `control_request`/`interrupt` to stop a turn.
 - **`sessionhub/`** — single source of truth: owns the `agentclient`, keeps the
   canonical ordered transcript (so late joiners replay full history), fans every
   event out to subscribers, and holds the single-writer control token
   (`TakeControl` steals atomically; `Submit`/`Interrupt` are controller-gated;
-  control changes are emitted as synthetic transcript events for audit).
-  Submitted prompts are echoed into the transcript synthetically the moment they
-  are accepted (we don't use `--replay-user-messages`), so they show instantly
-  rather than only when claude echoes them at the start of its reply. `Seed`
-  prepends a resumed session's restored history (read from
-  `~/.claude/projects/*/<id>.jsonl` by `loadResumeHistory`).
+  control changes are emitted as synthetic transcript events for audit). On
+  submit the hub emits an **optimistic** user echo immediately (the prompt shows
+  at once, not ~2s later when claude replays it); claude's `--replay-user-messages`
+  echo arrives later carrying the durable per-message `uuid`, which the frontend
+  reconciles onto the optimistic bubble. `Seed` prepends a resumed session's
+  restored history (read from `~/.claude/projects/*/<id>.jsonl` by
+  `loadResumeHistory`, preserving each message's `uuid`).
+
+  **Dedup model:** the SSE `id` is a per-process transcript index — it dedups
+  reconnects within one run but resets across a runclaude restart. The durable
+  signal is claude's per-message `uuid` (persisted in the session file and the
+  same value claude emits live). The frontend keeps a `seenUuids` set and skips
+  any event whose uuid it has shown, so a restarted session (e.g. relaunched
+  with different flags) continues seamlessly in an open tab instead of
+  re-rendering, while a freshly opened tab still replays the full history.
 - **`serve/`** — HTTP surface: embedded frontend, transcript over **SSE** (not
   WebSocket — the only client→server actions are discrete POSTs, so SSE keeps
   zero extra deps), `/whoami`, `/take-control`, `/release-control`, `/prompt`,

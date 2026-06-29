@@ -106,6 +106,7 @@ function addMsg(role, nodes, meta) {
   wrap.appendChild(bubble);
   transcriptEl.appendChild(wrap);
   scrollIfFollowing(wasBottom);
+  return wrap;
 }
 
 function addBlock(node) {
@@ -142,6 +143,35 @@ function toolCard(name, input) {
     card.appendChild(collapsible(JSON.stringify(input, null, 2)));
   }
   return card;
+}
+
+// Durable dedup across reconnects AND runclaude restarts: every real claude
+// event carries a stable uuid (persisted in the session file and re-seeded on
+// resume), so an event whose uuid we've already shown is skipped. The SSE id is
+// only a per-process transcript index and can't be relied on across a restart.
+const seenUuids = new Set();
+// Optimistic prompt bubbles awaiting claude's replay (which carries the uuid).
+const pendingPrompts = [];
+
+// handleUser routes a user event. There are three kinds:
+//  - optimistic: our instant local echo of a submitted prompt (no uuid yet).
+//  - isReplay:   claude's echo of that prompt ~2s later, carrying the uuid —
+//                reconciled onto the optimistic bubble, not drawn again.
+//  - otherwise:  tool_result output, or a restored historical prompt.
+function handleUser(ev) {
+  const content = ev.message && ev.message.content;
+  if (ev.optimistic && typeof content === "string") {
+    const node = addMsg("user", [document.createTextNode(content)], ev.by || null);
+    pendingPrompts.push(node);
+    return;
+  }
+  if (ev.isReplay && typeof content === "string") {
+    const node = pendingPrompts.shift();
+    if (node) { if (ev.uuid) node.dataset.uuid = ev.uuid; return; } // reconcile
+    renderUser(ev); // fresh viewer with no pending echo: draw it
+    return;
+  }
+  renderUser(ev);
 }
 
 // A user message content is either a plain string (a typed prompt) or an array
@@ -181,6 +211,13 @@ function renderAssistant(msg) {
 }
 
 function handle(ev) {
+  // Skip anything we've already displayed (by stable uuid), then remember it.
+  // This is what makes a reconnect — or a runclaude restart with the tab still
+  // open — continue seamlessly instead of re-rendering the whole transcript.
+  if (ev.uuid) {
+    if (seenUuids.has(ev.uuid)) return;
+    seenUuids.add(ev.uuid);
+  }
   switch (ev.type) {
     case "system":
       if (ev.subtype === "init") {
@@ -191,7 +228,7 @@ function handle(ev) {
       }
       break;
     case "user":
-      renderUser(ev);
+      handleUser(ev);
       break;
     case "assistant":
       renderAssistant(ev);

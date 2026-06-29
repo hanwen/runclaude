@@ -201,6 +201,7 @@ func loadResumeHistory(id string) ([][]byte, error) {
 		var rec struct {
 			Type        string          `json:"type"`
 			IsSidechain bool            `json:"isSidechain"`
+			UUID        string          `json:"uuid"`
 			Message     json.RawMessage `json:"message"`
 		}
 		if json.Unmarshal(sc.Bytes(), &rec) != nil {
@@ -212,11 +213,14 @@ func loadResumeHistory(id string) ([][]byte, error) {
 		if rec.Type != "user" && rec.Type != "assistant" {
 			continue
 		}
+		// Keep the stable uuid so the frontend can dedup restored history
+		// against anything already in an open tab (across a runclaude restart).
 		line, err := json.Marshal(struct {
 			Type      string          `json:"type"`
+			UUID      string          `json:"uuid,omitempty"`
 			Message   json.RawMessage `json:"message"`
 			IsHistory bool            `json:"isHistory"`
-		}{rec.Type, rec.Message, true})
+		}{rec.Type, rec.UUID, rec.Message, true})
 		if err != nil {
 			continue
 		}

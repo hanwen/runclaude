@@ -16,6 +16,12 @@ var StreamJSONFlags = []string{
 	"--input-format", "stream-json",
 	"--output-format", "stream-json",
 	"--verbose",
+	// Re-emit each user turn on stdout (type:"user", isReplay:true) carrying
+	// claude's stable per-message uuid. The hub shows prompts instantly via its
+	// own synthetic echo (the replay arrives ~2s later, with the reply); the
+	// replay's value is the uuid, which the frontend reconciles onto the echoed
+	// bubble so the same prompt dedups across a runclaude restart.
+	"--replay-user-messages",
 }
 
 // Spawn launches claude in stream-json mode and returns a Client wired to its
