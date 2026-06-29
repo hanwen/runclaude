@@ -137,6 +137,46 @@ func TestControlStealAndSubmit(t *testing.T) {
 	}
 }
 
+func TestSubmitEchoesPromptImmediately(t *testing.T) {
+	h, _, pw := newTestHub(t)
+	defer pw.Close()
+	sub := h.Subscribe()
+	defer sub.Close()
+
+	h.TakeControl("a", "Alice", "a@x")
+	recv(t, sub.C) // the control event
+
+	// The prompt must appear in the transcript right away (attributed), not only
+	// when claude later echoes it.
+	if err := h.Submit("a", "Alice", "a@x", "do the thing"); err != nil {
+		t.Fatal(err)
+	}
+	got := recv(t, sub.C)
+	if !bytes.Contains(got, []byte(`"type":"user"`)) ||
+		!bytes.Contains(got, []byte(`"do the thing"`)) ||
+		!bytes.Contains(got, []byte(`"by":"Alice"`)) {
+		t.Errorf("expected an immediate attributed user echo, got %s", got)
+	}
+}
+
+func TestSeedSeenAsHistory(t *testing.T) {
+	h, _, pw := newTestHub(t)
+	defer pw.Close()
+	h.Seed([][]byte{
+		[]byte(`{"type":"user","message":{"role":"user","content":"old"}}`),
+		[]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"prior"}]}}`),
+	})
+	// A viewer connecting after the seed gets it as replayed history.
+	sub := h.Subscribe()
+	defer sub.Close()
+	if len(sub.History) != 2 {
+		t.Fatalf("seeded history len = %d, want 2", len(sub.History))
+	}
+	if !bytes.Contains(sub.History[0], []byte(`"old"`)) {
+		t.Errorf("seeded history[0] = %s", sub.History[0])
+	}
+}
+
 func TestSubscribeAfterEnd(t *testing.T) {
 	h, emit, pw := newTestHub(t)
 	emit(`{"type":"system","subtype":"init","session_id":"s2"}`)

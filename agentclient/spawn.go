@@ -16,10 +16,6 @@ var StreamJSONFlags = []string{
 	"--input-format", "stream-json",
 	"--output-format", "stream-json",
 	"--verbose",
-	// Echo each user turn back on stdout (as type:"user", isReplay:true) so the
-	// session hub records prompts in the canonical transcript and every viewer
-	// sees who asked what, not just the assistant's replies.
-	"--replay-user-messages",
 }
 
 // Spawn launches claude in stream-json mode and returns a Client wired to its

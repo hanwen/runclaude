@@ -149,7 +149,7 @@ function toolCard(name, input) {
 function renderUser(msg) {
   const content = msg.message && msg.message.content;
   if (typeof content === "string") {
-    addMsg("user", [document.createTextNode(content)]);
+    addMsg("user", [document.createTextNode(content)], msg.by || null);
     return;
   }
   if (Array.isArray(content)) {
@@ -204,6 +204,9 @@ function handle(ev) {
       break;
     case "synced":
       state.caughtUp = true;
+      break;
+    case "notice":
+      if (ev.text) addBlock(el("div", "notice", ev.text));
       break;
   }
 }

@@ -27,6 +27,7 @@ type serveOptions struct {
 	writers  []string // logins allowed to take control
 	tailnet  string   // tsnet node hostname; empty = localhost
 	tsnetDir string   // tsnet state dir (node identity persistence)
+	resume   string   // resumed session id (to restore its prior transcript)
 }
 
 // runServe is the host-side session: it owns the agentclient talking to the
@@ -37,6 +38,21 @@ type serveOptions struct {
 func runServe(stdinW, stdoutR *os.File, opt serveOptions) {
 	client := agentclient.New(stdinW, stdoutR)
 	hub := sessionhub.New(client)
+
+	// When resuming, seed the hub with the prior session's transcript so the web
+	// UI shows the earlier conversation (claude --resume continues the session but
+	// does not re-emit its history on stdout).
+	if opt.resume != "" {
+		if hist, err := loadResumeHistory(opt.resume); err != nil {
+			log.Printf("serve: restore history for %s: %v", opt.resume, err)
+		} else if len(hist) > 0 {
+			hub.Seed(hist)
+			hub.Seed([][]byte{[]byte(fmt.Sprintf(
+				`{"type":"notice","text":"resumed session %s — %d earlier messages restored"}`,
+				opt.resume, len(hist)))})
+			log.Printf("serve: restored %d messages from session %s", len(hist), opt.resume)
+		}
+	}
 
 	// Identity + listener. On a tailnet, identity is the real WhoIs login and
 	// the listener is the tsnet node. On localhost there is no per-connection
@@ -134,9 +150,13 @@ func echoEvent(raw []byte, sessionLogged *bool) {
 		Type      string `json:"type"`
 		Subtype   string `json:"subtype"`
 		SessionID string `json:"session_id"`
+		IsHistory bool   `json:"isHistory"`
 	}
 	if json.Unmarshal(raw, &hdr) != nil {
 		return
+	}
+	if hdr.IsHistory {
+		return // restored transcript: shown in the web UI, not re-printed here
 	}
 	ev := agentclient.Event{Type: hdr.Type, Raw: raw}
 	switch hdr.Type {
@@ -152,6 +172,57 @@ func echoEvent(raw []byte, sessionLogged *bool) {
 	case "result":
 		fmt.Printf("[result] %s\n", ev.ResultText())
 	}
+}
+
+// loadResumeHistory reads a prior claude session's stored transcript
+// (~/.claude/projects/*/<id>.jsonl) and returns its user/assistant turns as
+// stream-json-shaped event lines the frontend can render. Returns nil (no
+// error) when the session file isn't found. Each line is tagged isHistory so
+// the terminal echo can skip it. Sidechain (subagent) turns are omitted.
+func loadResumeHistory(id string) ([][]byte, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	matches, err := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", id+".jsonl"))
+	if err != nil || len(matches) == 0 {
+		return nil, err
+	}
+	f, err := os.Open(matches[0])
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out [][]byte
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		var rec struct {
+			Type        string          `json:"type"`
+			IsSidechain bool            `json:"isSidechain"`
+			Message     json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(sc.Bytes(), &rec) != nil {
+			continue
+		}
+		if rec.IsSidechain || len(rec.Message) == 0 {
+			continue
+		}
+		if rec.Type != "user" && rec.Type != "assistant" {
+			continue
+		}
+		line, err := json.Marshal(struct {
+			Type      string          `json:"type"`
+			Message   json.RawMessage `json:"message"`
+			IsHistory bool            `json:"isHistory"`
+		}{rec.Type, rec.Message, true})
+		if err != nil {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, sc.Err()
 }
 
 // jjSource returns a provider for the read-only source panel, running jj in the

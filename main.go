@@ -992,6 +992,7 @@ func mainErr() error {
 			writers:  serveWriters,
 			tailnet:  *serveTailnet,
 			tsnetDir: filepath.Join(cacheDir, "tsnet"),
+			resume:   *serveResume,
 		})
 	}
 	return cmd.Wait()

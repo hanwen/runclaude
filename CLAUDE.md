@@ -79,16 +79,21 @@ design. Components:
 
 - **`agentclient/`** — a small Go port of the stream-json transport (the layer
   the TS/Python SDKs wrap). claude is launched with `--print --input-format
-  stream-json --output-format stream-json --verbose --replay-user-messages`;
-  each user turn is one JSON line on stdin, each event one JSON line on stdout.
-  `Client` is transport-agnostic (`New(stdin, stdout)`) so it serves both the
-  standalone spike and the sandboxed pipes. `Interrupt()` writes a
+  stream-json --output-format stream-json --verbose`; each user turn is one JSON
+  line on stdin, each event one JSON line on stdout. `Client` is
+  transport-agnostic (`New(stdin, stdout)`) so it serves both the standalone
+  spike and the sandboxed pipes. `Interrupt()` writes a
   `control_request`/`interrupt` to stop a turn.
 - **`sessionhub/`** — single source of truth: owns the `agentclient`, keeps the
   canonical ordered transcript (so late joiners replay full history), fans every
   event out to subscribers, and holds the single-writer control token
   (`TakeControl` steals atomically; `Submit`/`Interrupt` are controller-gated;
   control changes are emitted as synthetic transcript events for audit).
+  Submitted prompts are echoed into the transcript synthetically the moment they
+  are accepted (we don't use `--replay-user-messages`), so they show instantly
+  rather than only when claude echoes them at the start of its reply. `Seed`
+  prepends a resumed session's restored history (read from
+  `~/.claude/projects/*/<id>.jsonl` by `loadResumeHistory`).
 - **`serve/`** — HTTP surface: embedded frontend, transcript over **SSE** (not
   WebSocket — the only client→server actions are discrete POSTs, so SSE keeps
   zero extra deps), `/whoami`, `/take-control`, `/release-control`, `/prompt`,

@@ -123,7 +123,24 @@ func (s *Subscription) Close() {
 // local terminal operator's path — the operator physically owns the session, so
 // it is always allowed. Web prompts go through Submit instead.
 func (h *Hub) SendPrompt(text string) error {
+	h.emitUserPrompt(text, "operator")
 	return h.client.SendPrompt(text)
+}
+
+// emitUserPrompt records a submitted prompt in the transcript immediately, so it
+// shows for every viewer the moment it is accepted rather than only when claude
+// echoes it back at the start of its reply. (We don't use claude's
+// --replay-user-messages; this is the single canonical echo.) by attributes the
+// prompt to a participant for display.
+func (h *Hub) emitUserPrompt(text, by string) {
+	ev := map[string]any{
+		"type":    "user",
+		"message": map[string]any{"role": "user", "content": text},
+	}
+	if by != "" {
+		ev["by"] = by
+	}
+	h.emit(ev)
 }
 
 // Controller returns the participant id currently holding the writer token
@@ -175,6 +192,7 @@ func (h *Hub) Submit(id, name, login, text string) error {
 		return ErrNotController
 	}
 	log.Printf("audit: prompt from id=%q name=%q login=%q: %q", id, name, login, truncate(text, 200))
+	h.emitUserPrompt(text, name)
 	return h.client.SendPrompt(text)
 }
 
@@ -186,6 +204,16 @@ func (h *Hub) Interrupt(id string) error {
 	}
 	log.Printf("audit: interrupt by id=%q", id)
 	return h.client.Interrupt()
+}
+
+// Seed appends prior transcript events (e.g. a resumed session's restored
+// history) to the canonical transcript. Call once before serving — before any
+// subscriber connects and before Run ingests live events — so late joiners and
+// the initial view start with the earlier conversation.
+func (h *Hub) Seed(events [][]byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.transcript = append(h.transcript, events...)
 }
 
 // emit broadcasts a hub-synthesized event (e.g. a control change) into the same
