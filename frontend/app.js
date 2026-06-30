@@ -90,6 +90,15 @@ function ansiToHtml(input){
   return out;
 }
 
+// autoGrow sizes a textarea to its content height (so the composer expands as the
+// prompt grows), capped by the element's CSS max-height which then scrolls.
+function autoGrow(el) {
+  if (!el || el.hidden) return;
+  el.style.height = "auto";
+  const borders = el.offsetHeight - el.clientHeight; // top+bottom border
+  el.style.height = (el.scrollHeight + borders) + "px";
+}
+
 function atBottom() {
   return transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
 }
@@ -267,15 +276,29 @@ function applyControl(controllerPid, controllerName) {
 
   document.getElementById("role").textContent = iControl ? "controller" : "read-only";
   document.getElementById("role").classList.toggle("controller", !!iControl);
-  document.getElementById("release").hidden = !iControl;
-  document.getElementById("take").hidden = !state.mayWrite || iControl;
 
+  // Control buttons live on the entry box. Not driving: only "Take control"
+  // (when eligible). Driving: Send / Stop / Release, in that tab order.
   const prompt = document.getElementById("prompt");
+  const take = document.getElementById("take");
   const send = document.getElementById("send");
+  const stop = document.getElementById("stop");
+  const release = document.getElementById("release");
+  const canTake = state.mayWrite && !iControl;
+  take.hidden = !canTake;
+  send.hidden = !iControl;
+  stop.hidden = !iControl;
+  release.hidden = !iControl;
+  // When you can take control, the button *is* the entry box (full width); the
+  // prompt only appears once you're driving. Read-only viewers keep a disabled
+  // prompt so the composer isn't empty.
+  prompt.hidden = canTake;
+
   prompt.disabled = !iControl;
   send.disabled = !iControl;
-  document.getElementById("stop").disabled = !iControl;
-  prompt.placeholder = iControl ? "Send a prompt…" : "Take control to send a prompt…";
+  stop.disabled = !iControl;
+  prompt.placeholder = iControl ? "Send a prompt…" : "Read-only — viewing";
+  autoGrow(prompt);
 }
 
 async function post(path, body) {
@@ -299,9 +322,10 @@ function wireControls() {
     const text = prompt.value.trim();
     if (!text) return;
     const res = await post("/prompt", { id: PID, name: state.myName, text });
-    if (res.ok || res.status === 204) prompt.value = "";
+    if (res.ok || res.status === 204) { prompt.value = ""; autoGrow(prompt); }
   };
   send.onclick = submit;
+  prompt.addEventListener("input", () => autoGrow(prompt));
   prompt.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
   });
@@ -400,6 +424,8 @@ function wireSourcePanel() {
   toggle.onclick = () => {
     const show = panel.hidden;
     panel.hidden = !show;
+    toggle.classList.toggle("on", show);
+    toggle.setAttribute("aria-pressed", String(show));
     if (show) { refresh(); timer = setInterval(refresh, 4000); } else { stop(); }
   };
 
@@ -451,9 +477,15 @@ function wireTerminalPanel() {
   const fitAll = () => { if (panes && !panel.hidden) for (const p of panes) p.doFit(); };
   window.addEventListener("resize", fitAll);
 
+  const setToggle = (on) => {
+    toggle.classList.toggle("on", on);
+    toggle.setAttribute("aria-pressed", String(on));
+  };
+
   toggle.onclick = () => {
     const show = panel.hidden;
     panel.hidden = !show;
+    setToggle(show);
     if (show) {
       const ps = ensurePanes();
       for (const p of ps) p.start();
@@ -475,6 +507,7 @@ function wireTerminalPanel() {
   document.getElementById("terminal-popout").onclick = () => {
     disposePanes();
     panel.hidden = true;
+    setToggle(false);
     window.open("/popout.html" + qs, "runclaude-terminal", "popup,width=820,height=560");
   };
 }
