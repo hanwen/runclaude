@@ -37,9 +37,10 @@ type Hub struct {
 	// Single-writer control token. ctrlID is the participant id currently
 	// allowed to submit prompts ("" = nobody); ctrlName is its display name for
 	// the UI. Take-control steals the token atomically (no pending/grant state).
-	ctrlMu   sync.Mutex
-	ctrlID   string
-	ctrlName string
+	ctrlMu    sync.Mutex
+	ctrlID    string
+	ctrlName  string
+	ctrlLogin string
 }
 
 // New returns a Hub over client. Call Run (once) to start consuming events.
@@ -153,6 +154,15 @@ func (h *Hub) Controller() string {
 	return h.ctrlID
 }
 
+// ControllerLogin returns the authenticated login of the current controller
+// ("" if nobody holds the token). The terminal Presenter view keys on this to
+// stream the controller's shell, since shells are keyed by login.
+func (h *Hub) ControllerLogin() string {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	return h.ctrlLogin
+}
+
 // TakeControl atomically transfers the single writer token to participant id
 // (display name name, authenticated login for the audit log). Any previous
 // controller is displaced — clients compare the broadcast holder to their own
@@ -164,6 +174,7 @@ func (h *Hub) TakeControl(id, name, login string) string {
 	prev := h.ctrlName
 	h.ctrlID = id
 	h.ctrlName = name
+	h.ctrlLogin = login
 	h.ctrlMu.Unlock()
 	log.Printf("audit: control taken by id=%q name=%q login=%q (displaced %q)", id, name, login, prev)
 	h.emit(map[string]any{"type": "control", "controller": id, "controllerName": name})
@@ -180,6 +191,7 @@ func (h *Hub) ReleaseControl(id string) {
 	}
 	h.ctrlID = ""
 	h.ctrlName = ""
+	h.ctrlLogin = ""
 	h.ctrlMu.Unlock()
 	log.Printf("audit: control released by id=%q", id)
 	h.emit(map[string]any{"type": "control", "controller": "", "controllerName": ""})

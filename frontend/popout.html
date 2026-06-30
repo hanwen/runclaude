@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>runclaude · terminal</title>
+  <link rel="stylesheet" href="xterm.css">
+  <style>
+    :root { --bg:#0f1115; --panel:#171a21; --panel-2:#1e222b; --fg:#e6e8ee; --muted:#8b93a7; --accent:#c98a5b; --border:#2a2f3a; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    body { display: flex; flex-direction: column; }
+    #tabs { flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+      padding: 4px 6px; background: var(--panel); border-bottom: 1px solid var(--border); }
+    .tab { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+      border-radius: 6px 6px 0 0; padding: 4px 12px; cursor: pointer; font: inherit; }
+    .tab.active { background: var(--bg); color: var(--fg); border-bottom-color: var(--bg); }
+    #presenting { margin-left: auto; color: #f5a05b; font-weight: 600; display: none; align-items: center; gap: 6px; }
+    #presenting.on { display: flex; }
+    #presenting .blip { width: 9px; height: 9px; border-radius: 50%; background: #e5534b; box-shadow: 0 0 6px #e5534b; }
+    .host { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 4px 6px; }
+    .host[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <div id="tabs">
+    <button class="tab active" data-tab="presenter">Presenter</button>
+    <button class="tab" data-tab="myshell" hidden>My shell</button>
+    <span id="presenting" title="Your shell is on the shared view"><span class="blip"></span>presenting — the meeting sees your shell</span>
+  </div>
+  <div id="host-presenter" class="host"></div>
+  <div id="host-myshell" class="host" hidden></div>
+  <script src="xterm.js"></script>
+  <script src="xterm-addon-fit.js"></script>
+  <script src="term.js"></script>
+  <script src="popout.js"></script>
+</body>
+</html>

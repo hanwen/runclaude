@@ -114,11 +114,45 @@ design. Components:
   no `--serve-tailnet`, the server binds localhost (`--serve-addr`) and
   `--serve-dev` enables a `?as=<login>` identity override for one-machine
   testing.
+- **`terminal/`** — per-user in-browser shells. A shell runs **inside the
+  sandbox** (same rootfs/caps/netns/proxy env as claude) while its PTY is driven
+  from the host. The sandbox-side `Agent` (started by `runAsInit`) opens a PTY,
+  forks `$SHELL` on its slave, and passes the PTY **master fd back to the host**
+  over a `SOCK_SEQPACKET` control socket (`SCM_RIGHTS`); the host-side `Broker`
+  reads/writes the master and fans output out to subscribers (with a bounded
+  scrollback ring replayed on reconnect). Shells are keyed by `Identity.Login`
+  and **persist** across WebSocket detach/reconnect; they end only on shell exit
+  (the pid-1 reaper reports it via `Agent.OnReap` → an `exited` frame) or
+  `Broker.Close`. `proto.go` is the frame codec (`open`/`opened`/`error`/`exited`).
+- **`serve/terminal.go`** — two WebSocket endpoints (`coder/websocket`): **`/terminal`**
+  is a write-eligible user's own shell (read-write, gated by `Policy.MayWrite`
+  exactly like `/prompt`), and **`/terminal/shared`** is the read-only **Presenter**
+  view, open to any viewer, that follows the single control token — it streams
+  whichever login currently holds control and re-points when control changes
+  (it subscribes to the hub and reads `Hub.ControllerLogin()`). So "show the
+  meeting your shell" == take control; there is no separate share action. Output
+  frames are binary PTY bytes; client input is binary (stdin) plus a JSON text
+  message for resize. The server also sends JSON `{"type":"size",...}` messages
+  carrying the shell's true grid: the broker fans a size event to all watchers on
+  every `Resize`, so the read-only Presenter **mirrors the controller's grid**
+  (a read-only viewer can't pick its own size without desyncing the PTY) instead
+  of fitting to its own window. `/whoami` reports `terminal:true` when enabled.
 - **`frontend/`** — `go:embed`ed static HTML/JS that renders the transcript from
   the event stream, shows who holds control, and gates the prompt box on it. The
   header shows the full session id with a copy button (for `--serve-resume`), and
   tool-call inputs / tool results render collapsed to 3 lines with an expand
-  toggle.
+  toggle. A **Terminal** panel hosts two `xterm.js` panes (vendored + embedded):
+  the read-only Presenter (shown to everyone) and, for write-eligible users, their
+  own My-shell. The pane logic lives in a shared `term.js`; a **pop out** button
+  hands the terminal off to `popout.html`/`popout.js` — a standalone, resizable
+  window with **Presenter** and (for write-eligible users) **My-shell** tabs
+  (read-only viewers get only the Presenter tab). Being script-opened it
+  `resizeTo`s itself per tab: the Presenter snaps to the controller's grid on each
+  size message, the My-shell restores its own last size and fits to the window.
+  The owner's `/terminal` socket also pushes `{"type":"presenting",...}` (from
+  the hub's control token) so a **presenting** badge lights up when your shell is
+  the one on the shared view. Popping out stops the docked panes so two writable
+  My-shell connections don't fight over the PTY size.
 
 `--serve-resume <id>` appends `--resume <id>` to the claude invocation to
 continue a prior session (its history lives in the bind-mounted `~/.claude`,
@@ -128,10 +162,12 @@ header of the original session.
 **Data path (`main.go`, `serve.go`):** in `--serve` mode `mainErr` creates two
 `os.Pipe()`s and threads the sandbox-side ends through `childMain → initMain` via
 `ExtraFiles` alongside the existing proxy comm socket. The inherited fd numbers
-are recorded in `Config` (`CommFd`/`ServeInFd`/`ServeOutFd`); `inheritedFds`
-keeps their order stable across the re-execs. `runAsInit` points claude's
-stdin/stdout at the pipe ends; the host keeps the other ends and runs the
-`sessionhub` + web server (`runServe`). This mirrors the proxy's
+are recorded in `Config` (`CommFd`/`ServeInFd`/`ServeOutFd`, plus `TermFd` for
+the per-user terminal socketpair); `inheritedFds` keeps their order stable across
+the re-execs. `runAsInit` points claude's stdin/stdout at the pipe ends and marks
+`TermFd` close-on-exec (so neither claude nor the Agent's shells inherit it); the
+host keeps the other ends and runs the `sessionhub`, terminal `Broker`, and web
+server (`runServe`). This mirrors the proxy's
 "sandboxed process, host-side network surface" split — claude stays contained,
 the web server (and the tsnet node) lives on the host. `--serve-dev` enables a
 `?as=<login>` identity override for testing the control flow from one machine;

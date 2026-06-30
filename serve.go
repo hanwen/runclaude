@@ -17,6 +17,7 @@ import (
 	"github.com/hanwen/runclaude/agentclient"
 	web "github.com/hanwen/runclaude/serve"
 	"github.com/hanwen/runclaude/sessionhub"
+	"github.com/hanwen/runclaude/terminal"
 )
 
 // serveOptions configures runServe.
@@ -28,6 +29,7 @@ type serveOptions struct {
 	tailnet  string   // tsnet node hostname; empty = localhost
 	tsnetDir string   // tsnet state dir (node identity persistence)
 	resume   string   // resumed session id (to restore its prior transcript)
+	termFd   int      // host end of the per-user terminal socket; -1 = disabled
 }
 
 // runServe is the host-side session: it owns the agentclient talking to the
@@ -108,12 +110,21 @@ func runServe(stdinW, stdoutR *os.File, opt serveOptions) {
 	// feedback without a browser (web viewers get the same via the hub).
 	go echoTranscript(hub)
 
-	srv := &http.Server{Handler: web.New(web.Config{
+	// Per-user terminals: the host end of the term socket drives a Broker that
+	// asks the sandbox Agent to fork shells and streams their PTYs to the web UI.
+	webCfg := web.Config{
 		Hub:      hub,
 		Identity: ident,
 		Policy:   policy,
 		Source:   jjSource(opt.cwd),
-	})}
+	}
+	if opt.termFd >= 0 {
+		broker := terminal.NewBroker(opt.termFd)
+		defer broker.Close()
+		webCfg.Term = broker // non-nil concrete; keeps the interface non-nil
+	}
+
+	srv := &http.Server{Handler: web.New(webCfg)}
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("serve: http: %v", err)

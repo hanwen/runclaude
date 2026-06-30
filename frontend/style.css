@@ -60,6 +60,27 @@ aside#source.expanded { flex-basis: 100%; max-width: none; }
   margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word;
   font: 12.5px/1.5 ui-monospace, monospace; color: var(--fg);
 }
+aside#terminal {
+  flex: 0 0 46%; max-width: 720px; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--panel); border-left: 1px solid var(--border);
+}
+/* The id+type rule above outranks the UA `[hidden]{display:none}`, so restore
+   hiding explicitly (otherwise the panel shows even when popped out / on load). */
+aside#terminal[hidden] { display: none; }
+aside#terminal.expanded { flex-basis: 100%; max-width: none; }
+.term-stack { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+.term-pane { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; border-top: 1px solid var(--border); }
+.term-label {
+  padding: 6px 12px; font-size: 12px; color: var(--fg); background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+}
+.term-sub { color: var(--muted); font-weight: 400; }
+.term-head-btns { display: flex; gap: 6px; }
+.presenting-badge { margin-left: 8px; color: #f5a05b; font-weight: 600; font-size: 11px; }
+/* My-shell fits its container; the read-only Presenter is sized to the
+   controller's grid, so allow it to scroll when that exceeds the viewer pane. */
+.xterm-host { flex: 1 1 auto; min-height: 0; padding: 4px 6px; overflow: auto; }
 .file-link {
   display: inline; background: none; border: 0; padding: 0; height: auto;
   color: var(--accent); font: inherit; cursor: pointer; text-align: left;

@@ -9,8 +9,9 @@ import (
 	"io/fs"
 )
 
-//go:embed index.html app.js style.css
+//go:embed index.html app.js term.js style.css xterm.js xterm.css xterm-addon-fit.js popout.html popout.js
 var files embed.FS
 
-// FS is the embedded asset tree (index.html, app.js, style.css).
+// FS is the embedded asset tree (frontend HTML/JS/CSS plus the vendored
+// xterm.js terminal emulator used by the in-browser shell panes).
 var FS fs.FS = files

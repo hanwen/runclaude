@@ -17,7 +17,7 @@ const PID = (() => {
   return v;
 })();
 
-const state = { mayWrite: false, myName: "", controller: null, controllerName: "", wasController: false, caughtUp: false, sessionId: "" };
+const state = { mayWrite: false, terminal: false, myName: "", controller: null, controllerName: "", wasController: false, caughtUp: false, sessionId: "" };
 
 // In dev mode the identity rides in the query string (?as=); forward it on
 // every request so the server resolves the same principal.
@@ -333,10 +333,14 @@ async function loadIdentity() {
     const me = await res.json();
     state.myName = me.name || me.login || "";
     state.mayWrite = !!me.mayWrite;
+    state.terminal = !!me.terminal;
     document.getElementById("me").textContent = state.myName ? "you: " + state.myName : "";
   } catch { /* identity is informational; default to read-only */ }
   // Reconcile button visibility now that mayWrite is known.
   applyControl(state.controller, state.controllerName);
+  // The Terminal button (Presenter pane) is available to every viewer when the
+  // session enables terminals; the writable "my shell" pane is gated separately.
+  document.getElementById("terminal-toggle").hidden = !state.terminal;
 }
 
 // Read-only source panel: polls a jj view (show @ / diff / log / files) while
@@ -407,6 +411,74 @@ function wireSourcePanel() {
   };
 }
 
+// In-browser terminals. Two xterm panes:
+//   presenter (/terminal/shared) — read-only, follows the controller's shell;
+//   my shell  (/terminal)        — read-write, this user's private sandbox shell.
+// Each pane owns a WebSocket that auto-reconnects (shells persist host-side, so
+// a reconnect replays scrollback and continues). Output frames are binary PTY
+// bytes; input is binary (stdin) and a JSON text message for resize.
+function wireTerminalPanel() {
+  const toggle = document.getElementById("terminal-toggle");
+  const panel = document.getElementById("terminal");
+
+  const dockedPresenting = document.getElementById("docked-presenting");
+
+  let panes = null;
+  function ensurePanes() {
+    if (panes) return panes;
+    const ph = document.getElementById("term-presenter");
+    ph.replaceChildren(); // clear any prior xterm DOM before rebinding
+    panes = [makeTerminalPane(ph, { path: "/terminal/shared", writable: false })];
+    if (state.mayWrite) {
+      document.getElementById("myshell-pane").hidden = false;
+      const mh = document.getElementById("term-mine");
+      mh.replaceChildren();
+      panes.push(makeTerminalPane(mh, {
+        path: "/terminal", writable: true,
+        onPresenting: (on) => { dockedPresenting.hidden = !on; },
+      }));
+    }
+    return panes;
+  }
+
+  function disposePanes() {
+    if (!panes) return;
+    for (const p of panes) p.stop();
+    panes = null;
+    dockedPresenting.hidden = true;
+  }
+
+  const fitAll = () => { if (panes && !panel.hidden) for (const p of panes) p.doFit(); };
+  window.addEventListener("resize", fitAll);
+
+  toggle.onclick = () => {
+    const show = panel.hidden;
+    panel.hidden = !show;
+    if (show) {
+      const ps = ensurePanes();
+      for (const p of ps) p.start();
+      // Defer the first fit until the panel has its layout dimensions.
+      requestAnimationFrame(fitAll);
+    }
+  };
+
+  const expand = document.getElementById("terminal-expand");
+  expand.onclick = () => {
+    const max = panel.classList.toggle("expanded");
+    expand.textContent = max ? "⤡ restore" : "⤢ expand";
+    requestAnimationFrame(fitAll);
+  };
+
+  // Hand the terminal off to its own pop-out window (Presenter + My-shell tabs).
+  // Stop the docked panes first so two writable My-shell connections don't fight
+  // over the PTY size.
+  document.getElementById("terminal-popout").onclick = () => {
+    disposePanes();
+    panel.hidden = true;
+    window.open("/popout.html" + qs, "runclaude-terminal", "popup,width=820,height=560");
+  };
+}
+
 // Copy the session id (for `runclaude --serve --serve-resume <id>`).
 document.getElementById("copy-session").onclick = async (e) => {
   if (!state.sessionId) return;
@@ -420,5 +492,6 @@ document.getElementById("copy-session").onclick = async (e) => {
 setStatus("");
 wireControls();
 wireSourcePanel();
+wireTerminalPanel();
 loadIdentity();
 connect();

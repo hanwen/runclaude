@@ -26,7 +26,21 @@ import (
 	"github.com/hanwen/runclaude/agentclient"
 	"github.com/hanwen/runclaude/creds"
 	"github.com/hanwen/runclaude/proxy"
+	"github.com/hanwen/runclaude/terminal"
 )
+
+// shellExitCode maps a wait status to the conventional shell exit code (128+signo
+// when killed by a signal), for reporting a terminal shell's exit to the host.
+func shellExitCode(ws syscall.WaitStatus) int {
+	switch {
+	case ws.Exited():
+		return ws.ExitStatus()
+	case ws.Signaled():
+		return 128 + int(ws.Signal())
+	default:
+		return 0
+	}
+}
 
 const (
 	prSetNoNewPrivs      = 38
@@ -94,10 +108,13 @@ type Config struct {
 	// CommFd is the proxy fd-passing socket (see setupNetwork). ServeInFd /
 	// ServeOutFd are claude's stdin (read end) and stdout (write end) in
 	// --serve mode; the host keeps the matching pipe ends to run the session
-	// hub. See serve.go.
+	// hub. TermFd is the sandbox end of the per-user terminal control socket in
+	// --serve mode; the host keeps the other end to drive the terminal Broker.
+	// See serve.go and the terminal package.
 	CommFd     int `json:"commFd,omitempty"`
 	ServeInFd  int `json:"serveInFd,omitempty"`
 	ServeOutFd int `json:"serveOutFd,omitempty"`
+	TermFd     int `json:"termFd,omitempty"`
 }
 
 type Bind struct {
@@ -943,6 +960,7 @@ func mainErr() error {
 		extraFiles = append(extraFiles, commChildFile)
 	}
 	var hostStdinW, hostStdoutR *os.File
+	hostTermFd := -1
 	if *serve {
 		// host -> claude (prompt turns): host writes hostStdinW, the sandboxed
 		// claude reads claudeStdinR.
@@ -962,6 +980,19 @@ func mainErr() error {
 		extraFiles = append(extraFiles, claudeStdinR)
 		cfg.ServeOutFd = 3 + len(extraFiles)
 		extraFiles = append(extraFiles, claudeStdoutW)
+
+		// Per-user terminal control socket: the sandbox end is threaded down to
+		// the Agent (runAsInit); the host end drives the terminal Broker (runServe).
+		// SOCK_SEQPACKET keeps each control frame atomic; CLOEXEC keeps the host
+		// end out of the re-exec'd child (the sandbox end is dup'd in via
+		// ExtraFiles, which clears CLOEXEC for the child).
+		pair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		hostTermFd = pair[0]
+		cfg.TermFd = 3 + len(extraFiles)
+		extraFiles = append(extraFiles, os.NewFile(uintptr(pair[1]), "term-sandbox"))
 	}
 
 	cmd.Env = append(containerEnv, childEnv+"="+encodeConfig(cfg))
@@ -993,6 +1024,7 @@ func mainErr() error {
 			tailnet:  *serveTailnet,
 			tsnetDir: filepath.Join(cacheDir, "tsnet"),
 			resume:   *serveResume,
+			termFd:   hostTermFd,
 		})
 	}
 	return cmd.Wait()
@@ -1090,7 +1122,7 @@ func setupDev(rootfs string) error {
 // preserve). 0 entries are absent.
 func inheritedFds(cfg *Config) []int {
 	var fds []int
-	for _, fd := range []int{cfg.CommFd, cfg.ServeInFd, cfg.ServeOutFd} {
+	for _, fd := range []int{cfg.CommFd, cfg.ServeInFd, cfg.ServeOutFd, cfg.TermFd} {
 		if fd != 0 {
 			fds = append(fds, fd)
 		}
@@ -1410,6 +1442,14 @@ func initMain() error {
 // drops those for pid 1 of a PID ns when no handler is installed, which is
 // what froze claude on ^Z before this shim was added.
 func runAsInit(bin string, argv []string, cfg *Config) error {
+	// The terminal socket is for the host Broker <-> our in-process Agent only.
+	// Mark it close-on-exec so neither claude nor the user shells the Agent forks
+	// inherit it (a sandboxed process could otherwise spoof control frames to the
+	// host). Our own goroutine keeps using it — CLOEXEC only affects execve.
+	if cfg.TermFd != 0 {
+		syscall.CloseOnExec(cfg.TermFd)
+	}
+
 	cmd := exec.Command(bin)
 	cmd.Args = argv
 	// In --serve mode claude's stdin/stdout are the inherited pipe ends back to
@@ -1442,6 +1482,15 @@ func runAsInit(bin string, argv []string, cfg *Config) error {
 	}
 	childPid := cmd.Process.Pid
 
+	// Per-user terminals (--serve): the Agent forks shells inside this sandbox on
+	// request from the host. The shells are children of pid 1, so the reaper loop
+	// below harvests them and reports each exit to the Agent via OnReap.
+	var termAgent *terminal.Agent
+	if cfg.TermFd != 0 {
+		termAgent = terminal.NewAgent(cfg.TermFd, cfg.Cwd, os.Environ())
+		go termAgent.Serve()
+	}
+
 	// Forward signals delivered to us (pid 1) onto the child. ^C / ^Z from
 	// the tty go to the foreground process group directly and reach the
 	// child without our help; this catches the explicit `kill <pid1>` case.
@@ -1469,6 +1518,11 @@ func runAsInit(bin string, argv []string, cfg *Config) error {
 			return fmt.Errorf("wait4: %w", err)
 		}
 		if pid != childPid {
+			// An orphan or a terminal shell. Report shell exits to the Agent so
+			// the host can drop the session and notify watchers.
+			if termAgent != nil {
+				termAgent.OnReap(pid, shellExitCode(ws))
+			}
 			continue
 		}
 		switch {

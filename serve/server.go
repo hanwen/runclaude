@@ -33,6 +33,9 @@ type Config struct {
 	// path names a file for the "file" view. Output may contain ANSI color
 	// codes (the frontend renders them). nil disables the source panel.
 	Source func(ctx context.Context, view, path string) (string, error)
+	// Term, if set, is the per-user shell broker backing the in-browser
+	// terminal panes (/terminal, /terminal/shared). nil disables them.
+	Term Terminal
 }
 
 // Server routes HTTP requests for one session.
@@ -41,6 +44,7 @@ type Server struct {
 	ident  Identifier
 	policy Policy
 	source func(ctx context.Context, view, path string) (string, error)
+	term   Terminal
 	mux    *http.ServeMux
 }
 
@@ -51,6 +55,7 @@ func New(cfg Config) *Server {
 		ident:  cfg.Identity,
 		policy: cfg.Policy,
 		source: cfg.Source,
+		term:   cfg.Term,
 		mux:    http.NewServeMux(),
 	}
 	s.mux.Handle("/", http.FileServer(http.FS(frontend.FS)))
@@ -61,6 +66,10 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("/prompt", s.handlePrompt)
 	s.mux.HandleFunc("/interrupt", s.handleInterrupt)
 	s.mux.HandleFunc("/source", s.handleSource)
+	if s.term != nil {
+		s.mux.HandleFunc("/terminal", s.handleTerminal)
+		s.mux.HandleFunc("/terminal/shared", s.handleSharedTerminal)
+	}
 	return s
 }
 
@@ -92,7 +101,8 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(struct {
 		Identity
 		MayWrite bool `json:"mayWrite"`
-	}{id, s.policy.MayWrite(id)})
+		Terminal bool `json:"terminal"`
+	}{id, s.policy.MayWrite(id), s.term != nil})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
