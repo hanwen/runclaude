@@ -20,9 +20,10 @@ import (
 // credential rewriting happens. Upstream and Transports are optional overrides
 // keyed by hostname.
 type Setup struct {
-	// Allowed lists hostnames that may be reached via CONNECT or plain HTTP
-	// without TLS interception.
-	Allowed []string
+	// Allow matches hostnames that may be reached via CONNECT or plain HTTP
+	// without TLS interception. It is an *Allowlist rather than a plain slice
+	// so hosts can be approved at runtime (see Approver).
+	Allow *Allowlist
 	// Mitm lists hostnames whose TLS connections will be terminated with a
 	// leaf cert from Leaves and re-issued upstream after Inject runs.
 	Mitm []string
@@ -38,6 +39,10 @@ type Setup struct {
 	// Transports optionally installs a per-host RoundTripper around the
 	// upstream call (e.g. to handle 401-driven OAuth refresh).
 	Transports map[string]http.RoundTripper
+	// OnDeny, if set, is called with the destination host of each request
+	// rejected by the allowlist. Approver.Record is the usual value; it feeds
+	// the runtime approval UI.
+	OnDeny func(host string)
 }
 
 // OpenLogger opens a proxy log file at logPath. If logPath is empty, the
@@ -54,8 +59,8 @@ func OpenLogger(logPath string) (*log.Logger, error) {
 }
 
 // Serve runs the proxy on ln until ln is closed. Connections to hosts
-// matching p.Mitm are TLS-intercepted; hosts matching p.Allowed are passed
-// through; everything else returns 403.
+// matching p.Mitm are TLS-intercepted; hosts matched by p.Allow are passed
+// through; everything else returns 403 (and is reported via p.OnDeny).
 func Serve(p *Setup, ln net.Listener, logger *log.Logger) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
@@ -71,7 +76,7 @@ func Serve(p *Setup, ln net.Listener, logger *log.Logger) {
 				return
 			}
 			proxyMitm(w, r, host, p.Leaves, p.Inject, p.Upstream[host], p.Transports[host], logger)
-		case MatchDomain(host, p.Allowed):
+		case p.Allow != nil && p.Allow.Match(host):
 			logger.Printf("allow %s %s", r.Method, host)
 			if r.Method == http.MethodConnect {
 				proxyConnect(w, r, logger)
@@ -80,6 +85,9 @@ func Serve(p *Setup, ln net.Listener, logger *log.Logger) {
 			}
 		default:
 			logger.Printf("deny  %s %s", r.Method, host)
+			if p.OnDeny != nil {
+				p.OnDeny(host)
+			}
 			http.Error(w, "denied by runclaude allowlist", http.StatusForbidden)
 		}
 	})

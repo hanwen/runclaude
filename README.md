@@ -69,6 +69,15 @@ outgoing traffic, so Claude itself doesn't have access to the
 credential. The proxy supports both Anthropic bearer credentials and
 AWS authentication for use with bedrock.
 
+Egress is restricted to an allowlist of domains. When the sandboxed
+process reaches for a domain that isn't allowed, the request is denied
+and recorded. runclaude serves a small approval web page on localhost
+(the address is printed on startup, e.g. `domain approval UI:
+http://127.0.0.1:PORT`); it lists the denied domains with an "approve"
+button. Approving a domain permits it immediately, without restarting.
+Use `--approve-listen host:port` to pin a stable address. Approvals last
+only for the session.
+
 It uses unprivileged user namespaces, so it does not need root setuid.
 It has no runtime dependencies and starts up in ~20ms.
 

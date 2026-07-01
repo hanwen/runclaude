@@ -134,7 +134,7 @@ func run() error {
 	}
 
 	setup := &proxy.Setup{
-		Allowed:  allowed,
+		Allow:    proxy.NewAllowlist(allowed),
 		Mitm:     mitm,
 		Leaves:   proxy.NewLeafCache(ca),
 		Upstream: upstreams,

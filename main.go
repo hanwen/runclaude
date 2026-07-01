@@ -456,6 +456,8 @@ func mainErr() error {
 	flag.Var(&allowDomain, "a", "alias for --allow-domain")
 	proxyLog := flag.String("proxy-log", "",
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
+	approveListen := flag.String("approve-listen", "127.0.0.1:0",
+		"host address for the domain-approval web UI; the chosen address is printed on startup")
 	var mitmUpstream stringSlice
 	flag.Var(&mitmUpstream, "mitm-upstream",
 		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
@@ -596,11 +598,31 @@ func mainErr() error {
 		}
 		log.Printf("proxy log: %s", logPath)
 
+		// A single Allowlist backs both the proxy allow decision and the DNS
+		// server. mitmDomains are already contained in allowedDomains (each is
+		// appended above), but Add dedups so this stays correct regardless.
+		allowlist := proxy.NewAllowlist(allowedDomains)
+		for _, d := range mitmDomains {
+			allowlist.Add(d)
+		}
+		approver := proxy.NewApprover(allowlist, logger)
+		if approvalLn, err := net.Listen("tcp", *approveListen); err != nil {
+			log.Printf("warning: domain approval UI: %v", err)
+		} else {
+			log.Printf("domain approval UI: http://%s", approvalLn.Addr())
+			go func() {
+				if err := http.Serve(approvalLn, approver); err != nil {
+					logger.Printf("approval UI: %v", err)
+				}
+			}()
+		}
+
 		setup := &proxy.Setup{
-			Allowed:  allowedDomains,
+			Allow:    allowlist,
 			Mitm:     mitmDomains,
 			Inject:   func(string, *http.Request) {},
 			Upstream: cfg.MitmUpstream,
+			OnDeny:   approver.Record,
 		}
 		if len(mitmDomains) > 0 {
 			ca, err := proxy.LoadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
@@ -693,11 +715,10 @@ func mainErr() error {
 				logger.Printf("FileListener dns-tcp: %v", err)
 				return
 			}
-			// DNS allowlist covers both passthrough and mitm targets.
-			dnsAllow := append([]string{}, allowedDomains...)
-			dnsAllow = append(dnsAllow, mitmDomains...)
-			go proxy.ServeDNSUDP(dnsUDP, dnsAllow, logger)
-			go proxy.ServeDNSTCP(dnsTCP, dnsAllow, logger)
+			// DNS shares the proxy's Allowlist so runtime approvals also make
+			// the host resolvable inside the container.
+			go proxy.ServeDNSUDP(dnsUDP, allowlist, logger)
+			go proxy.ServeDNSTCP(dnsTCP, allowlist, logger)
 			proxy.Serve(setup, proxyLn, logger)
 		}()
 	}

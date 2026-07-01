@@ -97,14 +97,14 @@ func buildDNSError(req []byte, rcode uint16) []byte {
 // HandleDNSQuery parses a single DNS request and returns the wire-format
 // response. Hosts outside allowed receive NXDOMAIN; QTYPEs other than A/AAAA
 // receive NOTIMP.
-func HandleDNSQuery(buf []byte, allowed []string, logger *log.Logger) []byte {
+func HandleDNSQuery(buf []byte, allowed *Allowlist, logger *log.Logger) []byte {
 	_, name, qtype, err := parseDNSQuery(buf)
 	if err != nil {
 		logger.Printf("dns: parse: %v", err)
 		return buildDNSError(buf, 1) // FORMERR
 	}
 	name = strings.TrimSuffix(name, ".")
-	if !MatchDomain(name, allowed) {
+	if !allowed.Match(name) {
 		logger.Printf("dns: deny %s", name)
 		return buildDNSError(buf, 3) // NXDOMAIN
 	}
@@ -129,7 +129,7 @@ func HandleDNSQuery(buf []byte, allowed []string, logger *log.Logger) []byte {
 
 // ServeDNSUDP reads queries from conn and writes responses until conn is
 // closed.
-func ServeDNSUDP(conn net.PacketConn, allowed []string, logger *log.Logger) {
+func ServeDNSUDP(conn net.PacketConn, allowed *Allowlist, logger *log.Logger) {
 	defer conn.Close()
 	buf := make([]byte, 1500)
 	for {
@@ -150,7 +150,7 @@ func ServeDNSUDP(conn net.PacketConn, allowed []string, logger *log.Logger) {
 
 // ServeDNSTCP accepts DNS-over-TCP connections from ln and serves them until
 // ln is closed.
-func ServeDNSTCP(ln net.Listener, allowed []string, logger *log.Logger) {
+func ServeDNSTCP(ln net.Listener, allowed *Allowlist, logger *log.Logger) {
 	defer ln.Close()
 	for {
 		c, err := ln.Accept()

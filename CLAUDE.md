@@ -50,6 +50,7 @@ The host-side proxy listener / DNS sockets are created by `initMain` inside the 
 - The HTTP proxy enforces `CONNECT` allowlist; for MITM hosts it terminates TLS with the minted leaf and re-issues the request upstream with credentials injected by the `inject` callback.
 - `inject` rewrites `Authorization` / `x-api-key` for `api.anthropic.com`, and SigV4-signs for `bedrock-runtime.*.amazonaws.com` using `awsCreds` retrieved on the host.
 - `--mitm-upstream host=url` overrides the upstream for a host — used by tests to point at `fake-anthropic`.
+- Runtime approval (`proxy/approval.go`): the passthrough allowlist is a concurrency-safe `proxy.Allowlist` shared by both the proxy allow-check and the DNS server, so it can grow mid-session. A `proxy.Approver` records every denied host (`Setup.OnDeny`) and serves a small localhost web UI (`mainErr` starts it on `--approve-listen`, default `127.0.0.1:0`, address printed on startup) that lists denied hosts with an "approve" button; approving calls `Allowlist.Add`, immediately permitting DNS + egress for that host. Approvals are in-memory only (not persisted across sessions).
 
 ### Claude-mode helpers
 
