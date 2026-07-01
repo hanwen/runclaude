@@ -6,6 +6,7 @@ package creds
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -176,6 +179,43 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
+// logBody renders an upstream response body for a single log line. Anthropic
+// often gzip-compresses error bodies, so it decompresses when encoding says
+// gzip (or the gzip magic is present), then escapes any remaining
+// non-printable bytes so binary never lands in the proxy log.
+func logBody(body []byte, contentEncoding string) string {
+	gzipped := strings.Contains(strings.ToLower(contentEncoding), "gzip")
+	if !gzipped && len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		gzipped = true
+	}
+	if gzipped {
+		if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+			if dec, err := io.ReadAll(zr); err == nil {
+				body = dec
+			}
+		}
+	}
+	s := string(body)
+	if isMostlyPrintable(s) {
+		return s
+	}
+	return strconv.Quote(s)
+}
+
+// isMostlyPrintable reports whether s is plain enough to log verbatim: only
+// printable characters plus ordinary whitespace, no control/binary bytes.
+func isMostlyPrintable(s string) bool {
+	for _, r := range s {
+		if r == '\t' || r == '\n' || r == '\r' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // snapshot returns the inputs needed for a refresh call, or (proceed=false)
 // when another goroutine has already rotated past staleBearer.
 func (t *TokenSource) snapshot(staleBearer string) (rt, clientID, tokenURL string, proceed bool, err error) {
@@ -309,7 +349,8 @@ func (t *RefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	resp.Body.Close()
 
 	t.Logger.Printf("anthropic 401 on %s %s with bearer %s — attempting OAuth refresh; upstream body=%s",
-		req.Method, req.URL.Path, redactToken(stale), truncate(string(failBody), 512))
+		req.Method, req.URL.Path, redactToken(stale),
+		truncate(logBody(failBody, resp.Header.Get("Content-Encoding")), 512))
 	if err := t.Tokens.Refresh(req.Context(), stale); err != nil {
 		t.Logger.Printf("refresh failed: %v", err)
 		// Synthesize a 401 response so the client sees the original
