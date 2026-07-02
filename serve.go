@@ -22,14 +22,15 @@ import (
 
 // serveOptions configures runServe.
 type serveOptions struct {
-	cwd      string   // session working directory (for the jj source panel)
-	addr     string   // localhost bind address (when not on a tailnet)
-	dev      bool     // dev ?as= identity override
-	writers  []string // logins allowed to take control
-	tailnet  string   // tsnet node hostname; empty = localhost
-	tsnetDir string   // tsnet state dir (node identity persistence)
-	resume   string   // resumed session id (to restore its prior transcript)
-	termFd   int      // host end of the per-user terminal socket; -1 = disabled
+	cwd          string          // session working directory (for the jj source panel)
+	addr         string          // localhost bind address (when not on a tailnet)
+	dev          bool            // dev ?as= identity override
+	writers      []string        // logins allowed to take control
+	tailnet      string          // tsnet node hostname; empty = localhost
+	tsnetDir     string          // tsnet state dir (node identity persistence)
+	resume       string          // resumed session id (to restore its prior transcript)
+	termFd       int             // host end of the per-user terminal socket; -1 = disabled
+	activeConfig json.RawMessage // effective CLI options, served at /runclaude.json
 }
 
 // runServe is the host-side session: it owns the agentclient talking to the
@@ -113,10 +114,11 @@ func runServe(stdinW, stdoutR *os.File, opt serveOptions) {
 	// Per-user terminals: the host end of the term socket drives a Broker that
 	// asks the sandbox Agent to fork shells and streams their PTYs to the web UI.
 	webCfg := web.Config{
-		Hub:      hub,
-		Identity: ident,
-		Policy:   policy,
-		Source:   jjSource(opt.cwd),
+		Hub:          hub,
+		Identity:     ident,
+		Policy:       policy,
+		Source:       jjSource(opt.cwd),
+		ActiveConfig: opt.activeConfig,
 	}
 	if opt.termFd >= 0 {
 		broker := terminal.NewBroker(opt.termFd)

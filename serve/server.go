@@ -36,27 +36,32 @@ type Config struct {
 	// Term, if set, is the per-user shell broker backing the in-browser
 	// terminal panes (/terminal, /terminal/shared). nil disables them.
 	Term Terminal
+	// ActiveConfig, if set, is served verbatim at GET /runclaude.json.
+	// It holds the effective CLI options for this session.
+	ActiveConfig json.RawMessage
 }
 
 // Server routes HTTP requests for one session.
 type Server struct {
-	hub    *sessionhub.Hub
-	ident  Identifier
-	policy Policy
-	source func(ctx context.Context, view, path string) (string, error)
-	term   Terminal
-	mux    *http.ServeMux
+	hub          *sessionhub.Hub
+	ident        Identifier
+	policy       Policy
+	source       func(ctx context.Context, view, path string) (string, error)
+	term         Terminal
+	activeConfig json.RawMessage
+	mux          *http.ServeMux
 }
 
 // New builds the HTTP handler for the session described by cfg.
 func New(cfg Config) *Server {
 	s := &Server{
-		hub:    cfg.Hub,
-		ident:  cfg.Identity,
-		policy: cfg.Policy,
-		source: cfg.Source,
-		term:   cfg.Term,
-		mux:    http.NewServeMux(),
+		hub:          cfg.Hub,
+		ident:        cfg.Identity,
+		policy:       cfg.Policy,
+		source:       cfg.Source,
+		term:         cfg.Term,
+		activeConfig: cfg.ActiveConfig,
+		mux:          http.NewServeMux(),
 	}
 	s.mux.Handle("/", http.FileServer(http.FS(frontend.FS)))
 	s.mux.HandleFunc("/events", s.handleEvents)
@@ -66,6 +71,7 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("/prompt", s.handlePrompt)
 	s.mux.HandleFunc("/interrupt", s.handleInterrupt)
 	s.mux.HandleFunc("/source", s.handleSource)
+	s.mux.HandleFunc("/runclaude.json", s.handleActiveConfig)
 	if s.term != nil {
 		s.mux.HandleFunc("/terminal", s.handleTerminal)
 		s.mux.HandleFunc("/terminal/shared", s.handleSharedTerminal)
@@ -90,6 +96,17 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = io.WriteString(w, out)
+}
+
+// handleActiveConfig serves the effective CLI options for this session as JSON.
+func (s *Server) handleActiveConfig(w http.ResponseWriter, r *http.Request) {
+	if len(s.activeConfig) == 0 {
+		http.Error(w, "not available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(s.activeConfig)
 }
 
 // handleWhoami reports the caller's resolved identity and whether they are
