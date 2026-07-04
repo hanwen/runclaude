@@ -95,6 +95,8 @@ It has no runtime dependencies and starts up in ~20ms.
 * Credentials refresh automatically (both for AWS and Anthropic bearer
   tokens.)
 
+* Per repository configuration over `.claude/runclaude.json`.
+
 ## Standalone proxy (`runproxy`)
 
 The credential-injecting MITM proxy is also available as a standalone

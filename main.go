@@ -439,30 +439,43 @@ func mainErr() error {
 		return fmt.Errorf("$HOME must be absolute and not %q, got %q", "/", home)
 	}
 
+	// Load project-local option defaults before registering flags; CLI flags override.
+	fileOpts, err := loadOptionsFile(cwd)
+	if err != nil {
+		log.Printf("warning: .claude/runclaude.json: %v", err)
+	}
+
 	var exposed stringSlice
+	exposed = append(exposed, fileOpts.Expose...)
 	flag.Var(&exposed, "expose", "expose host path into the container (repeatable)")
 	flag.Var(&exposed, "e", "alias for --expose")
 	var only stringSlice
+	only = append(only, fileOpts.Only...)
 	flag.Var(&only, "only", "if set, only these paths (relative to cwd or absolute) are visible from cwd inside the container; cwd is backed by the cache dir, no git/jj repos are mapped (repeatable)")
 	flag.Var(&only, "o", "alias for --only")
-	mapPath := flag.Bool("map-path", true, "map all directories from $PATH")
-	claudeMode := flag.Bool("claude", true, "bind files needed for `claude` and run it as the default command")
-	claudeConfig := flag.Bool("claude-config", false, "like --claude but do not set the command (for testing/custom commands)")
-	restrictNet := flag.Bool("restrict-net", true, "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
+	mapPath := flag.Bool("map-path", boolOr(fileOpts.MapPath, true), "map all directories from $PATH")
+	claudeMode := flag.Bool("claude", boolOr(fileOpts.Claude, true), "bind files needed for `claude` and run it as the default command")
+	claudeConfig := flag.Bool("claude-config", fileOpts.ClaudeConfig, "like --claude but do not set the command (for testing/custom commands)")
+	restrictNet := flag.Bool("restrict-net", boolOr(fileOpts.RestrictNet, true), "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
-	mapWorkspace := flag.Bool("map-workspace", true, "for git/jj workspaces map the originating repository")
+	if len(fileOpts.AllowDomains) > 0 {
+		allowDomain.items = append(allowDomain.items, fileOpts.AllowDomains...)
+		allowDomain.set = true
+	}
+	mapWorkspace := flag.Bool("map-workspace", boolOr(fileOpts.MapWorkspace, true), "for git/jj workspaces map the originating repository")
 	flag.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
 	flag.Var(&allowDomain, "a", "alias for --allow-domain")
-	proxyLog := flag.String("proxy-log", "",
+	proxyLog := flag.String("proxy-log", fileOpts.ProxyLog,
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
-	approveListen := flag.String("approve-listen", "127.0.0.1:0",
+	approveListen := flag.String("approve-listen", strOr(fileOpts.ApproveListen, "127.0.0.1:0"),
 		"host address for the domain-approval web UI; the chosen address is printed on startup")
 	exclusive := flag.String("exclusive", "no",
 		"same-cwd concurrency control: \"no\" (default, just warn about other sessions), "+
 			"\"yes\" (refuse to start if another runclaude session shares this cwd), or "+
 			"\"probe\" (do not start; exit 0 if this cwd is free, nonzero if another session is live)")
 	var mitmUpstream stringSlice
+	mitmUpstream = append(mitmUpstream, fileOpts.MitmUpstream...)
 	flag.Var(&mitmUpstream, "mitm-upstream",
 		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
 	anthropicKeyOverride := flag.String("anthropic-key", "",
@@ -875,6 +888,29 @@ func mainErr() error {
 			cfg.Command = []string{"bash"}
 		}
 	}
+
+	// Write the effective options as /runclaude.json inside the container so
+	// any process can inspect the session configuration.
+	activeOpts := Options{
+		Expose:        []string(exposed),
+		Only:          []string(only),
+		MapPath:       boolPtr(*mapPath),
+		Claude:        boolPtr(*claudeMode),
+		ClaudeConfig:  *claudeConfig,
+		RestrictNet:   boolPtr(*restrictNet),
+		AllowDomains:  allowedDomains,
+		MapWorkspace:  boolPtr(*mapWorkspace),
+		ProxyLog:      *proxyLog,
+		ApproveListen: *approveListen,
+		MitmUpstream:  []string(mitmUpstream),
+	}
+	activeJSON, _ := json.MarshalIndent(activeOpts, "", "\t")
+	runclaudeJSONPath := filepath.Join(dir, "runclaude.json")
+	if err := os.WriteFile(runclaudeJSONPath, activeJSON, 0644); err != nil {
+		return err
+	}
+	cfg.Binds = append(cfg.Binds, Bind{Path: runclaudeJSONPath, Dest: "/runclaude.json", ReadOnly: true})
+
 	// Record this session and warn if other runclaude sessions share this
 	// cwd's cache (they share $HOME cache, /tmp and the merged ~/.claude tree).
 	cleanupSession := registerSession(cacheDir, cfg.Command)
