@@ -458,6 +458,10 @@ func mainErr() error {
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	approveListen := flag.String("approve-listen", "127.0.0.1:0",
 		"host address for the domain-approval web UI; the chosen address is printed on startup")
+	exclusive := flag.String("exclusive", "no",
+		"same-cwd concurrency control: \"no\" (default, just warn about other sessions), "+
+			"\"yes\" (refuse to start if another runclaude session shares this cwd), or "+
+			"\"probe\" (do not start; exit 0 if this cwd is free, nonzero if another session is live)")
 	var mitmUpstream stringSlice
 	flag.Var(&mitmUpstream, "mitm-upstream",
 		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
@@ -468,6 +472,42 @@ func mainErr() error {
 	anthropicRefreshOverride := flag.String("anthropic-refresh", "",
 		"OAuth refresh token to use with --anthropic-bearer for 401-triggered refresh; for testing")
 	flag.Parse()
+
+	switch *exclusive {
+	case "no", "yes", "probe":
+	default:
+		return fmt.Errorf("--exclusive must be one of no, yes, probe; got %q", *exclusive)
+	}
+	// The same-cwd session registry lives under the per-cwd cache dir; compute
+	// its path up front so --exclusive can consult it before any expensive
+	// startup work (credential loads, AWS SSO).
+	sum := sha256.Sum256([]byte(cwd))
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
+	if *exclusive != "no" {
+		others := liveSessions(filepath.Join(cacheDir, "sessions"))
+		switch *exclusive {
+		case "probe":
+			if len(others) > 0 {
+				return exitError{1, fmt.Sprintf("%d other runclaude session(s) share this cwd", len(others))}
+			}
+			// cwd is free: report success and do not start.
+			fmt.Fprintln(os.Stderr, "runclaude: cwd is free")
+			return nil
+		case "yes":
+			if len(others) > 0 {
+				var lines []string
+				for _, o := range others {
+					lines = append(lines, "  - "+o.describe())
+				}
+				return exitError{1, fmt.Sprintf("--exclusive=yes: %d other runclaude session(s) already share this cwd:\n%s",
+					len(others), strings.Join(lines, "\n"))}
+			}
+		}
+	}
 
 	claudeLike := *claudeMode || *claudeConfig
 
@@ -543,12 +583,6 @@ func mainErr() error {
 		allowedDomains = append(allowedDomains, pattern)
 	}
 
-	sum := sha256.Sum256([]byte(cwd))
-	cacheBase, err := os.UserCacheDir()
-	if err != nil {
-		return err
-	}
-	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
 	for _, sub := range []string{"home", "tmp", "run"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, sub), 0700); err != nil {
 			return err
@@ -1353,6 +1387,16 @@ func runAsInit(bin string, argv []string) error {
 	}
 }
 
+// exitError carries an explicit process exit code. Unlike a plain error (which
+// log.Fatal reports and exits 1), it lets --exclusive report a specific status
+// without a "runclaude:" log prefix, so callers can branch on the code.
+type exitError struct {
+	code int
+	msg  string
+}
+
+func (e exitError) Error() string { return e.msg }
+
 func main() {
 	var err error
 	switch {
@@ -1362,6 +1406,12 @@ func main() {
 		err = childMain()
 	default:
 		err = mainErr()
+	}
+	if ee, ok := err.(exitError); ok {
+		if ee.msg != "" {
+			fmt.Fprintln(os.Stderr, ee.msg)
+		}
+		os.Exit(ee.code)
 	}
 	if err != nil {
 		log.Fatal(err)
