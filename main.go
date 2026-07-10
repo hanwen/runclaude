@@ -414,6 +414,16 @@ func checkUserNS() error {
 	return nil
 }
 
+// cacheDirFor returns the per-cwd runclaude cache directory.
+func cacheDirFor(cwd string) (string, error) {
+	sum := sha256.Sum256([]byte(cwd))
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16]), nil
+}
+
 func mainErr() error {
 	dir, err := os.MkdirTemp("", "runclaude-")
 	if err != nil {
@@ -495,7 +505,23 @@ func mainErr() error {
 	var recordExclude stringSlice
 	recordExclude = append(recordExclude, fileOpts.RecordExclude...)
 	flag.Var(&recordExclude, "record-exclude", "extra ignore pattern for recorded snapshots (repeatable)")
+	upload := flag.String("upload", "",
+		"upload a recorded session to a directory/file (git bundle) or git remote/URL, then exit")
+	download := flag.String("download", "",
+		"fetch a recorded session from a bundle/remote, check it out as a new worktree, then exit")
+	sessionFlag := flag.String("session", "", "session id for --upload/--download (default: latest / the only one)")
+	atFlag := flag.String("at", "", "checkpoint selector for --download: uuid or timestamp substring (default: latest)")
+	destFlag := flag.String("dest", "", "worktree directory for --download")
+	sessionsList := flag.Bool("sessions", false, "list recorded sessions, then exit")
+	recordRm := flag.String("record-rm", "", "delete a recorded session's refs and state, then exit")
 	flag.Parse()
+
+	if handled, err := runRecordCommands(recordCmdFlags{
+		upload: *upload, download: *download, session: *sessionFlag, at: *atFlag,
+		dest: *destFlag, upstream: *recordUpstream, rm: *recordRm, list: *sessionsList,
+	}, cwd, home); handled {
+		return err
+	}
 
 	switch *exclusive {
 	case "no", "yes", "probe":
@@ -505,12 +531,10 @@ func mainErr() error {
 	// The same-cwd session registry lives under the per-cwd cache dir; compute
 	// its path up front so --exclusive can consult it before any expensive
 	// startup work (credential loads, AWS SSO).
-	sum := sha256.Sum256([]byte(cwd))
-	cacheBase, err := os.UserCacheDir()
+	cacheDir, err := cacheDirFor(cwd)
 	if err != nil {
 		return err
 	}
-	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
 	if *exclusive != "no" {
 		others := liveSessions(filepath.Join(cacheDir, "sessions"))
 		switch *exclusive {
@@ -607,6 +631,10 @@ func mainErr() error {
 		allowedDomains = append(allowedDomains, pattern)
 	}
 
+	cacheBase, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
 	for _, sub := range []string{"home", "tmp", "run"} {
 		if err := os.MkdirAll(filepath.Join(cacheDir, sub), 0700); err != nil {
 			return err

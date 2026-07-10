@@ -35,15 +35,18 @@ func (g *gitRepo) command(args ...string) *exec.Cmd {
 	}
 	full = append(full, args...)
 	cmd := exec.Command("git", full...)
-	cmd.Env = append(os.Environ(),
-		"GIT_WORK_TREE="+g.workTree,
-		"GIT_TERMINAL_PROMPT=0",
-	)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// workTree is empty for ref-only use (upload/download commands);
+	// GIT_WORK_TREE must then stay unset or `git worktree add` and friends
+	// misbehave.
+	if g.workTree != "" {
+		cmd.Env = append(cmd.Env, "GIT_WORK_TREE="+g.workTree)
+		cmd.Dir = g.workTree
+	}
 	cmd.Env = append(cmd.Env, g.identEnv...)
 	if g.indexFile != "" {
 		cmd.Env = append(cmd.Env, "GIT_INDEX_FILE="+g.indexFile)
 	}
-	cmd.Dir = g.workTree
 	return cmd
 }
 
