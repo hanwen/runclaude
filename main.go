@@ -488,6 +488,13 @@ func mainErr() error {
 		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	anthropicRefreshOverride := flag.String("anthropic-refresh", "",
 		"OAuth refresh token to use with --anthropic-bearer for 401-triggered refresh; for testing")
+	record := flag.Bool("record", boolOr(fileOpts.Record, false),
+		"record claude sessions: per-message worktree snapshots under refs/runclaude/<sid>/ plus a transcript branch (sticky per session; see docs/session-recording.md)")
+	recordUpstream := flag.String("record-upstream", fileOpts.RecordUpstream,
+		"upstream ref bounding session bundles (default: origin's default branch)")
+	var recordExclude stringSlice
+	recordExclude = append(recordExclude, fileOpts.RecordExclude...)
+	flag.Var(&recordExclude, "record-exclude", "extra ignore pattern for recorded snapshots (repeatable)")
 	flag.Parse()
 
 	switch *exclusive {
@@ -900,18 +907,21 @@ func mainErr() error {
 	// Write the effective options as /runclaude.json inside the container so
 	// any process can inspect the session configuration.
 	activeOpts := Options{
-		Expose:        []string(exposed),
-		Only:          []string(only),
-		MapPath:       boolPtr(*mapPath),
-		Claude:        boolPtr(*claudeMode),
-		ClaudeConfig:  *claudeConfig,
-		RestrictNet:   boolPtr(*restrictNet),
-		AllowDomains:  allowedDomains,
-		MapWorkspace:  boolPtr(*mapWorkspace),
-		ProxyLog:      *proxyLog,
-		ApproveListen: *approveListen,
-		MitmUpstream:  []string(mitmUpstream),
-		ClaudeFlags:   []string(claudeFlags),
+		Expose:         []string(exposed),
+		Only:           []string(only),
+		MapPath:        boolPtr(*mapPath),
+		Claude:         boolPtr(*claudeMode),
+		ClaudeConfig:   *claudeConfig,
+		RestrictNet:    boolPtr(*restrictNet),
+		AllowDomains:   allowedDomains,
+		MapWorkspace:   boolPtr(*mapWorkspace),
+		ProxyLog:       *proxyLog,
+		ApproveListen:  *approveListen,
+		MitmUpstream:   []string(mitmUpstream),
+		ClaudeFlags:    []string(claudeFlags),
+		Record:         boolPtr(*record),
+		RecordUpstream: *recordUpstream,
+		RecordExclude:  []string(recordExclude),
 	}
 	activeJSON, _ := json.MarshalIndent(activeOpts, "", "\t")
 	runclaudeJSONPath := filepath.Join(dir, "runclaude.json")
@@ -926,6 +936,24 @@ func mainErr() error {
 	defer cleanupSession()
 	if err := checkUserNS(); err != nil {
 		return err
+	}
+
+	// Session recorder: runs whenever a git dir resolves so sticky sessions
+	// (previously recorded, resumed without --record) keep recording; it
+	// claims new sessions only when --record was given.
+	var rec *recorder
+	if claudeLike && !onlyMode {
+		if gitDir, ok := resolveGitDir(cwd); ok {
+			r, err := newRecorder(gitDir, cwd, home, cacheDir, *record, *recordUpstream, recordExclude, log.Default())
+			if err != nil {
+				log.Printf("warning: --record: %v", err)
+			} else {
+				rec = r
+				go rec.run()
+			}
+		} else if *record {
+			log.Printf("warning: --record: no git repository at %s", cwd)
+		}
 	}
 
 	self, err := os.Executable()
@@ -982,6 +1010,9 @@ func mainErr() error {
 	err = cmd.Run()
 	if commChildFile != nil {
 		commChildFile.Close()
+	}
+	if rec != nil {
+		rec.Close()
 	}
 	return err
 }

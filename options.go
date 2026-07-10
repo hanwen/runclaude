@@ -10,18 +10,21 @@ import (
 // Save a subset as .claude/runclaude.json in the project directory to set
 // local defaults; individual CLI flags always take precedence.
 type Options struct {
-	Expose        []string `json:"expose,omitempty"`
-	Only          []string `json:"only,omitempty"`
-	MapPath       *bool    `json:"mapPath,omitempty"`
-	Claude        *bool    `json:"claude,omitempty"`
-	ClaudeConfig  bool     `json:"claudeConfig,omitempty"`
-	RestrictNet   *bool    `json:"restrictNet,omitempty"`
-	AllowDomains  []string `json:"allowDomains,omitempty"`
-	MapWorkspace  *bool    `json:"mapWorkspace,omitempty"`
-	ProxyLog      string   `json:"proxyLog,omitempty"`
-	ApproveListen string   `json:"approveListen,omitempty"`
-	MitmUpstream  []string `json:"mitmUpstream,omitempty"`
-	ClaudeFlags   []string `json:"claudeFlags,omitempty"`
+	Expose         []string `json:"expose,omitempty"`
+	Only           []string `json:"only,omitempty"`
+	MapPath        *bool    `json:"mapPath,omitempty"`
+	Claude         *bool    `json:"claude,omitempty"`
+	ClaudeConfig   bool     `json:"claudeConfig,omitempty"`
+	RestrictNet    *bool    `json:"restrictNet,omitempty"`
+	AllowDomains   []string `json:"allowDomains,omitempty"`
+	MapWorkspace   *bool    `json:"mapWorkspace,omitempty"`
+	ProxyLog       string   `json:"proxyLog,omitempty"`
+	ApproveListen  string   `json:"approveListen,omitempty"`
+	MitmUpstream   []string `json:"mitmUpstream,omitempty"`
+	ClaudeFlags    []string `json:"claudeFlags,omitempty"`
+	Record         *bool    `json:"record,omitempty"`
+	RecordUpstream string   `json:"recordUpstream,omitempty"`
+	RecordExclude  []string `json:"recordExclude,omitempty"`
 }
 
 // loadOptionsFile reads .claude/runclaude.json from cwd.
