@@ -25,6 +25,7 @@ Shell-level end-to-end tests (require `claude` on `$PATH` and working unprivileg
 ./test-pathmap.sh           # $PATH bind-mounting
 ./test-workspace.sh         # git worktree / jj workspace mapping
 ./test-settings-sanitize.sh # .claude/settings.json AWS scrubbing
+./test-record.sh            # session recording e2e (no claude CLI needed)
 ./test-claude-bedrock.sh    # live Bedrock (needs AWS creds)
 ./test-claude-cred.sh       # live Anthropic (needs ~/.claude credentials)
 ```
@@ -62,6 +63,10 @@ The host-side proxy listener / DNS sockets are created by `initMain` inside the 
 - `gitconfig.go` — `materializeGitConfig` copies the user's `~/.gitconfig` into the container's cache home with credential helpers / userinfo URLs stripped.
 - `vcs.go` — `vcsExcludeBinds` overlays per-clone git/jj `info/exclude` with extra patterns (e.g. `.claude/settings.json`) so claude's runtime mutations don't show up as repo changes. Only used on the non-merged path; the merged path doesn't touch the host project file at all.
 - `workspaceBinds` (main.go) — detects linked git worktrees (`.git` file → `gitdir:`) and jj workspaces (`.jj/repo` → repo path), binds the underlying repo storage so VCS works inside the container.
+
+### Session recording (`record.go`, `recordgit.go`, `recordcmd.go`)
+
+`--record` correlates Claude Code transcript positions with worktree snapshots so sessions can be reviewed as "conversation + tree state" (design: `docs/session-recording.md`). A host-side goroutine in `mainErr` tails the session JSONL (live-bound `~/.claude/projects/<encoded-cwd>/`), and on each mutating tool result commits the worktree (private index; host `git` required only when recording) at `refs/runclaude/<sid>/tree/<utc-ts>/<msg-uuid>`, coalescing same-second events. A parentless `refs/runclaude/<sid>/transcript` branch holds the full transcript file per flush, and `refs/runclaude/<sid>/meta` carries discovery metadata and scopes stickiness: once a session has refs for this cwd, later runs keep recording it without `--record`. Per-sid flock prevents same-cwd double-recording. Host-only commands: `--sessions` (list), `--upload` (bundle bounded by the earliest merge-base to `--record-upstream`, or push refs to a remote), `--download` (fetch + `git worktree add` + materialize transcript for `claude --resume --fork-session`; marks the session foreign so the reviewer's recorder never extends the author's refs), `--record-rm`. jj ignores the `refs/runclaude/` namespace, so recording is invisible to normal VCS use.
 
 ### Cache layout
 
