@@ -203,12 +203,13 @@ func (r *recorder) run() {
 }
 
 // Close stops polling, takes a final flush, and repacks if anything was
-// recorded.
-func (r *recorder) Close() {
+// recorded. It returns the recorded session ids so the caller can print a
+// summary once the terminal is free again.
+func (r *recorder) Close() []string {
 	close(r.done)
 	r.wg.Wait()
 	r.scanOnce()
-	recorded := false
+	var recorded []string
 	r.mu.Lock()
 	for _, s := range r.sessions {
 		r.flushTranscript(s, true)
@@ -216,14 +217,15 @@ func (r *recorder) Close() {
 		if s.lockFile != nil {
 			s.lockFile.Close()
 		}
-		recorded = true
+		recorded = append(recorded, s.sid)
 	}
 	r.mu.Unlock()
-	if recorded {
+	if len(recorded) > 0 {
 		if err := r.git.repack(); err != nil {
 			r.logger.Printf("record: repack: %v", err)
 		}
 	}
+	return recorded
 }
 
 // scanOnce looks for new/grown session files and processes them.
@@ -309,7 +311,10 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 		}
 		s.metaWritten = r.git.readRef(recordRefPrefix+sid+"/meta") != ""
 	}
-	r.logger.Printf("record: recording session %s", sid)
+	// File logger only: claude's TUI owns the terminal while sessions are
+	// claimed; the recorded-session summary is printed by mainErr after
+	// the container exits.
+	r.logger.Printf("recording session %s", sid)
 	return s
 }
 

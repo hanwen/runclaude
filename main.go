@@ -972,12 +972,23 @@ func mainErr() error {
 	var rec *recorder
 	if claudeLike && !onlyMode {
 		if gitDir, ok := resolveGitDir(cwd); ok {
-			r, err := newRecorder(gitDir, cwd, home, cacheDir, *record, *recordUpstream, recordExclude, log.Default())
+			// Recorder output goes to a file: claude's TUI owns the
+			// terminal once the container starts. Anything user-facing is
+			// printed here (before) or after cmd.Run (below).
+			recordLogPath := filepath.Join(cacheDir, "record.log")
+			recordLogger, err := proxy.OpenLogger(recordLogPath)
+			if err != nil {
+				return err
+			}
+			r, err := newRecorder(gitDir, cwd, home, cacheDir, *record, *recordUpstream, recordExclude, recordLogger)
 			if err != nil {
 				log.Printf("warning: --record: %v", err)
 			} else {
 				rec = r
 				go rec.run()
+				if *record {
+					log.Printf("record: on — snapshots under refs/runclaude/, log: %s", recordLogPath)
+				}
 			}
 		} else if *record {
 			log.Printf("warning: --record: no git repository at %s", cwd)
@@ -1040,7 +1051,11 @@ func mainErr() error {
 		commChildFile.Close()
 	}
 	if rec != nil {
-		rec.Close()
+		// The terminal is ours again: safe to tell the user what was
+		// recorded and how to share it.
+		for _, sid := range rec.Close() {
+			log.Printf("record: session %s recorded; share with: runclaude --upload <dir|remote> --session %s", sid, sid)
+		}
 	}
 	return err
 }
