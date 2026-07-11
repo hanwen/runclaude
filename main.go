@@ -799,6 +799,9 @@ func mainErr() error {
 		}
 	}
 	if claudeLike {
+		if err := ensureProjectTrusted(home, cwd); err != nil {
+			log.Printf("warning: pre-trust %s in ~/.claude.json: %v", cwd, err)
+		}
 		extra, err := claudeBinds(home)
 		if err != nil {
 			return err
