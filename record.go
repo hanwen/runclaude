@@ -11,13 +11,14 @@ package main
 //
 //	refs/runclaude/<sid>/tree/<utc-ts>/<msg-uuid>
 //
-// and maintains a parentless transcript branch
+// and maintains a parentless session branch
 //
-//	refs/runclaude/<sid>/transcript   (single file transcript.jsonl)
+//	refs/runclaude/<sid>/meta   (meta.json + transcript.jsonl)
 //
-// coalescing same-second events into one transcript commit. A tiny
-// refs/runclaude/<sid>/meta commit records author/cwd/start for discovery
-// and scopes stickiness to this checkout.
+// coalescing same-second events into one commit. meta.json (author, cwd,
+// start, first prompt) is written once and reused as the same blob in
+// every commit; it drives --sessions discovery and scopes stickiness to
+// this checkout. transcript.jsonl is the full session file per flush.
 
 import (
 	"bytes"
@@ -64,12 +65,12 @@ func transcriptDir(home, cwd string) string {
 }
 
 // recordState is the cached per-session recorder state. It is advisory:
-// the authoritative resume point is the transcript tip commit message.
+// the authoritative resume point is the session tip commit message.
 type recordState struct {
 	Offset         int64  `json:"offset"`
 	LastTree       string `json:"lastTree,omitempty"`
 	LastCheckpoint string `json:"lastCheckpoint,omitempty"`
-	TranscriptTip  string `json:"transcriptTip,omitempty"`
+	Tip            string `json:"tip,omitempty"` // <sid>/meta branch tip
 	// Foreign marks sessions fetched via --download; the local recorder
 	// never extends them (doing so would fork the author's refs).
 	Foreign bool `json:"foreign,omitempty"`
@@ -138,8 +139,8 @@ type recSession struct {
 	pendingUUIDs []string
 	firstPrompt  string
 	lastFlush    time.Time
-	metaWritten  bool
-	size         int64 // last observed file size
+	metaBlob     string // write-once meta.json blob, reused per commit
+	size         int64  // last observed file size
 }
 
 func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream string, extraExcludes []string, logger *log.Logger) (*recorder, error) {
@@ -259,8 +260,8 @@ func (r *recorder) scanOnce() {
 }
 
 // maybeClaim decides whether this recorder owns sid and, if so, locks and
-// initializes it. Ownership rules: (a) sticky — the transcript ref exists,
-// its meta cwd matches, and the session is not foreign; or (b) --record was
+// initializes it. Ownership rules: (a) sticky — the session branch exists,
+// its meta.json cwd matches, and the session is not foreign; or (b) --record was
 // given and the session file appeared after this recorder started.
 func (r *recorder) maybeClaim(sid, path string) *recSession {
 	sticky := r.isSticky(sid)
@@ -299,17 +300,19 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 		f.Close()
 		return nil
 	}
-	// The state file is a cache; the transcript tip commit message is
+	// The state file is a cache; the session tip commit message is
 	// authoritative for the resume offset (crash between update-ref and
 	// state write must not duplicate commits).
-	if tip := r.git.readRef(recordRefPrefix + sid + "/transcript"); tip != "" {
-		s.state.TranscriptTip = tip
+	if tip := r.git.readRef(recordRefPrefix + sid + "/meta"); tip != "" {
+		s.state.Tip = tip
 		if msg, err := r.git.commitMessage(tip); err == nil {
 			if off, ok := parseOffsetFromMessage(msg); ok && off > s.state.Offset {
 				s.state.Offset = off
 			}
 		}
-		s.metaWritten = r.git.readRef(recordRefPrefix+sid+"/meta") != ""
+		if blob, err := r.git.run("rev-parse", "--verify", "--quiet", tip+":meta.json"); err == nil {
+			s.metaBlob = blob
+		}
 	}
 	// File logger only: claude's TUI owns the terminal while sessions are
 	// claimed; the recorded-session summary is printed by mainErr after
@@ -320,12 +323,9 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 
 // isSticky reports whether sid was previously recorded from this cwd.
 func (r *recorder) isSticky(sid string) bool {
-	if r.git.readRef(recordRefPrefix+sid+"/transcript") == "" {
-		return false
-	}
 	metaJSON, err := r.git.showBlob(recordRefPrefix+sid+"/meta", "meta.json")
 	if err != nil {
-		return false
+		return false // no session branch: never recorded
 	}
 	var m sessionMeta
 	if json.Unmarshal([]byte(metaJSON), &m) != nil {
@@ -493,9 +493,11 @@ func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 	s.state.LastCheckpoint = sha
 }
 
-// flushTranscript commits the full transcript file onto the transcript
-// branch. Events within the same second coalesce into one commit; force
-// flushes regardless (session end).
+// flushTranscript commits meta.json + the full transcript file onto the
+// session branch (<sid>/meta). Events within the same second coalesce into
+// one commit; force flushes regardless (session end). The commit message
+// carries only the parse offset — the resume point read back by
+// maybeClaim; everything else about the flush is derivable from the tree.
 func (r *recorder) flushTranscript(s *recSession, force bool) {
 	if len(s.pendingUUIDs) == 0 {
 		return
@@ -503,41 +505,49 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 	if !force && r.now().Sub(s.lastFlush) < time.Second {
 		return
 	}
+	if s.metaBlob == "" {
+		blob, err := r.metaJSONBlob(s)
+		if err != nil {
+			r.logger.Printf("record: %s: meta blob: %v", s.sid, err)
+			return
+		}
+		s.metaBlob = blob
+	}
 	blob, err := r.git.hashFile(s.path)
 	if err != nil {
 		r.logger.Printf("record: %s: transcript blob: %v", s.sid, err)
 		return
 	}
-	tree, err := r.git.singleFileTree("transcript.jsonl", blob)
+	tree, err := r.git.blobTree(map[string]string{
+		"meta.json":        s.metaBlob,
+		"transcript.jsonl": blob,
+	})
 	if err != nil {
 		r.logger.Printf("record: %s: %v", s.sid, err)
 		return
 	}
 	var parents []string
-	if s.state.TranscriptTip != "" {
-		parents = append(parents, s.state.TranscriptTip)
+	if s.state.Tip != "" {
+		parents = append(parents, s.state.Tip)
 	}
-	msg := fmt.Sprintf("runclaude transcript\n\nsession: %s\noffset: %d\nblob: %s\nuuids: %s\n",
-		s.sid, s.state.Offset, blob, strings.Join(s.pendingUUIDs, " "))
+	msg := fmt.Sprintf("runclaude session\n\noffset: %d\n", s.state.Offset)
 	sha, err := r.git.commitTree(tree, parents, msg)
 	if err != nil {
-		r.logger.Printf("record: %s: transcript commit: %v", s.sid, err)
+		r.logger.Printf("record: %s: session commit: %v", s.sid, err)
 		return
 	}
-	if err := r.git.updateRef(recordRefPrefix+s.sid+"/transcript", sha); err != nil {
+	if err := r.git.updateRef(recordRefPrefix+s.sid+"/meta", sha); err != nil {
 		r.logger.Printf("record: %s: %v", s.sid, err)
 		return
 	}
-	s.state.TranscriptTip = sha
+	s.state.Tip = sha
 	s.pendingUUIDs = nil
 	s.lastFlush = r.now()
 	r.saveState(s)
-	if !s.metaWritten {
-		r.writeMeta(s)
-	}
 }
 
-func (r *recorder) writeMeta(s *recSession) {
+// metaJSONBlob writes the session's write-once meta.json blob.
+func (r *recorder) metaJSONBlob(s *recSession) (string, error) {
 	meta := sessionMeta{
 		SessionID:   s.sid,
 		Cwd:         r.cwd,
@@ -549,29 +559,9 @@ func (r *recorder) writeMeta(s *recSession) {
 	data, _ := json.MarshalIndent(meta, "", "\t")
 	tmp := filepath.Join(r.stateDir, s.sid+".meta.json")
 	if err := os.WriteFile(tmp, append(data, '\n'), 0600); err != nil {
-		r.logger.Printf("record: %s: %v", s.sid, err)
-		return
+		return "", err
 	}
-	blob, err := r.git.hashFile(tmp)
-	if err != nil {
-		r.logger.Printf("record: %s: meta blob: %v", s.sid, err)
-		return
-	}
-	tree, err := r.git.singleFileTree("meta.json", blob)
-	if err != nil {
-		r.logger.Printf("record: %s: %v", s.sid, err)
-		return
-	}
-	sha, err := r.git.commitTree(tree, nil, "runclaude session metadata\n\nsession: "+s.sid+"\n")
-	if err != nil {
-		r.logger.Printf("record: %s: meta commit: %v", s.sid, err)
-		return
-	}
-	if err := r.git.updateRef(recordRefPrefix+s.sid+"/meta", sha); err != nil {
-		r.logger.Printf("record: %s: %v", s.sid, err)
-		return
-	}
-	s.metaWritten = true
+	return r.git.hashFile(tmp)
 }
 
 func (r *recorder) saveState(s *recSession) {

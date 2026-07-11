@@ -61,14 +61,13 @@ EOF
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 refs=$($GIT for-each-ref --format='%(refname)' "refs/runclaude/$SID")
-echo "$refs" | grep -q "/transcript$" || fail "no transcript ref; got: $refs"
-echo "$refs" | grep -q "/meta$" || fail "no meta ref; got: $refs"
+echo "$refs" | grep -q "/meta$" || fail "no session branch ref; got: $refs"
 echo "$refs" | grep -q "/tree/.*/u3$" || fail "no u3 checkpoint; got: $refs"
 echo "$refs" | grep -q "/tree/.*/u5$" || fail "no u5 checkpoint; got: $refs"
 
 u5ref=$(echo "$refs" | grep "/tree/.*/u5$")
 [[ "$($GIT show "$u5ref:b.txt")" == "v2" ]] || fail "u5 checkpoint content"
-$GIT show "refs/runclaude/$SID/transcript:transcript.jsonl" | grep -q '"uuid":"u5"' \
+$GIT show "refs/runclaude/$SID/meta:transcript.jsonl" | grep -q '"uuid":"u5"' \
     || fail "transcript branch incomplete"
 
 # Upload -> clone -> download round trip.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -146,9 +147,19 @@ func (g *gitRepo) hashFile(path string) (string, error) {
 	return g.run("hash-object", "-w", "--", path)
 }
 
-// singleFileTree builds a tree containing exactly one file entry.
-func (g *gitRepo) singleFileTree(name, blob string) (string, error) {
-	return g.runInput(fmt.Sprintf("100644 blob %s\t%s\n", blob, name), "mktree")
+// blobTree builds a tree of plain-file entries. mktree requires input in
+// tree order, hence the sort.
+func (g *gitRepo) blobTree(entries map[string]string) (string, error) {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&b, "100644 blob %s\t%s\n", entries[name], name)
+	}
+	return g.runInput(b.String(), "mktree")
 }
 
 // commitMessage returns the full commit message body of sha.

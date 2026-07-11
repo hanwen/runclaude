@@ -66,7 +66,7 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "/transcript") || !strings.Contains(out, "/tree/") {
+	if !strings.Contains(out, "/meta") || !strings.Contains(out, "/tree/") {
 		t.Errorf("bundle heads missing refs:\n%s", out)
 	}
 

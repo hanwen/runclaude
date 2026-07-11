@@ -179,7 +179,7 @@ func TestRecorderCheckpointsAndTranscript(t *testing.T) {
 		t.Errorf("checkpoint tree b.txt: %q, %v", out, err)
 	}
 	// Transcript branch has the full file.
-	got, err := e.rec.git.showBlob(recordRefPrefix+sid+"/transcript", "transcript.jsonl")
+	got, err := e.rec.git.showBlob(recordRefPrefix+sid+"/meta", "transcript.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestRecorderStickyResume(t *testing.T) {
 	}
 	clock := time.Now().Add(time.Hour)
 	rec2.now = func() time.Time { return clock }
-	tipBefore := rec2.git.readRef(recordRefPrefix + e.session + "/transcript")
+	tipBefore := rec2.git.readRef(recordRefPrefix + e.session + "/meta")
 
 	os.WriteFile(filepath.Join(e.repo, "b.txt"), []byte("2\n"), 0644)
 	e.append(t,
@@ -293,7 +293,7 @@ func TestRecorderStickyResume(t *testing.T) {
 	if len(rec2.sessions) != 1 {
 		t.Fatalf("sticky session not claimed; sessions: %d", len(rec2.sessions))
 	}
-	tipAfter := rec2.git.readRef(recordRefPrefix + e.session + "/transcript")
+	tipAfter := rec2.git.readRef(recordRefPrefix + e.session + "/meta")
 	if tipAfter == tipBefore {
 		t.Error("transcript tip did not advance on resume")
 	}

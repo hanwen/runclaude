@@ -339,7 +339,7 @@ func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
 	// Materialize the transcript so `claude --resume` finds it from the
 	// new worktree. --fork-session is mandatory on replay: continuing the
 	// original session id would record onto the author's refs.
-	transcript, err := g.showBlob(recordRefPrefix+sid+"/transcript", "transcript.jsonl")
+	transcript, err := g.showBlob(recordRefPrefix+sid+"/meta", "transcript.jsonl")
 	if err != nil {
 		return err
 	}
