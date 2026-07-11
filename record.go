@@ -133,7 +133,6 @@ type recSession struct {
 	path      string
 	lockFile  *os.File // holds the flock; nil only in tests
 	state     recordState
-	partial   []byte            // trailing incomplete JSONL line
 	toolNames map[string]string // tool_use id -> tool name
 	// pending state for transcript coalescing
 	pendingUUIDs []string
@@ -300,15 +299,14 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 		f.Close()
 		return nil
 	}
-	// The state file is a cache; the session tip commit message is
-	// authoritative for the resume offset (crash between update-ref and
-	// state write must not duplicate commits).
+	// The state file is a cache; the tip's transcript blob is authoritative
+	// for the resume offset — its size is exactly the bytes recorded, since
+	// flushes truncate at the parse point (crash between update-ref and
+	// state write must not duplicate or skip content).
 	if tip := r.git.readRef(recordRefPrefix + sid + "/meta"); tip != "" {
 		s.state.Tip = tip
-		if msg, err := r.git.commitMessage(tip); err == nil {
-			if off, ok := parseOffsetFromMessage(msg); ok && off > s.state.Offset {
-				s.state.Offset = off
-			}
+		if n, err := r.git.blobSize(tip, "transcript.jsonl"); err == nil && n > s.state.Offset {
+			s.state.Offset = n
 		}
 		if blob, err := r.git.run("rev-parse", "--verify", "--quiet", tip+":meta.json"); err == nil {
 			s.metaBlob = blob
@@ -348,10 +346,10 @@ func (r *recorder) pollSession(s *recSession) {
 		// flush records the full new content.
 		r.logger.Printf("record: %s: transcript shrank (%d -> %d), re-baselining", s.sid, s.state.Offset, st.Size())
 		s.state.Offset = 0
-		s.partial = nil
+		s.size = -1 // force a read even if the rewrite kept the size
 	}
-	if st.Size() == s.size && st.Size() == s.state.Offset {
-		return
+	if st.Size() == s.size {
+		return // no new bytes since the last look
 	}
 	s.size = st.Size()
 
@@ -365,9 +363,15 @@ func (r *recorder) pollSession(s *recSession) {
 	}
 	buf := make([]byte, st.Size()-s.state.Offset)
 	n, _ := f.Read(buf)
-	buf = buf[:n]
+	// Consume only through the last newline; an incomplete trailing line
+	// stays in the file past the offset and is re-read once it completes.
+	end := bytes.LastIndexByte(buf[:n], '\n')
+	if end < 0 {
+		return
+	}
+	data := buf[:end+1]
+	newOffset := s.state.Offset + int64(end+1)
 
-	data := append(s.partial, buf...)
 	var snapshotUUIDs []string
 	var lastTS string
 	for {
@@ -389,8 +393,6 @@ func (r *recorder) pollSession(s *recSession) {
 			lastTS = ts
 		}
 	}
-	s.partial = data
-	newOffset := s.state.Offset + int64(n) - int64(len(s.partial))
 
 	if len(snapshotUUIDs) > 0 {
 		r.snapshot(s, snapshotUUIDs, lastTS, newOffset)
@@ -493,11 +495,13 @@ func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 	s.state.LastCheckpoint = sha
 }
 
-// flushTranscript commits meta.json + the full transcript file onto the
-// session branch (<sid>/meta). Events within the same second coalesce into
-// one commit; force flushes regardless (session end). The commit message
-// carries only the parse offset — the resume point read back by
-// maybeClaim; everything else about the flush is derivable from the tree.
+// flushTranscript commits meta.json + the transcript onto the session
+// branch (<sid>/meta). Events within the same second coalesce into one
+// commit; force flushes regardless (session end). The transcript blob is
+// truncated at the parse offset, so it always ends on a complete JSONL
+// line and its size IS the resume offset — nothing machine-readable lives
+// in the commit message. (A trailing line that never completes is
+// unparseable and stays out of the recording.)
 func (r *recorder) flushTranscript(s *recSession, force bool) {
 	if len(s.pendingUUIDs) == 0 {
 		return
@@ -513,7 +517,7 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 		}
 		s.metaBlob = blob
 	}
-	blob, err := r.git.hashFile(s.path)
+	blob, err := r.git.hashFilePrefix(s.path, s.state.Offset)
 	if err != nil {
 		r.logger.Printf("record: %s: transcript blob: %v", s.sid, err)
 		return
@@ -530,8 +534,7 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 	if s.state.Tip != "" {
 		parents = append(parents, s.state.Tip)
 	}
-	msg := fmt.Sprintf("runclaude session\n\noffset: %d\n", s.state.Offset)
-	sha, err := r.git.commitTree(tree, parents, msg)
+	sha, err := r.git.commitTree(tree, parents, "runclaude session")
 	if err != nil {
 		r.logger.Printf("record: %s: session commit: %v", s.sid, err)
 		return
@@ -593,20 +596,6 @@ func refTimestamp(entryTS string, now time.Time) string {
 		t = parsed
 	}
 	return t.UTC().Format("20060102T150405Z")
-}
-
-// parseOffsetFromMessage extracts the "offset: N" line written into
-// transcript commits.
-func parseOffsetFromMessage(msg string) (int64, bool) {
-	for _, line := range strings.Split(msg, "\n") {
-		if rest, ok := strings.CutPrefix(line, "offset: "); ok {
-			var off int64
-			if _, err := fmt.Sscanf(rest, "%d", &off); err == nil {
-				return off, true
-			}
-		}
-	}
-	return 0, false
 }
 
 func truncate(s string, n int) string {

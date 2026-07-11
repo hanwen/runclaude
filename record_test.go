@@ -30,15 +30,41 @@ func TestRefTimestamp(t *testing.T) {
 	}
 }
 
-func TestParseOffsetFromMessage(t *testing.T) {
-	msg := "runclaude transcript\n\nsession: s\noffset: 12345\nblob: abc\n"
-	off, ok := parseOffsetFromMessage(msg)
-	if !ok || off != 12345 {
-		t.Errorf("parseOffsetFromMessage: got %d, %v", off, ok)
+func TestRecorderPartialLineExcludedFromBlob(t *testing.T) {
+	e := newTestEnv(t)
+	complete := entryLine(t, "user", "u1", "hello", nil)
+	partial := `{"type":"user","uuid":"u2","message":` // torn write, no newline
+	e.append(t, complete, partial)
+	e.rec.scanOnce()
+
+	// The committed transcript ends at the parse offset: the torn line is
+	// not in the blob, and the blob size is the resume offset.
+	got, err := e.rec.git.showBlob(recordRefPrefix+e.session+"/meta", "transcript.jsonl")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := parseOffsetFromMessage("no offset here"); ok {
-		t.Error("parseOffsetFromMessage: false positive")
+	if got+"\n" != complete {
+		t.Errorf("blob should hold exactly the complete line: %q", got)
 	}
+	tip := e.rec.git.readRef(recordRefPrefix + e.session + "/meta")
+	n, err := e.rec.git.blobSize(tip, "transcript.jsonl")
+	if err != nil || n != int64(len(complete)) {
+		t.Errorf("blob size %d, want parse offset %d (%v)", n, len(complete), err)
+	}
+
+	// Completing the line later gets it recorded on the next flush.
+	e.append(t, "{\"content\":\"done\"}}\n")
+	e.clock = e.clock.Add(2 * time.Second)
+	e.rec.scanOnce()
+	got, err = e.rec.git.showBlob(recordRefPrefix+e.session+"/meta", "transcript.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.ReadFile(e.transcript)
+	if got+"\n" != string(want) {
+		t.Errorf("completed line missing from blob: %d vs %d bytes", len(got), len(want))
+	}
+	e.rec.Close()
 }
 
 // testRepo initializes a git repo with one commit and returns its path.

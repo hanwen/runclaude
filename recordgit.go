@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -147,6 +148,38 @@ func (g *gitRepo) hashFile(path string) (string, error) {
 	return g.run("hash-object", "-w", "--", path)
 }
 
+// hashFilePrefix writes the first n bytes of path as a blob object.
+func (g *gitRepo) hashFilePrefix(path string, n int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	cmd := g.command("hash-object", "-w", "--stdin")
+	cmd.Stdin = io.LimitReader(f, n)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("git hash-object --stdin: %v: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", fmt.Errorf("git hash-object --stdin: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// blobSize returns the size in bytes of <rev>:<path>.
+func (g *gitRepo) blobSize(rev, path string) (int64, error) {
+	out, err := g.run("cat-file", "-s", rev+":"+path)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	if _, err := fmt.Sscanf(out, "%d", &n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // blobTree builds a tree of plain-file entries. mktree requires input in
 // tree order, hence the sort.
 func (g *gitRepo) blobTree(entries map[string]string) (string, error) {
@@ -160,11 +193,6 @@ func (g *gitRepo) blobTree(entries map[string]string) (string, error) {
 		fmt.Fprintf(&b, "100644 blob %s\t%s\n", entries[name], name)
 	}
 	return g.runInput(b.String(), "mktree")
-}
-
-// commitMessage returns the full commit message body of sha.
-func (g *gitRepo) commitMessage(sha string) (string, error) {
-	return g.run("log", "-1", "--format=%B", sha)
 }
 
 // showBlob returns the content of <rev>:<path>.
