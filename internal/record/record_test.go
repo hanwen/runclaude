@@ -1,4 +1,4 @@
-package main
+package record
 
 import (
 	"encoding/json"
@@ -117,7 +117,7 @@ func entryLine(t *testing.T, typ, uuid string, content any, extra map[string]any
 
 type testEnv struct {
 	repo, home string
-	rec        *recorder
+	rec        *Recorder
 	session    string
 	transcript string
 	clock      time.Time
@@ -127,7 +127,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	repo := testRepo(t)
 	home := t.TempDir()
-	rec, err := newRecorder(filepath.Join(repo, ".git"), repo, home, true, "origin/main", nil, log.New(os.Stderr, "", 0))
+	rec, err := NewRecorder(filepath.Join(repo, ".git"), repo, home, true, "origin/main", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		clock:   time.Now(),
 	}
 	rec.now = func() time.Time { return env.clock }
-	dir := transcriptDir(home, repo)
+	dir := TranscriptDir(home, repo)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestRecorderStickyResume(t *testing.T) {
 
 	// New recorder without recordAll must resume via stickiness, from the
 	// recorded offset (no duplicate transcript commits).
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestRecorderNotStickyForOtherClone(t *testing.T) {
 	if err := os.WriteFile(idPath, []byte("other-clone\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestRecorderLockExcludesSecond(t *testing.T) {
 		t.Fatalf("first recorder did not claim: %d", len(e.rec.sessions))
 	}
 	// Same cacheDir (same cwd) — second recorder must not claim the locked session.
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestRecorderIgnoresPreexistingSessions(t *testing.T) {
 	// A file that predates the recorder and has no refs: not claimed even
 	// with recordAll.
 	e.append(t, entryLine(t, "user", "u1", "old", nil))
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,14 +417,14 @@ func addWorktree(t *testing.T, repo string) string {
 func TestRecorderRepoScopedSessionsDir(t *testing.T) {
 	e := newTestEnv(t)
 	wt := addWorktree(t, e.repo)
-	rec2, err := newRecorder(filepath.Join(wt, ".git"), wt, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(wt, ".git"), wt, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Both worktrees watch the main worktree's project dir and share the
 	// clone-global state dir (per-sid flocks exclude across worktrees).
-	if rec2.projectsDir != e.rec.projectsDir {
-		t.Errorf("projectsDir differs across worktrees: %q vs %q", rec2.projectsDir, e.rec.projectsDir)
+	if rec2.ProjectsDir != e.rec.ProjectsDir {
+		t.Errorf("projectsDir differs across worktrees: %q vs %q", rec2.ProjectsDir, e.rec.ProjectsDir)
 	}
 	if rec2.stateDir != e.rec.stateDir {
 		t.Errorf("stateDir differs across worktrees: %q vs %q", rec2.stateDir, e.rec.stateDir)
@@ -471,18 +471,18 @@ func TestRecorderInJJWorkspace(t *testing.T) {
 	e := newTestEnv(t)
 	ws := addJJWorkspace(t, e.repo)
 
-	gitDir, ok := resolveRecordGitDir(ws)
+	gitDir, ok := ResolveRecordGitDir(ws)
 	if !ok || gitDir != filepath.Join(e.repo, ".git") {
-		t.Fatalf("resolveRecordGitDir(%s) = %q, %v; want the main workspace's .git", ws, gitDir, ok)
+		t.Fatalf("ResolveRecordGitDir(%s) = %q, %v; want the main workspace's .git", ws, gitDir, ok)
 	}
-	rec2, err := newRecorder(gitDir, ws, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(gitDir, ws, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rec2.Close()
 	// Sessions and state are shared with recorders in the main workspace.
-	if rec2.projectsDir != e.rec.projectsDir {
-		t.Errorf("projectsDir differs: %q vs %q", rec2.projectsDir, e.rec.projectsDir)
+	if rec2.ProjectsDir != e.rec.ProjectsDir {
+		t.Errorf("projectsDir differs: %q vs %q", rec2.ProjectsDir, e.rec.ProjectsDir)
 	}
 	if rec2.id != e.rec.id {
 		t.Errorf("recorder id differs: %q vs %q", rec2.id, e.rec.id)
@@ -492,7 +492,7 @@ func TestRecorderInJJWorkspace(t *testing.T) {
 	// tree and never ingests its .jj/ state (jj writes no .jj/.gitignore in
 	// linked workspaces).
 	sid := "99999999-8888-7777-6666-555555555555"
-	tf := filepath.Join(rec2.projectsDir, sid+".jsonl")
+	tf := filepath.Join(rec2.ProjectsDir, sid+".jsonl")
 	lines := entryLine(t, "assistant", "w1", []map[string]any{
 		{"type": "tool_use", "id": "t1", "name": "Write"},
 	}, map[string]any{"cwd": ws}) + entryLine(t, "user", "w2", []map[string]any{
@@ -530,13 +530,13 @@ func TestResolveRecordGitDirNonColocatedJJ(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(store, "type"), []byte("git\n"), 0644)
 	os.WriteFile(filepath.Join(store, "git_target"), []byte("git"), 0644)
-	gitDir, ok := resolveRecordGitDir(main)
+	gitDir, ok := ResolveRecordGitDir(main)
 	if want := filepath.Join(store, "git"); !ok || gitDir != want {
-		t.Fatalf("resolveRecordGitDir = %q, %v; want %q", gitDir, ok, want)
+		t.Fatalf("ResolveRecordGitDir = %q, %v; want %q", gitDir, ok, want)
 	}
 	// Sessions key to the main workspace root, matching the colocated case.
 	home := t.TempDir()
-	if got, want := repoSessionsDir(home, "/elsewhere/ws", gitDir), transcriptDir(home, main); got != want {
+	if got, want := repoSessionsDir(home, "/elsewhere/ws", gitDir), TranscriptDir(home, main); got != want {
 		t.Errorf("repoSessionsDir = %q, want %q", got, want)
 	}
 }
@@ -602,7 +602,7 @@ func TestRecorderHandoffOnCwdChange(t *testing.T) {
 
 	// The other worktree's recorder claims it (sticky: same clone) and
 	// resumes from the blob offset.
-	rec2, err := newRecorder(filepath.Join(wt, ".git"), wt, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(wt, ".git"), wt, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestRecorderMaterializesTranscript(t *testing.T) {
 	if err := os.Remove(e.transcript); err != nil {
 		t.Fatal(err)
 	}
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := NewRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-package main
+package record
 
 // Git plumbing helpers for session recording. All operations shell out to
 // the host `git` binary with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE set

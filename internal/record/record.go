@@ -1,4 +1,4 @@
-package main
+package record
 
 // Session recording (the new/resume subcommands, or `record: true` in
 // .claude/runclaude.json): correlate Claude Code transcript positions
@@ -63,9 +63,9 @@ func encodeProjectDir(cwd string) string {
 	}, cwd)
 }
 
-// transcriptDir returns the host-side directory claude writes session
+// TranscriptDir returns the host-side directory claude writes session
 // transcripts for cwd into.
-func transcriptDir(home, cwd string) string {
+func TranscriptDir(home, cwd string) string {
 	return filepath.Join(home, ".claude", "projects", encodeProjectDir(cwd))
 }
 
@@ -76,15 +76,15 @@ func transcriptDir(home, cwd string) string {
 // Falls back to cwd's own dir when no main worktree resolves (bare repos).
 func repoSessionsDir(home, cwd, commonDir string) string {
 	if filepath.Base(commonDir) == ".git" {
-		return transcriptDir(home, filepath.Dir(commonDir))
+		return TranscriptDir(home, filepath.Dir(commonDir))
 	}
 	// A non-colocated jj repo's git store sits at <main>/.jj/repo/store/git;
 	// key sessions to the main workspace root, same as the colocated case.
 	jjStore := string(filepath.Separator) + filepath.Join(".jj", "repo", "store", "git")
 	if root, ok := strings.CutSuffix(commonDir, jjStore); ok && root != "" {
-		return transcriptDir(home, root)
+		return TranscriptDir(home, root)
 	}
-	return transcriptDir(home, cwd)
+	return TranscriptDir(home, cwd)
 }
 
 // recordState is the cached per-session recorder state. It is advisory:
@@ -131,11 +131,11 @@ type contentBlock struct {
 	Text      string `json:"text"`
 }
 
-type recorder struct {
+type Recorder struct {
 	git         *gitRepo
 	id          string // per-clone recording identity (recorderID)
 	cwd         string // worktree this recorder snapshots
-	projectsDir string // host dir with <sid>.jsonl files (repo-scoped)
+	ProjectsDir string // host dir with <sid>.jsonl files (repo-scoped)
 	stateDir    string // <git-common-dir>/runclaude/record
 	recordAll   bool   // recording requested: claim sessions started under this run
 	upstream    string // configured upstream for meta
@@ -184,7 +184,7 @@ type recSession struct {
 	handoff bool
 }
 
-func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extraExcludes []string, logger *log.Logger) (*recorder, error) {
+func NewRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extraExcludes []string, logger *log.Logger) (*Recorder, error) {
 	git := &gitRepo{
 		gitDir:   gitDir,
 		workTree: cwd,
@@ -220,11 +220,11 @@ func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 	if err := os.MkdirAll(projectsDir, 0700); err != nil {
 		return nil, err
 	}
-	r := &recorder{
+	r := &Recorder{
 		git:         git,
 		id:          id,
 		cwd:         cwd,
-		projectsDir: projectsDir,
+		ProjectsDir: projectsDir,
 		stateDir:    stateDir,
 		recordAll:   recordAll,
 		upstream:    upstream,
@@ -253,13 +253,13 @@ func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 // missing (purged by claude's cleanup, downloaded from another clone, or
 // recorded before sessions became repo-scoped) into the shared projects
 // dir, so `claude --resume` finds them from any worktree.
-func (r *recorder) materializeTranscripts() {
+func (r *Recorder) materializeTranscripts() {
 	ids, err := sessionIDs(r.git)
 	if err != nil {
 		return
 	}
 	for _, sid := range ids {
-		path := filepath.Join(r.projectsDir, sid+".jsonl")
+		path := filepath.Join(r.ProjectsDir, sid+".jsonl")
 		if _, err := os.Stat(path); err == nil {
 			continue
 		}
@@ -277,7 +277,7 @@ func (r *recorder) materializeTranscripts() {
 }
 
 // run polls until Close. Call as a goroutine.
-func (r *recorder) run() {
+func (r *Recorder) Run() {
 	r.wg.Add(1)
 	defer r.wg.Done()
 	tick := time.NewTicker(300 * time.Millisecond)
@@ -295,7 +295,7 @@ func (r *recorder) run() {
 // Close stops polling, takes a final flush, and repacks if anything was
 // recorded. It returns the recorded session ids so the caller can print a
 // summary once the terminal is free again.
-func (r *recorder) Close() []string {
+func (r *Recorder) Close() []string {
 	close(r.done)
 	r.wg.Wait()
 	r.scanOnce()
@@ -319,10 +319,10 @@ func (r *recorder) Close() []string {
 }
 
 // scanOnce looks for new/grown session files and processes them.
-func (r *recorder) scanOnce() {
+func (r *Recorder) scanOnce() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entries, err := os.ReadDir(r.projectsDir)
+	entries, err := os.ReadDir(r.ProjectsDir)
 	if err != nil {
 		return // dir may not exist yet
 	}
@@ -332,7 +332,7 @@ func (r *recorder) scanOnce() {
 			continue
 		}
 		sid := strings.TrimSuffix(name, ".jsonl")
-		path := filepath.Join(r.projectsDir, name)
+		path := filepath.Join(r.ProjectsDir, name)
 		s := r.sessions[sid]
 		if s == nil {
 			if size, err := fileSize(path); err != nil || r.skipped[sid] == size {
@@ -370,7 +370,7 @@ func fileSize(path string) (int64, error) {
 // and the session file appeared after this recorder started; and in either
 // case the transcript's latest entries were written from this worktree
 // (the projects dir is shared by all worktrees of the clone).
-func (r *recorder) maybeClaim(sid, path string) *recSession {
+func (r *Recorder) maybeClaim(sid, path string) *recSession {
 	// Fresh = the session file did not exist when this recorder started.
 	// (Not an mtime comparison: file timestamps come from the kernel's
 	// coarse clock and can lag time.Now() by a scheduler tick.)
@@ -432,7 +432,7 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 // release hands a claimed session back (its new entries come from another
 // worktree): flush what was recorded here, drop the flock, and let the
 // other worktree's recorder claim it.
-func (r *recorder) release(s *recSession) {
+func (r *Recorder) release(s *recSession) {
 	r.flushTranscript(s, true)
 	r.saveState(s)
 	if s.lockFile != nil {
@@ -484,7 +484,7 @@ func lastEntryCwd(path string) (string, bool) {
 }
 
 // isSticky reports whether sid was previously recorded by this clone.
-func (r *recorder) isSticky(sid string) bool {
+func (r *Recorder) isSticky(sid string) bool {
 	metaJSON, err := r.git.showBlob(recordRefPrefix+sid+"/meta", "meta.json")
 	if err != nil {
 		return false // no session branch: never recorded
@@ -524,7 +524,7 @@ func recorderID(g *gitRepo) (string, error) {
 }
 
 // pollSession reads newly appended bytes and reacts to complete entries.
-func (r *recorder) pollSession(s *recSession) {
+func (r *Recorder) pollSession(s *recSession) {
 	st, err := os.Stat(s.path)
 	if err != nil {
 		return
@@ -632,7 +632,7 @@ func foreignCutoff(data []byte, root string) (int, bool) {
 
 // handleEntry parses one JSONL line. It returns the entry uuid (if any),
 // its timestamp, and whether it should trigger a tree snapshot.
-func (r *recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mutating bool) {
+func (r *Recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mutating bool) {
 	var e transcriptEntry
 	if err := json.Unmarshal(line, &e); err != nil {
 		return "", "", false // unknown/partial format: pass through
@@ -685,7 +685,7 @@ func (r *recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mut
 // smushing). Unchanged trees create no commit. In a jj workspace the
 // checkpoint carries @'s change id, and when jj's own snapshot already
 // matches the tree it is reused verbatim (see recordjj.go).
-func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offset int64) {
+func (r *Recorder) snapshot(s *recSession, uuids []string, entryTS string, offset int64) {
 	// Per-session private index: never touches the user's staging area,
 	// persists across flushes for incremental restats.
 	g := *r.git
@@ -755,7 +755,7 @@ func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 // line and its size IS the resume offset — nothing machine-readable lives
 // in the commit message. (A trailing line that never completes is
 // unparseable and stays out of the recording.)
-func (r *recorder) flushTranscript(s *recSession, force bool) {
+func (r *Recorder) flushTranscript(s *recSession, force bool) {
 	if len(s.pendingUUIDs) == 0 {
 		// A forced flush (session end, handoff) still commits trailing
 		// uuid-less lines — the final ai-title update lands after the last
@@ -809,7 +809,7 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 }
 
 // metaJSONBlob writes the session's write-once meta.json blob.
-func (r *recorder) metaJSONBlob(s *recSession) (string, error) {
+func (r *Recorder) metaJSONBlob(s *recSession) (string, error) {
 	meta := sessionMeta{
 		SessionID:   s.sid,
 		RecorderID:  r.id,
@@ -826,7 +826,7 @@ func (r *recorder) metaJSONBlob(s *recSession) (string, error) {
 	return r.git.hashFile(tmp)
 }
 
-func (r *recorder) saveState(s *recSession) {
+func (r *Recorder) saveState(s *recSession) {
 	data, _ := json.Marshal(s.state)
 	if s.lockFile != nil {
 		s.lockFile.Truncate(0)

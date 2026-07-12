@@ -42,6 +42,17 @@ func loadOptionsFile(cwd string) (Options, error) {
 	return opts, err
 }
 
+// fileRecordUpstream reads the project options file's recordUpstream — the
+// same default the --record-upstream flag gets on the sandbox path. Passed
+// to record.DispatchSubcommand as the upload verb's --upstream default.
+func fileRecordUpstream(cwd string) string {
+	opts, err := loadOptionsFile(cwd)
+	if err != nil {
+		return ""
+	}
+	return opts.RecordUpstream
+}
+
 // boolOr returns *p when p is non-nil, else def.
 func boolOr(p *bool, def bool) bool {
 	if p != nil {

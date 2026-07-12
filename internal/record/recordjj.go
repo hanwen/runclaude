@@ -1,4 +1,4 @@
-package main
+package record
 
 // Native jj integration for session recording. In a jj workspace the
 // recorder resolves the working-copy change per checkpoint so snapshots

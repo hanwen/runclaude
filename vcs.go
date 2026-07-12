@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/hanwen/runclaude/internal/record"
 )
 
 // vcsExcludeBinds returns Binds that overlay a copy of each per-clone VCS
@@ -18,10 +20,10 @@ import (
 // cache) where the augmented copies live.
 func vcsExcludeBinds(cwd, outDir, pattern string) ([]Bind, error) {
 	excludePaths := map[string]struct{}{}
-	if d, ok := resolveGitDir(cwd); ok {
+	if d, ok := record.ResolveGitDir(cwd); ok {
 		excludePaths[filepath.Join(d, "info", "exclude")] = struct{}{}
 	}
-	if d, ok := resolveJJGitStore(cwd); ok {
+	if d, ok := record.ResolveJJGitStore(cwd); ok {
 		excludePaths[filepath.Join(d, "info", "exclude")] = struct{}{}
 	}
 	if len(excludePaths) == 0 {
@@ -63,82 +65,4 @@ func writeExcludeCopy(hostPath, copyPath, pattern string) error {
 		out = append(existing, []byte("\n"+pattern+"\n")...)
 	}
 	return os.WriteFile(copyPath, out, 0644)
-}
-
-func resolveGitDir(cwd string) (string, bool) {
-	p := filepath.Join(cwd, ".git")
-	fi, err := os.Stat(p)
-	if err != nil {
-		return "", false
-	}
-	if fi.IsDir() {
-		return p, true
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return "", false
-	}
-	rest, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
-	if !ok {
-		return "", false
-	}
-	gd := strings.TrimSpace(rest)
-	if !filepath.IsAbs(gd) {
-		gd = filepath.Join(cwd, gd)
-	}
-	return filepath.Clean(gd), true
-}
-
-// jjRepoDir returns cwd's jj repo dir. In the main workspace .jj/repo is
-// the dir itself; a linked workspace (`jj workspace add`) has a pointer
-// file there instead, holding the main repo dir's path (relative to .jj).
-func jjRepoDir(cwd string) (string, bool) {
-	p := filepath.Join(cwd, ".jj", "repo")
-	fi, err := os.Stat(p)
-	if err != nil {
-		return "", false
-	}
-	if fi.IsDir() {
-		return p, true
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return "", false
-	}
-	repo := strings.TrimSpace(string(data))
-	if !filepath.IsAbs(repo) {
-		repo = filepath.Join(cwd, ".jj", repo)
-	}
-	return filepath.Clean(repo), true
-}
-
-func resolveJJGitStore(cwd string) (string, bool) {
-	repo, ok := jjRepoDir(cwd)
-	if !ok {
-		return "", false
-	}
-	store := filepath.Join(repo, "store")
-	typ, err := os.ReadFile(filepath.Join(store, "type"))
-	if err != nil || strings.TrimSpace(string(typ)) != "git" {
-		return "", false
-	}
-	target, err := os.ReadFile(filepath.Join(store, "git_target"))
-	if err != nil {
-		return "", false
-	}
-	gd := strings.TrimSpace(string(target))
-	if !filepath.IsAbs(gd) {
-		gd = filepath.Join(store, gd)
-	}
-	return filepath.Clean(gd), true
-}
-
-// resolveRecordGitDir returns the git object store backing cwd for session
-// recording: the repo's own .git, or a jj repo's git backend store — which
-// also covers jj workspaces, whose dirs have no .git at all.
-func resolveRecordGitDir(cwd string) (string, bool) {
-	if d, ok := resolveGitDir(cwd); ok {
-		return d, true
-	}
-	return resolveJJGitStore(cwd)
 }

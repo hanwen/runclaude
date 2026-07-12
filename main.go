@@ -24,6 +24,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
 	"github.com/hanwen/runclaude/creds"
+	"github.com/hanwen/runclaude/internal/record"
 	"github.com/hanwen/runclaude/proxy"
 )
 
@@ -438,7 +439,7 @@ func cacheDirFor(cwd string) (string, error) {
 }
 
 func mainErr() error {
-	handled, verb, resumeSid, cliArgs, err := dispatchSubcommand(os.Args[1:])
+	handled, verb, resumeSid, cliArgs, err := record.DispatchSubcommand(os.Args[1:], fileRecordUpstream)
 	if handled {
 		return err
 	}
@@ -475,7 +476,7 @@ func mainErr() error {
 
 	// The sandbox flag set, shared by the bare invocation and the new/resume
 	// verbs (which are the same sandbox path with recording forced on); the
-	// host-only verbs have their own flag sets in recordcmd.go.
+	// host-only verbs have their own flag sets in internal/record.
 	fs := flag.NewFlagSet("runclaude", flag.ExitOnError)
 	var exposed stringSlice
 	exposed = append(exposed, fileOpts.Expose...)
@@ -548,8 +549,9 @@ flags:
 	}
 	fs.Parse(cliArgs)
 	// Recording is turned on by the new/resume verbs or the project options
-	// file; stickiness re-enables it per session regardless (see record.go).
-	record := verb != "" || boolOr(fileOpts.Record, false)
+	// file; stickiness re-enables it per session regardless (see
+	// internal/record).
+	recordOn := verb != "" || boolOr(fileOpts.Record, false)
 	if resumeSid != "" && !*claudeMode {
 		return fmt.Errorf("resume requires claude mode (--claude)")
 	}
@@ -939,7 +941,7 @@ flags:
 			// --download) must fork: continuing the author's session id
 			// would collide with their refs. Same-clone sessions continue.
 			if !onlyMode {
-				cmd = append(cmd, autoForkSession(cwd, claudeArgs)...)
+				cmd = append(cmd, record.AutoForkSession(cwd, claudeArgs)...)
 			}
 			cfg.Command = cmd
 		}
@@ -989,7 +991,7 @@ flags:
 		ApproveListen:  *approveListen,
 		MitmUpstream:   []string(mitmUpstream),
 		ClaudeFlags:    []string(claudeFlags),
-		Record:         boolPtr(record),
+		Record:         boolPtr(recordOn),
 		RecordUpstream: *recordUpstream,
 		RecordExclude:  []string(recordExclude),
 	}
@@ -1011,9 +1013,9 @@ flags:
 	// Session recorder: runs whenever a git dir resolves so sticky sessions
 	// (previously recorded, resumed on a plain run) keep recording; it
 	// claims new sessions only when recording was asked for.
-	var rec *recorder
+	var rec *record.Recorder
 	if claudeLike && !onlyMode {
-		if gitDir, ok := resolveRecordGitDir(cwd); ok {
+		if gitDir, ok := record.ResolveRecordGitDir(cwd); ok {
 			// Recorder output goes to a file: claude's TUI owns the
 			// terminal once the container starts. Anything user-facing is
 			// printed here (before) or after cmd.Run (below).
@@ -1022,7 +1024,7 @@ flags:
 			if err != nil {
 				return err
 			}
-			r, err := newRecorder(gitDir, cwd, home, record, *recordUpstream, recordExclude, recordLogger)
+			r, err := record.NewRecorder(gitDir, cwd, home, recordOn, *recordUpstream, recordExclude, recordLogger)
 			if err != nil {
 				log.Printf("warning: record: %v", err)
 			} else {
@@ -1032,17 +1034,17 @@ flags:
 				// the container, so any worktree of the clone can list and
 				// resume the clone's sessions. Appended last: it must mount
 				// on top of the ~/.claude binds.
-				if cwdDir := transcriptDir(home, cwd); rec.projectsDir != cwdDir {
+				if cwdDir := record.TranscriptDir(home, cwd); rec.ProjectsDir != cwdDir {
 					if err := os.MkdirAll(cwdDir, 0700); err == nil {
-						cfg.Binds = append(cfg.Binds, Bind{Path: rec.projectsDir, Dest: cwdDir})
+						cfg.Binds = append(cfg.Binds, Bind{Path: rec.ProjectsDir, Dest: cwdDir})
 					}
 				}
-				go rec.run()
-				if record {
+				go rec.Run()
+				if recordOn {
 					log.Printf("record: on — snapshots under refs/runclaude/, log: %s", recordLogPath)
 				}
 			}
-		} else if record {
+		} else if recordOn {
 			log.Printf("warning: record: no git or jj repository at %s", cwd)
 		}
 	}

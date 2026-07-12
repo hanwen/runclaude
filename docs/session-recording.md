@@ -22,7 +22,7 @@ All refs under `refs/runclaude/` in the repo from `resolveGitDir(cwd)`. v1 suppo
 - **Transcript branch**: `refs/runclaude/<sid>/transcript` — linear, parentless root, single file `transcript.jsonl`, blob = full session file. One commit per coalesced batch (same-second events smushed); commit message lists covered msg-uuids **and the file offset/blob hash of the tip**, making flushes idempotent after a crash (restart compares tip metadata, not the state file). On session end: `git pack-refs --all --prune` for the runclaude namespace + `git repack -d -q` to collapse the per-batch full-blob loose objects into deltas.
 - **Session metadata**: `refs/runclaude/<sid>/meta` — tiny commit with one `meta.json`: author, start time, cwd, upstream base, first user prompt (truncated). This is what discovery lists, and what scopes stickiness.
 
-## Recorder (new `record.go`, goroutine in `mainErr`)
+## Recorder (`internal/record/record.go`, goroutine in `mainErr`)
 
 1. Poll (~300ms stat) `~/.claude/projects/<encoded-cwd>/*.jsonl`; on a mutating event, snapshot immediately (see above). Detect file shrink/inode change and re-baseline instead of tailing garbage (Claude Code can rewrite/fork session files on resume/compaction).
 2. **Ownership**: per-sid `flock` on `<cacheDir>/record/<sid>.state`; a recorder only claims sids it can lock, and by default only sids whose file appeared after this runclaude started (multiple runclaude sessions in one cwd — a case session.go already warns about — must not double-commit or race `update-ref`).

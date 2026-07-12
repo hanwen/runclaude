@@ -1,4 +1,4 @@
-package main
+package record
 
 // Host-only commands operating on recorded sessions: the list/upload/
 // download/rm subcommands. These run before (instead of) any sandbox setup.
@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-// dispatchSubcommand handles `runclaude <verb> ...` session-management
+// DispatchSubcommand handles `runclaude <verb> ...` session-management
 // subcommands. The verb must be the first argument; `runclaude -- <verb>`
 // escapes a sandbox command that happens to share a verb's name. Host-only
 // verbs run here (handled=true, caller exits) with their own flag sets;
@@ -22,7 +22,11 @@ import (
 // resumeSid) — rest feeds the sandbox flag set, which the two verbs share
 // with the bare invocation (verb tailors its usage output and turns
 // recording on).
-func dispatchSubcommand(args []string) (handled bool, verb, resumeSid string, rest []string, err error) {
+//
+// upstreamDefault supplies the default for upload's --upstream flag — the
+// same value the sandbox path's --record-upstream flag defaults to (the
+// project options file); nil means no default.
+func DispatchSubcommand(args []string, upstreamDefault func(cwd string) string) (handled bool, verb, resumeSid string, rest []string, err error) {
 	if len(args) == 0 {
 		return false, "", "", args, nil
 	}
@@ -47,7 +51,11 @@ func dispatchSubcommand(args []string) (handled bool, verb, resumeSid string, re
 	if err != nil {
 		return true, "", "", nil, err
 	}
-	return true, "", "", nil, runSessionSubcommand(args[0], args[1:], cwd, home)
+	upstream := ""
+	if upstreamDefault != nil {
+		upstream = upstreamDefault(cwd)
+	}
+	return true, "", "", nil, runSessionSubcommand(args[0], args[1:], cwd, home, upstream)
 }
 
 // resumeSubcommand picks the session id for the resume verb: an explicit
@@ -71,7 +79,7 @@ func resumeSubcommand(args []string) (sid string, rest []string, err error) {
 	if err != nil {
 		return "", nil, err
 	}
-	gitDir, ok := resolveRecordGitDir(cwd)
+	gitDir, ok := ResolveRecordGitDir(cwd)
 	if !ok {
 		return "", nil, fmt.Errorf("resume: no git or jj repository at %s", cwd)
 	}
@@ -82,9 +90,10 @@ func resumeSubcommand(args []string) (sid string, rest []string, err error) {
 	return sid, rest, nil
 }
 
-// runSessionSubcommand executes a host-only session verb against cwd's repo.
-func runSessionSubcommand(sub string, args []string, cwd, home string) error {
-	gitDir, ok := resolveRecordGitDir(cwd)
+// runSessionSubcommand executes a host-only session verb against cwd's
+// repo; upstreamDefault is the default for upload's --upstream flag.
+func runSessionSubcommand(sub string, args []string, cwd, home, upstreamDefault string) error {
+	gitDir, ok := ResolveRecordGitDir(cwd)
 	if !ok {
 		return fmt.Errorf("no git or jj repository at %s", cwd)
 	}
@@ -112,7 +121,7 @@ func runSessionSubcommand(sub string, args []string, cwd, home string) error {
 	case "upload":
 		fs := verbFlagSet("upload", "runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>")
 		session := fs.String("session", "", "session id (default: latest)")
-		upstream := fs.String("upstream", fileRecordUpstream(cwd),
+		upstream := fs.String("upstream", upstreamDefault,
 			"upstream ref bounding the bundle (default: origin's default branch)")
 		fs.Parse(args)
 		if fs.NArg() != 1 {
@@ -148,22 +157,12 @@ func verbFlagSet(verb, synopsis string) *flag.FlagSet {
 	return fs
 }
 
-// fileRecordUpstream reads the project options file's recordUpstream — the
-// same default the --record-upstream flag gets on the sandbox path.
-func fileRecordUpstream(cwd string) string {
-	opts, err := loadOptionsFile(cwd)
-	if err != nil {
-		return ""
-	}
-	return opts.RecordUpstream
-}
-
-// autoForkSession returns ["--fork-session"] when args resume a session
+// AutoForkSession returns ["--fork-session"] when args resume a session
 // that was recorded by a different clone (e.g. fetched via download):
 // continuing the author's session id would collide with their refs. A
 // session recorded by this clone continues — from any of its worktrees —
 // and stickiness keeps recording it.
-func autoForkSession(cwd string, args []string) []string {
+func AutoForkSession(cwd string, args []string) []string {
 	sid := resumeArg(args)
 	if sid == "" {
 		return nil
@@ -173,7 +172,7 @@ func autoForkSession(cwd string, args []string) []string {
 			return nil
 		}
 	}
-	gitDir, ok := resolveRecordGitDir(cwd)
+	gitDir, ok := ResolveRecordGitDir(cwd)
 	if !ok {
 		return nil
 	}
@@ -496,7 +495,7 @@ func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
 	// Materialize the transcript into the repo-scoped sessions dir so
 	// `claude --resume` (under runclaude) finds it from any worktree of
 	// this clone. Replaying under runclaude forks automatically when the
-	// session was recorded by another clone (see autoForkSession); the
+	// session was recorded by another clone (see AutoForkSession); the
 	// local recorder never extends foreign refs (recorder id mismatch).
 	transcript, err := g.blobBytes(recordRefPrefix+sid+"/meta", "transcript.jsonl")
 	if err != nil {

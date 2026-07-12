@@ -1,4 +1,4 @@
-package main
+package record
 
 import (
 	"os"
@@ -92,7 +92,7 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	// Transcript materialized into the clone's repo-scoped sessions dir —
 	// the review worktree sees it via the container bind, and its size must
 	// equal the recorded blob (it is the resume offset).
-	tfile := filepath.Join(transcriptDir(home2, clone), e.session+".jsonl")
+	tfile := filepath.Join(TranscriptDir(home2, clone), e.session+".jsonl")
 	fi, err := os.Stat(tfile)
 	if err != nil {
 		t.Fatalf("transcript not materialized: %v", err)
@@ -106,17 +106,17 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	// recorder id cannot match the author's); the author's own clone does
 	// not fork.
 	resume := []string{"--resume", e.session}
-	if got := autoForkSession(clone, resume); len(got) != 1 || got[0] != "--fork-session" {
-		t.Errorf("autoForkSession in reviewer clone: %v", got)
+	if got := AutoForkSession(clone, resume); len(got) != 1 || got[0] != "--fork-session" {
+		t.Errorf("AutoForkSession in reviewer clone: %v", got)
 	}
-	if got := autoForkSession(e.repo, resume); got != nil {
-		t.Errorf("autoForkSession in recording clone: %v", got)
+	if got := AutoForkSession(e.repo, resume); got != nil {
+		t.Errorf("AutoForkSession in recording clone: %v", got)
 	}
-	if got := autoForkSession(clone, []string{"--resume", e.session, "--fork-session"}); got != nil {
-		t.Errorf("autoForkSession with explicit flag: %v", got)
+	if got := AutoForkSession(clone, []string{"--resume", e.session, "--fork-session"}); got != nil {
+		t.Errorf("AutoForkSession with explicit flag: %v", got)
 	}
-	if got := autoForkSession(clone, []string{"--resume", "not-recorded"}); got != nil {
-		t.Errorf("autoForkSession for unrecorded sid: %v", got)
+	if got := AutoForkSession(clone, []string{"--resume", "not-recorded"}); got != nil {
+		t.Errorf("AutoForkSession for unrecorded sid: %v", got)
 	}
 
 	// --at selects an earlier checkpoint.
@@ -156,21 +156,21 @@ func TestListAndRemoveSessions(t *testing.T) {
 }
 
 func TestDispatchSubcommand(t *testing.T) {
-	handled, verb, sid, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
+	handled, verb, sid, rest, err := DispatchSubcommand([]string{"new", "--", "-p", "hi"}, nil)
 	if handled || verb != "new" || sid != "" || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
 		t.Errorf("new: handled=%v verb=%q sid=%q rest=%v err=%v", handled, verb, sid, rest, err)
 	}
 	// An explicit resume id needs no repo; remaining args feed flag parsing.
-	handled, verb, sid, rest, err = dispatchSubcommand([]string{"resume", "abc", "--restrict-net=false"})
+	handled, verb, sid, rest, err = DispatchSubcommand([]string{"resume", "abc", "--restrict-net=false"}, nil)
 	if handled || verb != "resume" || sid != "abc" || err != nil || !reflect.DeepEqual(rest, []string{"--restrict-net=false"}) {
 		t.Errorf("resume abc: handled=%v verb=%q sid=%q rest=%v err=%v", handled, verb, sid, rest, err)
 	}
 	// Anything else passes through untouched to regular flag parsing —
 	// including `--` escaping a command named like a verb.
 	for _, args := range [][]string{nil, {"--restrict-net=false"}, {"--", "list"}, {"bash", "-c", "true"}} {
-		handled, verb, sid, rest, err := dispatchSubcommand(args)
+		handled, verb, sid, rest, err := DispatchSubcommand(args, nil)
 		if handled || verb != "" || sid != "" || err != nil || !reflect.DeepEqual(rest, args) {
-			t.Errorf("dispatchSubcommand(%v): handled=%v verb=%q sid=%q rest=%v err=%v",
+			t.Errorf("DispatchSubcommand(%v): handled=%v verb=%q sid=%q rest=%v err=%v",
 				args, handled, verb, sid, rest, err)
 		}
 	}
@@ -197,7 +197,7 @@ func TestSessionSubcommands(t *testing.T) {
 	home := t.TempDir()
 
 	bundleDir := t.TempDir()
-	if err := runSessionSubcommand("upload", []string{"--upstream", "main", bundleDir}, e.repo, home); err != nil {
+	if err := runSessionSubcommand("upload", []string{"--upstream", "main", bundleDir}, e.repo, home, ""); err != nil {
 		t.Fatal(err)
 	}
 	bundle := filepath.Join(bundleDir, e.session+".bundle")
@@ -211,20 +211,20 @@ func TestSessionSubcommands(t *testing.T) {
 		t.Fatalf("clone: %v: %s", err, out)
 	}
 	dest := filepath.Join(cloneParent, "review")
-	if err := runSessionSubcommand("download", []string{"--dest", dest, bundle}, clone, home); err != nil {
+	if err := runSessionSubcommand("download", []string{"--dest", dest, bundle}, clone, home, ""); err != nil {
 		t.Fatal(err)
 	}
 	if data, err := os.ReadFile(filepath.Join(dest, "b.txt")); err != nil || string(data) != "v2\n" {
 		t.Errorf("downloaded worktree b.txt: %q, %v", data, err)
 	}
 
-	if err := runSessionSubcommand("list", []string{"extra"}, e.repo, home); err == nil {
+	if err := runSessionSubcommand("list", []string{"extra"}, e.repo, home, ""); err == nil {
 		t.Error("list accepted positional args")
 	}
-	if err := runSessionSubcommand("rm", nil, e.repo, home); err == nil {
+	if err := runSessionSubcommand("rm", nil, e.repo, home, ""); err == nil {
 		t.Error("rm accepted empty args")
 	}
-	if err := runSessionSubcommand("rm", []string{e.session}, e.repo, home); err != nil {
+	if err := runSessionSubcommand("rm", []string{e.session}, e.repo, home, ""); err != nil {
 		t.Fatal(err)
 	}
 	g := &gitRepo{gitDir: filepath.Join(e.repo, ".git")}

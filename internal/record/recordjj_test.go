@@ -1,4 +1,4 @@
-package main
+package record
 
 import (
 	"log"
@@ -67,12 +67,12 @@ func runJJ(t *testing.T, dir string, args ...string) string {
 
 func TestRecorderJJNativeCheckpoints(t *testing.T) {
 	repo := testJJRepo(t)
-	gitDir, ok := resolveRecordGitDir(repo)
+	gitDir, ok := ResolveRecordGitDir(repo)
 	if !ok {
-		t.Fatalf("resolveRecordGitDir(%s) failed", repo)
+		t.Fatalf("ResolveRecordGitDir(%s) failed", repo)
 	}
 	home := t.TempDir()
-	rec, err := newRecorder(gitDir, repo, home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec, err := NewRecorder(gitDir, repo, home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestRecorderJJNativeCheckpoints(t *testing.T) {
 	opsBefore := runJJ(t, repo, "op", "log", "--no-graph", "--ignore-working-copy", "-T", `id.short() ++ "\n"`)
 
 	sid := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	transcript := filepath.Join(rec.projectsDir, sid+".jsonl")
+	transcript := filepath.Join(rec.ProjectsDir, sid+".jsonl")
 	appendEntries := func(useUUID, resultUUID string) {
 		t.Helper()
 		lines := entryLine(t, "assistant", useUUID, []map[string]any{
@@ -168,12 +168,12 @@ func TestRecorderJJStaleWorkspace(t *testing.T) {
 	runJJ(t, repo, "new", "-m", "child")
 	changeID := runJJ(t, repo, "log", "--no-graph", "--ignore-working-copy", "-r", "@", "-T", "change_id")
 
-	gitDir, ok := resolveRecordGitDir(repo)
+	gitDir, ok := ResolveRecordGitDir(repo)
 	if !ok {
-		t.Fatalf("resolveRecordGitDir(%s) failed", repo)
+		t.Fatalf("ResolveRecordGitDir(%s) failed", repo)
 	}
 	home := t.TempDir()
-	rec, err := newRecorder(gitDir, repo, home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec, err := NewRecorder(gitDir, repo, home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestRecorderJJStaleWorkspace(t *testing.T) {
 	}, map[string]any{"cwd": repo}) + entryLine(t, "user", "s2", []map[string]any{
 		{"type": "tool_result", "tool_use_id": "t1"},
 	}, map[string]any{"cwd": repo})
-	if err := os.WriteFile(filepath.Join(rec.projectsDir, sid+".jsonl"), []byte(lines), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(rec.ProjectsDir, sid+".jsonl"), []byte(lines), 0644); err != nil {
 		t.Fatal(err)
 	}
 	rec.scanOnce()
@@ -231,7 +231,7 @@ func TestRecorderJJBrokenFallsBack(t *testing.T) {
 	}
 	e := newTestEnv(t)
 	ws := addJJWorkspace(t, e.repo)
-	rec, err := newRecorder(filepath.Join(e.repo, ".git"), ws, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	rec, err := NewRecorder(filepath.Join(e.repo, ".git"), ws, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestRecorderJJBrokenFallsBack(t *testing.T) {
 	}, map[string]any{"cwd": ws}) + entryLine(t, "user", "b2", []map[string]any{
 		{"type": "tool_result", "tool_use_id": "t1"},
 	}, map[string]any{"cwd": ws})
-	if err := os.WriteFile(filepath.Join(rec.projectsDir, sid+".jsonl"), []byte(lines), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(rec.ProjectsDir, sid+".jsonl"), []byte(lines), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(ws, "f.txt"), []byte("x\n"), 0644); err != nil {
