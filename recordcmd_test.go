@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,27 +88,35 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	if err != nil || string(data) != "v2\n" {
 		t.Errorf("worktree b.txt: %q, %v", data, err)
 	}
-	// Transcript materialized for claude --resume from the worktree cwd.
-	destAbs, _ := filepath.Abs(dest)
-	tfile := filepath.Join(transcriptDir(home2, destAbs), e.session+".jsonl")
-	if _, err := os.Stat(tfile); err != nil {
-		t.Errorf("transcript not materialized: %v", err)
-	}
-	// Foreign marker prevents the reviewer's recorder from extending the
-	// author's refs.
-	cacheDir, err := cacheDirFor(destAbs)
+	// Transcript materialized into the clone's repo-scoped sessions dir —
+	// the review worktree sees it via the container bind, and its size must
+	// equal the recorded blob (it is the resume offset).
+	tfile := filepath.Join(transcriptDir(home2, clone), e.session+".jsonl")
+	fi, err := os.Stat(tfile)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("transcript not materialized: %v", err)
 	}
-	stateData, err := os.ReadFile(filepath.Join(cacheDir, "record", e.session+".state"))
-	if err != nil {
-		t.Fatalf("foreign marker: %v", err)
+	tip := cg.readRef(recordRefPrefix + e.session + "/meta")
+	if n, err := cg.blobSize(tip, "transcript.jsonl"); err != nil || n != fi.Size() {
+		t.Errorf("materialized transcript %d bytes, blob %d (%v)", fi.Size(), n, err)
 	}
-	var st recordState
-	if json.Unmarshal(stateData, &st) != nil || !st.Foreign {
-		t.Errorf("state not marked foreign: %s", stateData)
+
+	// The reviewer's clone resumes with an automatic --fork-session (its
+	// recorder id cannot match the author's); the author's own clone does
+	// not fork.
+	resume := []string{"--resume", e.session}
+	if got := autoForkSession(clone, resume); len(got) != 1 || got[0] != "--fork-session" {
+		t.Errorf("autoForkSession in reviewer clone: %v", got)
 	}
-	os.RemoveAll(cacheDir) // cacheDirFor points at the real user cache
+	if got := autoForkSession(e.repo, resume); got != nil {
+		t.Errorf("autoForkSession in recording clone: %v", got)
+	}
+	if got := autoForkSession(clone, []string{"--resume", e.session, "--fork-session"}); got != nil {
+		t.Errorf("autoForkSession with explicit flag: %v", got)
+	}
+	if got := autoForkSession(clone, []string{"--resume", "not-recorded"}); got != nil {
+		t.Errorf("autoForkSession for unrecorded sid: %v", got)
+	}
 
 	// --at selects an earlier checkpoint.
 	dest2 := filepath.Join(cloneParent, "review-v1")
@@ -119,10 +126,6 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	data, err = os.ReadFile(filepath.Join(dest2, "b.txt"))
 	if err != nil || string(data) != "v1\n" {
 		t.Errorf("--at u3 worktree b.txt: %q, %v", data, err)
-	}
-	destAbs2, _ := filepath.Abs(dest2)
-	if cacheDir2, err := cacheDirFor(destAbs2); err == nil {
-		os.RemoveAll(cacheDir2)
 	}
 }
 
@@ -139,7 +142,7 @@ func TestListAndRemoveSessions(t *testing.T) {
 		t.Fatalf("resolveSessionID: %q, %v", sid, err)
 	}
 
-	if err := removeSession(g, e.session, e.repo); err != nil {
+	if err := removeSession(g, e.session); err != nil {
 		t.Fatal(err)
 	}
 	refs, err := g.refNames(recordRefPrefix + e.session)

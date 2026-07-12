@@ -127,8 +127,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	repo := testRepo(t)
 	home := t.TempDir()
-	cache := t.TempDir()
-	rec, err := newRecorder(filepath.Join(repo, ".git"), repo, home, cache, true, "origin/main", nil, log.New(os.Stderr, "", 0))
+	rec, err := newRecorder(filepath.Join(repo, ".git"), repo, home, true, "origin/main", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +297,7 @@ func TestRecorderStickyResume(t *testing.T) {
 
 	// New recorder WITHOUT --record must resume via stickiness, from the
 	// recorded offset (no duplicate transcript commits).
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, t.TempDir(), false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +358,7 @@ func TestRecorderNotStickyForOtherClone(t *testing.T) {
 	if err := os.WriteFile(idPath, []byte("other-clone\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, t.TempDir(), false, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +376,7 @@ func TestRecorderLockExcludesSecond(t *testing.T) {
 		t.Fatalf("first recorder did not claim: %d", len(e.rec.sessions))
 	}
 	// Same cacheDir (same cwd) — second recorder must not claim the locked session.
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, e.rec.stateDir[:len(e.rec.stateDir)-len("/record")], true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,13 +392,190 @@ func TestRecorderIgnoresPreexistingSessions(t *testing.T) {
 	// A file that predates the recorder and has no refs: not claimed even
 	// with --record.
 	e.append(t, entryLine(t, "user", "u1", "old", nil))
-	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, t.TempDir(), true, "", nil, log.New(os.Stderr, "", 0))
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec2.scanOnce()
 	if len(rec2.sessions) != 0 {
 		t.Error("claimed a session that predates the recorder")
+	}
+}
+
+// addWorktree creates a linked git worktree of e.repo and returns its path.
+func addWorktree(t *testing.T, repo string) string {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "wt")
+	cmd := exec.Command("git", "-C", repo, "worktree", "add", "-q", "--detach", wt)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v: %s", err, out)
+	}
+	return wt
+}
+
+func TestRecorderRepoScopedSessionsDir(t *testing.T) {
+	e := newTestEnv(t)
+	wt := addWorktree(t, e.repo)
+	rec2, err := newRecorder(filepath.Join(wt, ".git"), wt, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both worktrees watch the main worktree's project dir and share the
+	// clone-global state dir (per-sid flocks exclude across worktrees).
+	if rec2.projectsDir != e.rec.projectsDir {
+		t.Errorf("projectsDir differs across worktrees: %q vs %q", rec2.projectsDir, e.rec.projectsDir)
+	}
+	if rec2.stateDir != e.rec.stateDir {
+		t.Errorf("stateDir differs across worktrees: %q vs %q", rec2.stateDir, e.rec.stateDir)
+	}
+	if rec2.id != e.rec.id {
+		t.Errorf("recorder id differs across worktrees: %q vs %q", rec2.id, e.rec.id)
+	}
+}
+
+func TestRecorderClaimGateByCwd(t *testing.T) {
+	e := newTestEnv(t)
+	// Entries written from another worktree: this recorder must not claim,
+	// even with --record.
+	other := filepath.Join(t.TempDir(), "elsewhere")
+	e.append(t, entryLine(t, "user", "u1", "hi", map[string]any{"cwd": other}))
+	e.rec.scanOnce()
+	if len(e.rec.sessions) != 0 {
+		t.Fatal("claimed a session running in another worktree")
+	}
+	// The session returns to this worktree: now it is ours. (A subdirectory
+	// cwd still counts as within the worktree.)
+	e.append(t, entryLine(t, "user", "u2", "back", map[string]any{"cwd": filepath.Join(e.repo, "sub")}))
+	e.rec.scanOnce()
+	if len(e.rec.sessions) != 1 {
+		t.Fatal("did not claim after the session returned to this worktree")
+	}
+	e.rec.Close()
+}
+
+func TestRecorderHandoffOnCwdChange(t *testing.T) {
+	e := newTestEnv(t)
+	e.append(t,
+		entryLine(t, "assistant", "u1", []map[string]any{
+			{"type": "tool_use", "id": "t1", "name": "Write"},
+		}, map[string]any{"cwd": e.repo}),
+		entryLine(t, "user", "u2", []map[string]any{
+			{"type": "tool_result", "tool_use_id": "t1"},
+		}, map[string]any{"cwd": e.repo}),
+	)
+	os.WriteFile(filepath.Join(e.repo, "b.txt"), []byte("1\n"), 0644)
+	e.rec.scanOnce()
+	if len(e.rec.sessions) != 1 {
+		t.Fatal("session not claimed")
+	}
+	ours, _ := os.Stat(e.transcript)
+
+	// The session continues from another worktree: release without
+	// consuming the foreign entries, so that worktree's recorder resumes
+	// exactly at the blob offset.
+	wt := addWorktree(t, e.repo)
+	e.clock = e.clock.Add(2 * time.Second)
+	e.append(t, entryLine(t, "user", "u3", "over there", map[string]any{"cwd": wt}))
+	e.rec.scanOnce()
+	if len(e.rec.sessions) != 0 {
+		t.Fatal("session not released after moving to another worktree")
+	}
+	tip := e.rec.git.readRef(recordRefPrefix + e.session + "/meta")
+	n, err := e.rec.git.blobSize(tip, "transcript.jsonl")
+	if err != nil || n != ours.Size() {
+		t.Errorf("blob covers %d bytes, want %d (up to the foreign entry; %v)", n, ours.Size(), err)
+	}
+	// No tree ref for the foreign uuid.
+	for _, ref := range e.refs(t) {
+		if strings.HasSuffix(ref, "/u3") {
+			t.Errorf("foreign entry got a tree ref: %s", ref)
+		}
+	}
+
+	// The other worktree's recorder claims it (sticky: same clone) and
+	// resumes from the blob offset.
+	rec2, err := newRecorder(filepath.Join(wt, ".git"), wt, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Now().Add(time.Hour)
+	rec2.now = func() time.Time { return clock }
+	os.WriteFile(filepath.Join(wt, "c.txt"), []byte("wt\n"), 0644)
+	e.append(t,
+		entryLine(t, "assistant", "u4", []map[string]any{
+			{"type": "tool_use", "id": "t2", "name": "Write"},
+		}, map[string]any{"cwd": wt}),
+		entryLine(t, "user", "u5", []map[string]any{
+			{"type": "tool_result", "tool_use_id": "t2"},
+		}, map[string]any{"cwd": wt}),
+	)
+	rec2.scanOnce()
+	if len(rec2.sessions) != 1 {
+		t.Fatal("other worktree's recorder did not claim the handed-off session")
+	}
+	s := rec2.sessions[e.session]
+	if s.state.Offset <= n {
+		t.Errorf("offset %d did not advance past handoff point %d", s.state.Offset, n)
+	}
+	var u5 string
+	for _, ref := range e.refs(t) {
+		if strings.HasSuffix(ref, "/u5") {
+			u5 = ref
+		}
+	}
+	if u5 == "" {
+		t.Fatalf("no checkpoint from the new worktree; refs: %v", e.refs(t))
+	}
+	// The checkpoint snapshots the new worktree's tree.
+	if out, err := rec2.git.showBlob(u5, "c.txt"); err != nil || out != "wt" {
+		t.Errorf("checkpoint c.txt from new worktree: %q, %v", out, err)
+	}
+	rec2.Close()
+}
+
+func TestRecorderMaterializesTranscript(t *testing.T) {
+	e := newTestEnv(t)
+	e.append(t, entryLine(t, "user", "u1", "hello", nil))
+	e.rec.scanOnce()
+	e.rec.Close()
+
+	// Claude purged the transcript (cleanupPeriodDays): a new recorder
+	// restores it from the session branch, byte-identical to the blob.
+	if err := os.Remove(e.transcript); err != nil {
+		t.Fatal(err)
+	}
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(e.transcript)
+	if err != nil {
+		t.Fatalf("transcript not materialized: %v", err)
+	}
+	tip := rec2.git.readRef(recordRefPrefix + e.session + "/meta")
+	if n, err := rec2.git.blobSize(tip, "transcript.jsonl"); err != nil || n != int64(len(data)) {
+		t.Errorf("materialized %d bytes, blob %d (%v)", len(data), n, err)
+	}
+}
+
+func TestRecorderFlushesTrailingBookkeeping(t *testing.T) {
+	e := newTestEnv(t)
+	e.append(t, entryLine(t, "user", "u1", "hello", nil))
+	e.rec.scanOnce()
+	e.clock = e.clock.Add(2 * time.Second)
+	// ai-title updates carry no uuid and arrive after the last real entry;
+	// the final forced flush must still commit them.
+	e.append(t, `{"type":"ai-title","aiTitle":"Greet the user","sessionId":"`+e.session+`"}`+"\n")
+	e.rec.scanOnce()
+	e.rec.Close()
+
+	got, err := e.rec.git.showBlob(recordRefPrefix+e.session+"/meta", "transcript.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "ai-title") {
+		t.Errorf("trailing bookkeeping line missing from final blob:\n%s", got)
 	}
 }
 

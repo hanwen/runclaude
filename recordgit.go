@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -195,9 +196,41 @@ func (g *gitRepo) blobTree(entries map[string]string) (string, error) {
 	return g.runInput(b.String(), "mktree")
 }
 
-// showBlob returns the content of <rev>:<path>.
+// showBlob returns the content of <rev>:<path>, trimmed.
 func (g *gitRepo) showBlob(rev, path string) (string, error) {
 	return g.run("show", rev+":"+path)
+}
+
+// blobBytes returns the exact content of <rev>:<path>. Use this when the
+// byte count matters (transcript blobs: size == resume offset).
+func (g *gitRepo) blobBytes(rev, path string) ([]byte, error) {
+	cmd := g.command("cat-file", "blob", rev+":"+path)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("git cat-file blob %s:%s: %v: %s", rev, path, err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("git cat-file blob %s:%s: %w", rev, path, err)
+	}
+	return out, nil
+}
+
+// commonGitDir returns the repo's common git dir as an absolute path: the
+// main .git dir shared by all linked worktrees.
+func (g *gitRepo) commonGitDir() (string, error) {
+	common, err := g.run("rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(common) {
+		// rev-parse resolves relative to the process cwd (the worktree).
+		base := g.workTree
+		if base == "" {
+			base, _ = os.Getwd()
+		}
+		common = filepath.Join(base, common)
+	}
+	return filepath.Clean(common), nil
 }
 
 // ensureIdent installs a fallback identity when the repo has none

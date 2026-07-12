@@ -79,9 +79,7 @@ git clone -q "$REPO" "$CLONE"
 (cd "$CLONE" && "$WORKDIR/runclaude" --download "$WORKDIR/$SID.bundle" --dest "$WORKDIR/review")
 [[ "$(cat "$WORKDIR/review/b.txt")" == "v2" ]] || fail "downloaded worktree content"
 
-# Clean up per-path state the download left in the real home: the review
-# worktree's cache dir (foreign marker) and its materialized transcript.
-REVHASH=$(printf %s "$WORKDIR/review" | sha256sum | cut -c1-16)
-rm -rf "$HOME/.cache/runclaude/review-$REVHASH"
-rm -rf "$HOME/.claude/projects/$(printf %s "$WORKDIR/review" | tr -c 'A-Za-z0-9' '-')"
+# The download materialized the transcript into the clone's repo-scoped
+# sessions dir in the real home; clean it up.
+rm -rf "$HOME/.claude/projects/$(printf %s "$CLONE" | tr -c 'A-Za-z0-9' '-')"
 echo "PASS test-record.sh"

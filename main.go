@@ -899,7 +899,14 @@ func mainErr() error {
 				cmd = append(cmd, "--setting-sources", "user")
 			}
 			cmd = append(cmd, []string(claudeFlags)...)
-			cfg.Command = append(cmd, flag.Args()...)
+			cmd = append(cmd, flag.Args()...)
+			// Resuming a session recorded by a different clone (fetched via
+			// --download) must fork: continuing the author's session id
+			// would collide with their refs. Same-clone sessions continue.
+			if !onlyMode {
+				cmd = append(cmd, autoForkSession(cwd, flag.Args())...)
+			}
+			cfg.Command = cmd
 		}
 		if bearer != "" || apiKey != "" {
 			if err := writeStubCredentials(credDir); err != nil {
@@ -980,11 +987,21 @@ func mainErr() error {
 			if err != nil {
 				return err
 			}
-			r, err := newRecorder(gitDir, cwd, home, cacheDir, *record, *recordUpstream, recordExclude, recordLogger)
+			r, err := newRecorder(gitDir, cwd, home, *record, *recordUpstream, recordExclude, recordLogger)
 			if err != nil {
 				log.Printf("warning: --record: %v", err)
 			} else {
 				rec = r
+				// Sessions are repo-scoped: bind the shared dir (the main
+				// worktree's project dir) over this cwd's project dir inside
+				// the container, so any worktree of the clone can list and
+				// resume the clone's sessions. Appended last: it must mount
+				// on top of the ~/.claude binds.
+				if cwdDir := transcriptDir(home, cwd); rec.projectsDir != cwdDir {
+					if err := os.MkdirAll(cwdDir, 0700); err == nil {
+						cfg.Binds = append(cfg.Binds, Bind{Path: rec.projectsDir, Dest: cwdDir})
+					}
+				}
 				go rec.run()
 				if *record {
 					log.Printf("record: on — snapshots under refs/runclaude/, log: %s", recordLogPath)

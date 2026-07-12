@@ -5,9 +5,10 @@ package main
 // "conversation + tree state at each step" (see docs/session-recording.md).
 //
 // The recorder runs on the host (mainErr) and tails the session transcript
-// JSONL that the sandboxed claude writes into the live-bound
-// ~/.claude/projects/<encoded-cwd>/ dir. Per mutating tool result it
-// snapshots the worktree as a commit at
+// JSONL that the sandboxed claude writes into the repo-scoped sessions dir
+// (the main worktree's ~/.claude/projects/ entry, bind-mounted over the
+// current cwd's inside the container — see repoSessionsDir). Per mutating
+// tool result it snapshots the worktree as a commit at
 //
 //	refs/runclaude/<sid>/tree/<utc-ts>/<msg-uuid>
 //
@@ -67,6 +68,18 @@ func transcriptDir(home, cwd string) string {
 	return filepath.Join(home, ".claude", "projects", encodeProjectDir(cwd))
 }
 
+// repoSessionsDir returns the transcript dir shared by all worktrees of a
+// repo: the main worktree's project dir. Inside the container it is
+// bind-mounted over the current cwd's project dir, so sessions started in
+// any worktree of the clone are visible (and resumable) from every other.
+// Falls back to cwd's own dir when no main worktree resolves (bare repos).
+func repoSessionsDir(home, cwd, commonDir string) string {
+	if filepath.Base(commonDir) == ".git" {
+		return transcriptDir(home, filepath.Dir(commonDir))
+	}
+	return transcriptDir(home, cwd)
+}
+
 // recordState is the cached per-session recorder state. It is advisory:
 // the authoritative resume point is the size of the tip's transcript blob.
 type recordState struct {
@@ -74,9 +87,6 @@ type recordState struct {
 	LastTree       string `json:"lastTree,omitempty"`
 	LastCheckpoint string `json:"lastCheckpoint,omitempty"`
 	Tip            string `json:"tip,omitempty"` // <sid>/meta branch tip
-	// Foreign marks sessions fetched via --download; the local recorder
-	// never extends them (doing so would fork the author's refs).
-	Foreign bool `json:"foreign,omitempty"`
 }
 
 type sessionMeta struct {
@@ -98,6 +108,7 @@ type transcriptEntry struct {
 	Type      string `json:"type"`
 	UUID      string `json:"uuid"`
 	Timestamp string `json:"timestamp"`
+	Cwd       string `json:"cwd"`
 	Message   *struct {
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
@@ -116,8 +127,9 @@ type contentBlock struct {
 type recorder struct {
 	git         *gitRepo
 	id          string // per-clone recording identity (recorderID)
-	projectsDir string // host dir with <sid>.jsonl files
-	stateDir    string // <cacheDir>/record
+	cwd         string // worktree this recorder snapshots
+	projectsDir string // host dir with <sid>.jsonl files (repo-scoped)
+	stateDir    string // <git-common-dir>/runclaude/record
 	recordAll   bool   // --record: claim sessions started under this run
 	upstream    string // configured upstream for meta
 	start       time.Time
@@ -130,8 +142,13 @@ type recorder struct {
 
 	mu       sync.Mutex
 	sessions map[string]*recSession
-	done     chan struct{}
-	wg       sync.WaitGroup
+	// skipped caches claim refusals keyed by file size: the projects dir is
+	// shared by all worktrees of the clone, so most files are not ours and
+	// must not cost a git sticky-check per 300ms scan. Growth re-evaluates
+	// (the tail cwd may have become ours).
+	skipped map[string]int64
+	done    chan struct{}
+	wg      sync.WaitGroup
 }
 
 type recSession struct {
@@ -146,10 +163,28 @@ type recSession struct {
 	lastFlush    time.Time
 	metaBlob     string // write-once meta.json blob, reused per commit
 	size         int64  // last observed file size
+	// flushedOffset is the offset the tip transcript blob covers; a forced
+	// flush commits when Offset moved past it even with no pending uuids
+	// (trailing bookkeeping lines like ai-title carry no uuid).
+	flushedOffset int64
+	// handoff marks a session whose new entries come from another worktree:
+	// release it so that worktree's recorder can claim it.
+	handoff bool
 }
 
-func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream string, extraExcludes []string, logger *log.Logger) (*recorder, error) {
-	stateDir := filepath.Join(cacheDir, "record")
+func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extraExcludes []string, logger *log.Logger) (*recorder, error) {
+	git := &gitRepo{
+		gitDir:   gitDir,
+		workTree: cwd,
+	}
+	common, err := git.commonGitDir()
+	if err != nil {
+		return nil, err
+	}
+	// State (locks, offsets, private indexes) is clone-global, like the
+	// recorder id: the per-sid flock must exclude recorders in *other
+	// worktrees* of the same clone, and it survives repo moves.
+	stateDir := filepath.Join(common, "runclaude", "record")
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
@@ -161,29 +196,20 @@ func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream st
 	if err := os.WriteFile(excludesFile, []byte(strings.Join(patterns, "\n")+"\n"), 0600); err != nil {
 		return nil, err
 	}
-	git := &gitRepo{
-		gitDir:       gitDir,
-		workTree:     cwd,
-		excludesFile: excludesFile,
-	}
+	git.excludesFile = excludesFile
 	git.ensureIdent()
 	id, err := recorderID(git)
 	if err != nil {
 		return nil, fmt.Errorf("recorder id: %w", err)
 	}
-	projectsDir := transcriptDir(home, cwd)
-	preexisting := map[string]bool{}
-	if entries, err := os.ReadDir(projectsDir); err == nil {
-		for _, e := range entries {
-			if name, ok := strings.CutSuffix(e.Name(), ".jsonl"); ok {
-				preexisting[name] = true
-			}
-		}
+	projectsDir := repoSessionsDir(home, cwd, common)
+	if err := os.MkdirAll(projectsDir, 0700); err != nil {
+		return nil, err
 	}
-	return &recorder{
+	r := &recorder{
 		git:         git,
 		id:          id,
-		preexisting: preexisting,
+		cwd:         cwd,
 		projectsDir: projectsDir,
 		stateDir:    stateDir,
 		recordAll:   recordAll,
@@ -192,8 +218,47 @@ func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream st
 		logger:      logger,
 		now:         time.Now,
 		sessions:    map[string]*recSession{},
+		skipped:     map[string]int64{},
 		done:        make(chan struct{}),
-	}, nil
+	}
+	r.materializeTranscripts()
+	preexisting := map[string]bool{}
+	if entries, err := os.ReadDir(projectsDir); err == nil {
+		for _, e := range entries {
+			if name, ok := strings.CutSuffix(e.Name(), ".jsonl"); ok {
+				preexisting[name] = true
+			}
+		}
+	}
+	r.preexisting = preexisting
+	return r, nil
+}
+
+// materializeTranscripts writes recorded sessions whose live transcript is
+// missing (purged by claude's cleanup, downloaded from another clone, or
+// recorded before sessions became repo-scoped) into the shared projects
+// dir, so `claude --resume` finds them from any worktree.
+func (r *recorder) materializeTranscripts() {
+	ids, err := sessionIDs(r.git)
+	if err != nil {
+		return
+	}
+	for _, sid := range ids {
+		path := filepath.Join(r.projectsDir, sid+".jsonl")
+		if _, err := os.Stat(path); err == nil {
+			continue
+		}
+		data, err := r.git.blobBytes(recordRefPrefix+sid+"/meta", "transcript.jsonl")
+		if err != nil {
+			r.logger.Printf("record: %s: materialize: %v", sid, err)
+			continue
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			r.logger.Printf("record: %s: materialize: %v", sid, err)
+			continue
+		}
+		r.logger.Printf("record: %s: transcript materialized from %s%s/meta", sid, recordRefPrefix, sid)
+	}
 }
 
 // run polls until Close. Call as a goroutine.
@@ -255,31 +320,53 @@ func (r *recorder) scanOnce() {
 		path := filepath.Join(r.projectsDir, name)
 		s := r.sessions[sid]
 		if s == nil {
-			s = r.maybeClaim(sid, path)
-			if s == nil {
+			if size, err := fileSize(path); err != nil || r.skipped[sid] == size {
+				continue // unchanged since the last claim refusal
+			} else if s = r.maybeClaim(sid, path); s == nil {
+				r.skipped[sid] = size
 				continue
 			}
+			delete(r.skipped, sid)
 			r.sessions[sid] = s
 		}
 		r.pollSession(s)
+		if s.handoff {
+			r.release(s)
+			continue
+		}
 		// Transcript coalescing: flush when at least a second has passed
 		// since the last flush and events are pending.
 		r.flushTranscript(s, false)
 	}
 }
 
+func fileSize(path string) (int64, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return st.Size(), nil
+}
+
 // maybeClaim decides whether this recorder owns sid and, if so, locks and
-// initializes it. Ownership rules: (a) sticky — the session branch exists,
-// its meta.json recorder id is this clone's, and the session is not
-// foreign; or (b) --record was
-// given and the session file appeared after this recorder started.
+// initializes it. Ownership rules: (a) sticky — the session branch exists
+// and its meta.json recorder id is this clone's — or (b) --record was given
+// and the session file appeared after this recorder started; and in either
+// case the transcript's latest entries were written from this worktree
+// (the projects dir is shared by all worktrees of the clone).
 func (r *recorder) maybeClaim(sid, path string) *recSession {
-	sticky := r.isSticky(sid)
 	// Fresh = the session file did not exist when this recorder started.
 	// (Not an mtime comparison: file timestamps come from the kernel's
 	// coarse clock and can lag time.Now() by a scheduler tick.)
 	fresh := r.recordAll && !r.preexisting[sid]
-	if !sticky && !fresh {
+	if !fresh && !r.isSticky(sid) {
+		return nil
+	}
+	// Worktree gate: another worktree's session must be recorded by *its*
+	// runclaude (whose git.workTree snapshots the right tree). Fail open
+	// when no entry carries a cwd — a fresh transcript's first real entry
+	// does, bookkeeping-only files are ours to hold.
+	if c, ok := lastEntryCwd(path); ok && !cwdWithin(c, r.cwd) {
 		return nil
 	}
 	lockPath := filepath.Join(r.stateDir, sid+".state")
@@ -305,11 +392,6 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 	if data, err := os.ReadFile(lockPath); err == nil && len(data) > 0 {
 		json.Unmarshal(data, &s.state)
 	}
-	if s.state.Foreign {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-		return nil
-	}
 	// The state file is a cache; the tip's transcript blob is authoritative
 	// for the resume offset — its size is exactly the bytes recorded, since
 	// flushes truncate at the parse point (crash between update-ref and
@@ -323,11 +405,66 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 			s.metaBlob = blob
 		}
 	}
+	s.flushedOffset = s.state.Offset
 	// File logger only: claude's TUI owns the terminal while sessions are
 	// claimed; the recorded-session summary is printed by mainErr after
 	// the container exits.
 	r.logger.Printf("recording session %s", sid)
 	return s
+}
+
+// release hands a claimed session back (its new entries come from another
+// worktree): flush what was recorded here, drop the flock, and let the
+// other worktree's recorder claim it.
+func (r *recorder) release(s *recSession) {
+	r.flushTranscript(s, true)
+	r.saveState(s)
+	if s.lockFile != nil {
+		s.lockFile.Close()
+	}
+	delete(r.sessions, s.sid)
+	if size, err := fileSize(s.path); err == nil {
+		r.skipped[s.sid] = size
+	}
+	r.logger.Printf("record: %s: continued from another worktree; released", s.sid)
+}
+
+// cwdWithin reports whether entry cwd c belongs to worktree root: equal or
+// underneath it (claude can report subdirectories).
+func cwdWithin(c, root string) bool {
+	return c == root || strings.HasPrefix(c, root+string(filepath.Separator))
+}
+
+// lastEntryCwd returns the cwd of the last transcript entry that has one,
+// looking at the file's tail. ok is false when no entry carries a cwd.
+func lastEntryCwd(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	const tail = 64 << 10
+	st, err := f.Stat()
+	if err != nil {
+		return "", false
+	}
+	off := st.Size() - tail
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	n, _ := f.ReadAt(buf, off)
+	lines := bytes.Split(buf[:n], []byte("\n"))
+	if off > 0 && len(lines) > 0 {
+		lines = lines[1:] // first line is torn mid-entry
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e transcriptEntry
+		if json.Unmarshal(lines[i], &e) == nil && e.Cwd != "" {
+			return e.Cwd, true
+		}
+	}
+	return "", false
 }
 
 // isSticky reports whether sid was previously recorded by this clone.
@@ -351,13 +488,9 @@ func (r *recorder) isSticky(sid string) bool {
 // is shared by linked worktrees — but is local-only: clone/fetch never
 // transfer it.
 func recorderID(g *gitRepo) (string, error) {
-	common, err := g.run("rev-parse", "--git-common-dir")
+	common, err := g.commonGitDir()
 	if err != nil {
 		return "", err
-	}
-	if !filepath.IsAbs(common) {
-		// rev-parse resolves relative to the process cwd (the worktree).
-		common = filepath.Join(g.workTree, common)
 	}
 	path := filepath.Join(common, "runclaude-recorder-id")
 	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
@@ -412,6 +545,18 @@ func (r *recorder) pollSession(s *recSession) {
 	data := buf[:end+1]
 	newOffset := s.state.Offset + int64(end+1)
 
+	// A foreign entry (written from another worktree of this clone — the
+	// transcript dir is repo-scoped) hands the session off only when no
+	// later entry in the batch is ours again: history written elsewhere
+	// stays in the transcript, but a live migration stops consumption
+	// right before the foreign entry so the other worktree's recorder
+	// resumes exactly there (blob size = its offset).
+	if cut, handoff := foreignCutoff(data, r.cwd); handoff {
+		newOffset = s.state.Offset + int64(cut)
+		data = data[:cut]
+		s.handoff = true
+	}
+
 	var snapshotUUIDs []string
 	var lastTS string
 	for {
@@ -441,6 +586,34 @@ func (r *recorder) pollSession(s *recSession) {
 	r.saveState(s)
 }
 
+// foreignCutoff scans a batch of complete JSONL lines and returns the byte
+// offset of the first foreign-cwd line that no ours-cwd line follows, with
+// handoff=true — or (len(data), false) when the batch ends in our worktree
+// (or carries no cwd at all).
+func foreignCutoff(data []byte, root string) (int, bool) {
+	pos, cut := 0, -1
+	for pos < len(data) {
+		nl := bytes.IndexByte(data[pos:], '\n')
+		if nl < 0 {
+			break
+		}
+		line := data[pos : pos+nl]
+		var e transcriptEntry
+		if len(line) > 0 && json.Unmarshal(line, &e) == nil && e.Cwd != "" {
+			if cwdWithin(e.Cwd, root) {
+				cut = -1
+			} else if cut < 0 {
+				cut = pos
+			}
+		}
+		pos += nl + 1
+	}
+	if cut < 0 {
+		return len(data), false
+	}
+	return cut, true
+}
+
 // handleEntry parses one JSONL line. It returns the entry uuid (if any),
 // its timestamp, and whether it should trigger a tree snapshot.
 func (r *recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mutating bool) {
@@ -448,8 +621,13 @@ func (r *recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mut
 	if err := json.Unmarshal(line, &e); err != nil {
 		return "", "", false // unknown/partial format: pass through
 	}
+	if e.Cwd != "" && !cwdWithin(e.Cwd, r.cwd) {
+		// Historic entry from another worktree (see foreignCutoff): part of
+		// the transcript, but its tree state was not made here — no snapshot.
+		return e.UUID, e.Timestamp, false
+	}
 	if e.UUID == "" {
-		return "", "", false // bookkeeping entry (mode, last-prompt, ...)
+		return "", "", false // bookkeeping entry (mode, ai-title, ...)
 	}
 	if e.Message == nil || len(e.Message.Content) == 0 {
 		return e.UUID, e.Timestamp, false
@@ -544,7 +722,12 @@ func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 // unparseable and stays out of the recording.)
 func (r *recorder) flushTranscript(s *recSession, force bool) {
 	if len(s.pendingUUIDs) == 0 {
-		return
+		// A forced flush (session end, handoff) still commits trailing
+		// uuid-less lines — the final ai-title update lands after the last
+		// real entry.
+		if !force || s.state.Offset <= s.flushedOffset {
+			return
+		}
 	}
 	if !force && r.now().Sub(s.lastFlush) < time.Second {
 		return
@@ -585,6 +768,7 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 	}
 	s.state.Tip = sha
 	s.pendingUUIDs = nil
+	s.flushedOffset = s.state.Offset
 	s.lastFlush = r.now()
 	r.saveState(s)
 }

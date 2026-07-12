@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,7 @@ func runRecordCommands(f recordCmdFlags, cwd, home string) (bool, error) {
 	case f.list:
 		return true, listSessions(g)
 	case f.rm != "":
-		return true, removeSession(g, f.rm, cwd)
+		return true, removeSession(g, f.rm)
 	case f.upload != "":
 		sid, err := resolveSessionID(g, f.session)
 		if err != nil {
@@ -47,6 +48,53 @@ func runRecordCommands(f recordCmdFlags, cwd, home string) (bool, error) {
 	default:
 		return true, downloadSession(g, f.download, f.session, f.at, f.dest, cwd, home)
 	}
+}
+
+// autoForkSession returns ["--fork-session"] when args resume a session
+// that was recorded by a different clone (e.g. fetched via --download):
+// continuing the author's session id would collide with their refs. A
+// session recorded by this clone continues — from any of its worktrees —
+// and stickiness keeps recording it.
+func autoForkSession(cwd string, args []string) []string {
+	sid := resumeArg(args)
+	if sid == "" {
+		return nil
+	}
+	for _, a := range args {
+		if a == "--fork-session" {
+			return nil
+		}
+	}
+	gitDir, ok := resolveGitDir(cwd)
+	if !ok {
+		return nil
+	}
+	g := &gitRepo{gitDir: gitDir, workTree: cwd}
+	m, err := readMeta(g, sid)
+	if err != nil {
+		return nil // not a recorded session: claude's own resume semantics
+	}
+	id, err := recorderID(g)
+	if err != nil || m.RecorderID == "" || m.RecorderID == id {
+		return nil
+	}
+	log.Printf("record: session %s was recorded by another clone; forking (--fork-session)", sid)
+	return []string{"--fork-session"}
+}
+
+// resumeArg extracts the session id from claude CLI resume flags.
+func resumeArg(args []string) string {
+	for i, a := range args {
+		switch {
+		case a == "--resume" || a == "-r":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				return args[i+1]
+			}
+		case strings.HasPrefix(a, "--resume="):
+			return strings.TrimPrefix(a, "--resume=")
+		}
+	}
+	return ""
 }
 
 // sessionIDs returns the ids of locally recorded sessions, oldest first.
@@ -106,7 +154,7 @@ func listSessions(g *gitRepo) error {
 	return nil
 }
 
-func removeSession(g *gitRepo, sid, cwd string) error {
+func removeSession(g *gitRepo, sid string) error {
 	refs, err := g.refNames(recordRefPrefix + sid)
 	if err != nil {
 		return err
@@ -119,9 +167,10 @@ func removeSession(g *gitRepo, sid, cwd string) error {
 			return err
 		}
 	}
-	if cacheDir, err := cacheDirFor(cwd); err == nil {
-		os.Remove(filepath.Join(cacheDir, "record", sid+".state"))
-		os.Remove(filepath.Join(cacheDir, "record", sid+".index"))
+	if common, err := g.commonGitDir(); err == nil {
+		stateDir := filepath.Join(common, "runclaude", "record")
+		os.Remove(filepath.Join(stateDir, sid+".state"))
+		os.Remove(filepath.Join(stateDir, sid+".index"))
 	}
 	fmt.Printf("deleted %d refs for session %s\n", len(refs), sid)
 	fmt.Println("objects remain until `git gc --prune`; run it to reclaim space")
@@ -336,32 +385,29 @@ func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
 		return err
 	}
 
-	// Materialize the transcript so `claude --resume` finds it from the
-	// new worktree. --fork-session is mandatory on replay: continuing the
-	// original session id would record onto the author's refs.
-	transcript, err := g.showBlob(recordRefPrefix+sid+"/meta", "transcript.jsonl")
+	// Materialize the transcript into the repo-scoped sessions dir so
+	// `claude --resume` (under runclaude) finds it from any worktree of
+	// this clone. Replaying under runclaude forks automatically when the
+	// session was recorded by another clone (see autoForkSession); the
+	// local recorder never extends foreign refs (recorder id mismatch).
+	transcript, err := g.blobBytes(recordRefPrefix+sid+"/meta", "transcript.jsonl")
 	if err != nil {
 		return err
 	}
-	tdir := transcriptDir(home, destAbs)
+	common, err := g.commonGitDir()
+	if err != nil {
+		return err
+	}
+	tdir := repoSessionsDir(home, destAbs, common)
 	if err := os.MkdirAll(tdir, 0700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tdir, sid+".jsonl"), []byte(transcript+"\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(tdir, sid+".jsonl"), transcript, 0600); err != nil {
 		return err
-	}
-	// Mark the session foreign in the worktree's cache so a recorder there
-	// never extends the author's refs.
-	if cacheDir, err := cacheDirFor(destAbs); err == nil {
-		recDir := filepath.Join(cacheDir, "record")
-		if err := os.MkdirAll(recDir, 0700); err == nil {
-			data, _ := json.Marshal(recordState{Foreign: true})
-			os.WriteFile(filepath.Join(recDir, sid+".state"), data, 0600)
-		}
 	}
 
 	fmt.Printf("session %s checked out at %s (checkpoint %s)\n", sid, dest, strings.TrimPrefix(ref, recordRefPrefix+sid+"/tree/"))
-	fmt.Printf("replay: cd %s && runclaude -- claude --resume %s --fork-session\n", dest, sid)
+	fmt.Printf("replay: cd %s && runclaude -- --resume %s\n", dest, sid)
 	fmt.Printf("step checkpoints: git diff <ref-A> <ref-B> over refs under %s%s/tree/\n", recordRefPrefix, sid)
 	return nil
 }

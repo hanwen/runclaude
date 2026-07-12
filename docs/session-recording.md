@@ -58,3 +58,11 @@ Record if `--record` was given OR `refs/runclaude/<sid>/transcript` exists **and
 Pure-jj repos; `--step` review viewer; continuation-session stickiness linkage (new sid referencing prior sid); container freeze for crash-consistent snapshots; transcript scrubbing/encryption; retention policies beyond `--record-rm`.
 
 Build order: recorder + refs + ownership locking → stickiness + meta → upload (incl. never-committed report) → download/replay → `--sessions` → shell test.
+
+## Post-v1 revisions (implemented)
+
+The sections above are the original plan; the implementation superseded parts of it (CLAUDE.md stays current):
+
+- **`/transcript` folded into `/meta`**: one parentless session branch `refs/runclaude/<sid>/meta` with a two-file tree (`meta.json` + `transcript.jsonl`); no offset/hash in commit messages — the transcript blob is truncated at the parse offset, so the tip blob's size *is* the resume offset and every committed transcript ends on a complete JSONL line.
+- **Stickiness by recorder id, not cwd**: `meta.json` carries a per-clone random id (`<git-common-dir>/runclaude-recorder-id`, never transferred by clone/fetch) instead of a checkout path. The `--download` foreign marker became redundant: a reviewer's clone can never hold the author's id.
+- **Sessions are repo-scoped**: all worktrees of a clone share the main worktree's `~/.claude/projects/` dir via a container bind, so any worktree lists/resumes the clone's sessions; recorder startup re-materializes missing transcripts from the session branch (survives claude's 30-day purge). Recorder state + per-sid flocks moved to `<git-common-dir>/runclaude/record/` (clone-global locking); recorders claim by the transcript entries' `cwd` field and hand off mid-session when a session migrates to another worktree. Resume of a foreign-clone session auto-appends `--fork-session`; same-clone resume continues the session from any worktree.
