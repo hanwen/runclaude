@@ -213,7 +213,7 @@ func TestRecorderCheckpointsAndTranscript(t *testing.T) {
 	if got+"\n" != string(want) {
 		t.Errorf("transcript blob mismatch: %d vs %d bytes", len(got), len(want))
 	}
-	// Meta records this cwd and the first prompt.
+	// Meta records this clone's recorder id and the first prompt.
 	metaJSON, err := e.rec.git.showBlob(recordRefPrefix+sid+"/meta", "meta.json")
 	if err != nil {
 		t.Fatal(err)
@@ -222,8 +222,8 @@ func TestRecorderCheckpointsAndTranscript(t *testing.T) {
 	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.Cwd != e.repo || meta.FirstPrompt != "please add b" {
-		t.Errorf("meta: %+v", meta)
+	if meta.RecorderID != e.rec.id || meta.RecorderID == "" || meta.FirstPrompt != "please add b" {
+		t.Errorf("meta: %+v (recorder id %q)", meta, e.rec.id)
 	}
 
 	// The user's real index must be untouched: b.txt stays untracked.
@@ -338,6 +338,35 @@ func TestRecorderStickyResume(t *testing.T) {
 		t.Errorf("no checkpoint for resumed session; refs: %v", e.refs(t))
 	}
 	rec2.Close()
+}
+
+func TestRecorderNotStickyForOtherClone(t *testing.T) {
+	e := newTestEnv(t)
+	e.append(t,
+		entryLine(t, "assistant", "u1", []map[string]any{
+			{"type": "tool_use", "id": "t1", "name": "Write"},
+		}, nil),
+		entryLine(t, "user", "u2", []map[string]any{
+			{"type": "tool_result", "tool_use_id": "t1"},
+		}, nil),
+	)
+	e.rec.scanOnce()
+	e.rec.Close()
+
+	// Simulate a different clone (fetched refs, materialized transcript,
+	// different recorder id): the session must not be sticky there.
+	idPath := filepath.Join(e.repo, ".git", "runclaude-recorder-id")
+	if err := os.WriteFile(idPath, []byte("other-clone\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, t.TempDir(), false, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2.scanOnce()
+	if len(rec2.sessions) != 0 {
+		t.Error("session sticky in a clone with a different recorder id")
+	}
 }
 
 func TestRecorderLockExcludesSecond(t *testing.T) {

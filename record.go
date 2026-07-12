@@ -15,13 +15,16 @@ package main
 //
 //	refs/runclaude/<sid>/meta   (meta.json + transcript.jsonl)
 //
-// coalescing same-second events into one commit. meta.json (author, cwd,
-// start, first prompt) is written once and reused as the same blob in
-// every commit; it drives --sessions discovery and scopes stickiness to
-// this checkout. transcript.jsonl is the full session file per flush.
+// coalescing same-second events into one commit. meta.json (author,
+// recorder id, start, first prompt) is written once and reused as the same
+// blob in every commit; it drives --sessions discovery and scopes
+// stickiness to the recording clone. transcript.jsonl is the session file
+// truncated at the parse offset per flush.
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -65,7 +68,7 @@ func transcriptDir(home, cwd string) string {
 }
 
 // recordState is the cached per-session recorder state. It is advisory:
-// the authoritative resume point is the session tip commit message.
+// the authoritative resume point is the size of the tip's transcript blob.
 type recordState struct {
 	Offset         int64  `json:"offset"`
 	LastTree       string `json:"lastTree,omitempty"`
@@ -77,8 +80,11 @@ type recordState struct {
 }
 
 type sessionMeta struct {
-	SessionID   string `json:"sessionId"`
-	Cwd         string `json:"cwd"`
+	SessionID string `json:"sessionId"`
+	// RecorderID identifies the clone that recorded the session (see
+	// recorderID); deliberately not the checkout path, which changes on
+	// moves and would leak the author's filesystem layout.
+	RecorderID  string `json:"recorderId"`
 	Author      string `json:"author,omitempty"`
 	Start       string `json:"start"`
 	Upstream    string `json:"upstream,omitempty"`
@@ -109,9 +115,9 @@ type contentBlock struct {
 
 type recorder struct {
 	git         *gitRepo
+	id          string // per-clone recording identity (recorderID)
 	projectsDir string // host dir with <sid>.jsonl files
 	stateDir    string // <cacheDir>/record
-	cwd         string
 	recordAll   bool   // --record: claim sessions started under this run
 	upstream    string // configured upstream for meta
 	start       time.Time
@@ -161,6 +167,10 @@ func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream st
 		excludesFile: excludesFile,
 	}
 	git.ensureIdent()
+	id, err := recorderID(git)
+	if err != nil {
+		return nil, fmt.Errorf("recorder id: %w", err)
+	}
 	projectsDir := transcriptDir(home, cwd)
 	preexisting := map[string]bool{}
 	if entries, err := os.ReadDir(projectsDir); err == nil {
@@ -172,10 +182,10 @@ func newRecorder(gitDir, cwd, home, cacheDir string, recordAll bool, upstream st
 	}
 	return &recorder{
 		git:         git,
+		id:          id,
 		preexisting: preexisting,
 		projectsDir: projectsDir,
 		stateDir:    stateDir,
-		cwd:         cwd,
 		recordAll:   recordAll,
 		upstream:    upstream,
 		start:       time.Now(),
@@ -260,7 +270,8 @@ func (r *recorder) scanOnce() {
 
 // maybeClaim decides whether this recorder owns sid and, if so, locks and
 // initializes it. Ownership rules: (a) sticky — the session branch exists,
-// its meta.json cwd matches, and the session is not foreign; or (b) --record was
+// its meta.json recorder id is this clone's, and the session is not
+// foreign; or (b) --record was
 // given and the session file appeared after this recorder started.
 func (r *recorder) maybeClaim(sid, path string) *recSession {
 	sticky := r.isSticky(sid)
@@ -319,7 +330,7 @@ func (r *recorder) maybeClaim(sid, path string) *recSession {
 	return s
 }
 
-// isSticky reports whether sid was previously recorded from this cwd.
+// isSticky reports whether sid was previously recorded by this clone.
 func (r *recorder) isSticky(sid string) bool {
 	metaJSON, err := r.git.showBlob(recordRefPrefix+sid+"/meta", "meta.json")
 	if err != nil {
@@ -329,9 +340,38 @@ func (r *recorder) isSticky(sid string) bool {
 	if json.Unmarshal([]byte(metaJSON), &m) != nil {
 		return false
 	}
-	// Linked worktrees share the refs store; without the cwd scope,
-	// recording in one worktree would silently enable it in all.
-	return m.Cwd == r.cwd
+	// Only the recording clone resumes a session: a reviewer's clone (refs
+	// fetched, transcript materialized by --download) has a different id
+	// and must not extend the author's branch.
+	return m.RecorderID != "" && m.RecorderID == r.id
+}
+
+// recorderID returns this clone's stable recording identity, minting it on
+// first use. It lives in the common git dir, so it survives repo moves and
+// is shared by linked worktrees — but is local-only: clone/fetch never
+// transfer it.
+func recorderID(g *gitRepo) (string, error) {
+	common, err := g.run("rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(common) {
+		// rev-parse resolves relative to the process cwd (the worktree).
+		common = filepath.Join(g.workTree, common)
+	}
+	path := filepath.Join(common, "runclaude-recorder-id")
+	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+		return strings.TrimSpace(string(data)), nil
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	id := hex.EncodeToString(buf)
+	if err := os.WriteFile(path, []byte(id+"\n"), 0600); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // pollSession reads newly appended bytes and reacts to complete entries.
@@ -553,7 +593,7 @@ func (r *recorder) flushTranscript(s *recSession, force bool) {
 func (r *recorder) metaJSONBlob(s *recSession) (string, error) {
 	meta := sessionMeta{
 		SessionID:   s.sid,
-		Cwd:         r.cwd,
+		RecorderID:  r.id,
 		Author:      gitAuthor(r.git),
 		Start:       r.start.UTC().Format(time.RFC3339),
 		Upstream:    r.upstream,
