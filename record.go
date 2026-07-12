@@ -139,7 +139,12 @@ type recorder struct {
 	stateDir    string // <git-common-dir>/runclaude/record
 	recordAll   bool   // recording requested: claim sessions started under this run
 	upstream    string // configured upstream for meta
-	start       time.Time
+	// jjDir is the workspace to resolve jj's working-copy change in per
+	// checkpoint (see recordjj.go); empty when cwd is not a jj workspace,
+	// jj is unavailable, or a resolution failed (logged once, then plain
+	// git checkpoints for the rest of the session).
+	jjDir string
+	start time.Time
 	// preexisting holds session ids whose files already existed at
 	// recorder start; recordAll only claims sessions newer than that
 	// (sticky sessions are claimed regardless).
@@ -223,6 +228,7 @@ func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 		stateDir:    stateDir,
 		recordAll:   recordAll,
 		upstream:    upstream,
+		jjDir:       detectJJ(cwd, logger),
 		start:       time.Now(),
 		logger:      logger,
 		now:         time.Now,
@@ -676,7 +682,9 @@ func (r *recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mut
 
 // snapshot commits the current worktree and points one ref per triggering
 // uuid at it (same-second events share the commit, mirroring transcript
-// smushing). Unchanged trees create no commit.
+// smushing). Unchanged trees create no commit. In a jj workspace the
+// checkpoint carries @'s change id, and when jj's own snapshot already
+// matches the tree it is reused verbatim (see recordjj.go).
 func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offset int64) {
 	// Per-session private index: never touches the user's staging area,
 	// persists across flushes for incremental restats.
@@ -690,27 +698,44 @@ func (r *recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 	if tree == s.state.LastTree {
 		return
 	}
-	var parents []string
-	head := r.git.headCommit()
-	if s.state.LastCheckpoint == "" {
-		if head != "" {
-			parents = append(parents, head)
-		}
-	} else {
-		parents = append(parents, s.state.LastCheckpoint)
-		// Pin a moved HEAD as second parent only when it is genuinely new
-		// history (jj moves HEAD on nearly every command; reachable HEADs
-		// would spray merge parents across every checkpoint).
-		if head != "" && !r.git.isAncestor(head, s.state.LastCheckpoint) {
-			parents = append(parents, head)
+	var wcCommit, changeID string
+	if r.jjDir != "" {
+		if wcCommit, changeID, err = jjWorkingCopy(r.jjDir); err != nil {
+			r.logger.Printf("record: %s: %v (checkpoints without change ids)", s.sid, err)
+			r.jjDir = ""
 		}
 	}
-	msg := fmt.Sprintf("runclaude checkpoint\n\nsession: %s\nuuids: %s\nspan: %d-%d\n",
-		s.sid, strings.Join(uuids, " "), s.state.Offset, offset)
-	sha, err := r.git.commitTree(tree, parents, msg)
-	if err != nil {
-		r.logger.Printf("record: %s: commit: %v", s.sid, err)
-		return
+	sha := ""
+	if wcCommit != "" {
+		// jj snapshotted this exact tree already (the last mutation came
+		// through a jj command): the checkpoint is the jj-authored commit.
+		if wcTree, err := r.git.run("rev-parse", "--verify", wcCommit+"^{tree}"); err == nil && wcTree == tree {
+			sha = wcCommit
+		}
+	}
+	if sha == "" {
+		var parents []string
+		head := r.git.headCommit()
+		if s.state.LastCheckpoint == "" {
+			if head != "" {
+				parents = append(parents, head)
+			}
+		} else {
+			parents = append(parents, s.state.LastCheckpoint)
+			// Pin a moved HEAD as second parent only when it is genuinely new
+			// history (jj moves HEAD on nearly every command; reachable HEADs
+			// would spray merge parents across every checkpoint).
+			if head != "" && !r.git.isAncestor(head, s.state.LastCheckpoint) {
+				parents = append(parents, head)
+			}
+		}
+		msg := fmt.Sprintf("runclaude checkpoint\n\nsession: %s\nuuids: %s\nspan: %d-%d\n",
+			s.sid, strings.Join(uuids, " "), s.state.Offset, offset)
+		sha, err = r.git.commitTreeChangeID(tree, parents, msg, changeID)
+		if err != nil {
+			r.logger.Printf("record: %s: commit: %v", s.sid, err)
+			return
+		}
 	}
 	ts := refTimestamp(entryTS, r.now())
 	for _, u := range uuids {

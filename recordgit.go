@@ -113,6 +113,35 @@ func (g *gitRepo) commitTree(tree string, parents []string, msg string) (string,
 	return g.run(args...)
 }
 
+// commitTreeChangeID is commitTree with a jj `change-id` header, making
+// the commit a native jj change (jj adopts the header on import). git
+// commit-tree cannot add headers, so the raw commit object is assembled
+// here and written with hash-object; --literally skips the format check,
+// which predates jj's header. changeID must be pre-validated (isReverseHex).
+func (g *gitRepo) commitTreeChangeID(tree string, parents []string, msg, changeID string) (string, error) {
+	if changeID == "" {
+		return g.commitTree(tree, parents, msg)
+	}
+	author, err := g.run("var", "GIT_AUTHOR_IDENT")
+	if err != nil {
+		return "", err
+	}
+	committer, err := g.run("var", "GIT_COMMITTER_IDENT")
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "tree %s\n", tree)
+	for _, p := range parents {
+		fmt.Fprintf(&b, "parent %s\n", p)
+	}
+	fmt.Fprintf(&b, "author %s\ncommitter %s\nchange-id %s\n\n%s", author, committer, changeID, msg)
+	if !strings.HasSuffix(msg, "\n") {
+		b.WriteString("\n")
+	}
+	return g.runInput(b.String(), "hash-object", "-t", "commit", "-w", "--stdin", "--literally")
+}
+
 func (g *gitRepo) updateRef(name, sha string) error {
 	_, err := g.run("update-ref", name, sha)
 	return err
