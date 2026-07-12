@@ -1,16 +1,108 @@
 package main
 
-// Host-only commands operating on recorded sessions: --upload, --download,
-// --sessions, --record-rm. These run before (instead of) any sandbox setup.
+// Host-only commands operating on recorded sessions: the list/upload/
+// download/rm subcommands and their legacy flag spellings (--sessions,
+// --upload, --download, --record-rm). These run before (instead of) any
+// sandbox setup.
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// dispatchSubcommand handles `runclaude <verb> ...` session-management
+// subcommands. The verb must be the first argument; `runclaude -- <verb>`
+// escapes a sandbox command that happens to share a verb's name. Host-only
+// verbs run here (handled=true, caller exits); "new" is the normal sandbox
+// path with recording forced on, so it only strips the verb and sets
+// newSession — rest feeds the regular flag parsing.
+func dispatchSubcommand(args []string) (handled, newSession bool, rest []string, err error) {
+	if len(args) == 0 {
+		return false, false, args, nil
+	}
+	switch args[0] {
+	case "new":
+		return false, true, args[1:], nil
+	case "list", "upload", "download", "rm":
+	default:
+		return false, false, args, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return true, false, nil, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return true, false, nil, err
+	}
+	return true, false, nil, runSessionSubcommand(args[0], args[1:], cwd, home)
+}
+
+// runSessionSubcommand executes a host-only session verb against cwd's repo.
+func runSessionSubcommand(sub string, args []string, cwd, home string) error {
+	gitDir, ok := resolveRecordGitDir(cwd)
+	if !ok {
+		return fmt.Errorf("no git or jj repository at %s", cwd)
+	}
+	g := &gitRepo{gitDir: gitDir}
+	switch sub {
+	case "list":
+		if len(args) > 0 {
+			return fmt.Errorf("usage: runclaude list")
+		}
+		return listSessions(g)
+	case "rm":
+		if len(args) == 0 {
+			return fmt.Errorf("usage: runclaude rm <session-id>...")
+		}
+		for _, sid := range args {
+			if err := removeSession(g, sid); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "upload":
+		fs := flag.NewFlagSet("runclaude upload", flag.ExitOnError)
+		session := fs.String("session", "", "session id (default: latest)")
+		upstream := fs.String("upstream", fileRecordUpstream(cwd),
+			"upstream ref bounding the bundle (default: origin's default branch)")
+		fs.Parse(args)
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>")
+		}
+		sid, err := resolveSessionID(g, *session)
+		if err != nil {
+			return err
+		}
+		return uploadSession(g, sid, fs.Arg(0), *upstream)
+	case "download":
+		fs := flag.NewFlagSet("runclaude download", flag.ExitOnError)
+		session := fs.String("session", "", "session id (default: the newly fetched one)")
+		at := fs.String("at", "", "checkpoint selector: uuid or timestamp substring (default: latest)")
+		dest := fs.String("dest", "", "worktree directory (default: <repo>-review-<sid>)")
+		fs.Parse(args)
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>")
+		}
+		return downloadSession(g, fs.Arg(0), *session, *at, *dest, cwd, home)
+	}
+	return fmt.Errorf("unknown subcommand %q", sub)
+}
+
+// fileRecordUpstream reads the project options file's recordUpstream — the
+// same default the --record-upstream flag gets on the sandbox path.
+func fileRecordUpstream(cwd string) string {
+	opts, err := loadOptionsFile(cwd)
+	if err != nil {
+		return ""
+	}
+	return opts.RecordUpstream
+}
 
 type recordCmdFlags struct {
 	upload   string // bundle path/dir, remote name, or URL

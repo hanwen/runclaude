@@ -70,13 +70,15 @@ u5ref=$(echo "$refs" | grep "/tree/.*/u5$")
 $GIT show "refs/runclaude/$SID/meta:transcript.jsonl" | grep -q '"uuid":"u5"' \
     || fail "transcript branch incomplete"
 
-# Upload -> clone -> download round trip.
-(cd "$REPO" && "$WORKDIR/runclaude" --upload "$WORKDIR" --session "$SID" --record-upstream main)
+(cd "$REPO" && "$WORKDIR/runclaude" list) | grep -q "$SID" || fail "list does not show session"
+
+# Upload -> clone -> download round trip (via subcommands).
+(cd "$REPO" && "$WORKDIR/runclaude" upload --session "$SID" --upstream main "$WORKDIR")
 [[ -s "$WORKDIR/$SID.bundle" ]] || fail "bundle not written"
 
 CLONE="$WORKDIR/clone"
 git clone -q "$REPO" "$CLONE"
-(cd "$CLONE" && "$WORKDIR/runclaude" --download "$WORKDIR/$SID.bundle" --dest "$WORKDIR/review")
+(cd "$CLONE" && "$WORKDIR/runclaude" download --dest "$WORKDIR/review" "$WORKDIR/$SID.bundle")
 [[ "$(cat "$WORKDIR/review/b.txt")" == "v2" ]] || fail "downloaded worktree content"
 
 # The download materialized the transcript into the clone's repo-scoped

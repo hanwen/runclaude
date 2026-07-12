@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,63 @@ func TestListAndRemoveSessions(t *testing.T) {
 	}
 	if len(refs) != 0 {
 		t.Errorf("refs remain after removal: %v", refs)
+	}
+}
+
+func TestDispatchSubcommand(t *testing.T) {
+	handled, newSession, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
+	if handled || !newSession || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
+		t.Errorf("new: handled=%v newSession=%v rest=%v err=%v", handled, newSession, rest, err)
+	}
+	// Anything else passes through untouched to regular flag parsing —
+	// including `--` escaping a command named like a verb.
+	for _, args := range [][]string{nil, {"--sessions"}, {"--", "list"}, {"bash", "-c", "true"}} {
+		handled, newSession, rest, err := dispatchSubcommand(args)
+		if handled || newSession || err != nil || !reflect.DeepEqual(rest, args) {
+			t.Errorf("dispatchSubcommand(%v): handled=%v newSession=%v rest=%v err=%v",
+				args, handled, newSession, rest, err)
+		}
+	}
+}
+
+func TestSessionSubcommands(t *testing.T) {
+	e := recordDemoSession(t)
+	home := t.TempDir()
+
+	bundleDir := t.TempDir()
+	if err := runSessionSubcommand("upload", []string{"--upstream", "main", bundleDir}, e.repo, home); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(bundleDir, e.session+".bundle")
+	if _, err := os.Stat(bundle); err != nil {
+		t.Fatal(err)
+	}
+
+	cloneParent := t.TempDir()
+	clone := filepath.Join(cloneParent, "clone")
+	if out, err := exec.Command("git", "clone", "-q", e.repo, clone).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v: %s", err, out)
+	}
+	dest := filepath.Join(cloneParent, "review")
+	if err := runSessionSubcommand("download", []string{"--dest", dest, bundle}, clone, home); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dest, "b.txt")); err != nil || string(data) != "v2\n" {
+		t.Errorf("downloaded worktree b.txt: %q, %v", data, err)
+	}
+
+	if err := runSessionSubcommand("list", []string{"extra"}, e.repo, home); err == nil {
+		t.Error("list accepted positional args")
+	}
+	if err := runSessionSubcommand("rm", nil, e.repo, home); err == nil {
+		t.Error("rm accepted empty args")
+	}
+	if err := runSessionSubcommand("rm", []string{e.session}, e.repo, home); err != nil {
+		t.Fatal(err)
+	}
+	g := &gitRepo{gitDir: filepath.Join(e.repo, ".git")}
+	if refs, err := g.refNames(recordRefPrefix + e.session); err != nil || len(refs) != 0 {
+		t.Errorf("refs remain after rm: %v, %v", refs, err)
 	}
 }
 
