@@ -156,22 +156,22 @@ func TestListAndRemoveSessions(t *testing.T) {
 }
 
 func TestDispatchSubcommand(t *testing.T) {
-	handled, record, sid, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
-	if handled || !record || sid != "" || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
-		t.Errorf("new: handled=%v record=%v sid=%q rest=%v err=%v", handled, record, sid, rest, err)
+	handled, verb, sid, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
+	if handled || verb != "new" || sid != "" || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
+		t.Errorf("new: handled=%v verb=%q sid=%q rest=%v err=%v", handled, verb, sid, rest, err)
 	}
 	// An explicit resume id needs no repo; remaining args feed flag parsing.
-	handled, record, sid, rest, err = dispatchSubcommand([]string{"resume", "abc", "--restrict-net=false"})
-	if handled || !record || sid != "abc" || err != nil || !reflect.DeepEqual(rest, []string{"--restrict-net=false"}) {
-		t.Errorf("resume abc: handled=%v record=%v sid=%q rest=%v err=%v", handled, record, sid, rest, err)
+	handled, verb, sid, rest, err = dispatchSubcommand([]string{"resume", "abc", "--restrict-net=false"})
+	if handled || verb != "resume" || sid != "abc" || err != nil || !reflect.DeepEqual(rest, []string{"--restrict-net=false"}) {
+		t.Errorf("resume abc: handled=%v verb=%q sid=%q rest=%v err=%v", handled, verb, sid, rest, err)
 	}
 	// Anything else passes through untouched to regular flag parsing —
 	// including `--` escaping a command named like a verb.
 	for _, args := range [][]string{nil, {"--restrict-net=false"}, {"--", "list"}, {"bash", "-c", "true"}} {
-		handled, record, sid, rest, err := dispatchSubcommand(args)
-		if handled || record || sid != "" || err != nil || !reflect.DeepEqual(rest, args) {
-			t.Errorf("dispatchSubcommand(%v): handled=%v record=%v sid=%q rest=%v err=%v",
-				args, handled, record, sid, rest, err)
+		handled, verb, sid, rest, err := dispatchSubcommand(args)
+		if handled || verb != "" || sid != "" || err != nil || !reflect.DeepEqual(rest, args) {
+			t.Errorf("dispatchSubcommand(%v): handled=%v verb=%q sid=%q rest=%v err=%v",
+				args, handled, verb, sid, rest, err)
 		}
 	}
 }

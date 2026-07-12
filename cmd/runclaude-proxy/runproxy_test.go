@@ -50,7 +50,7 @@ func TestRunproxyE2E(t *testing.T) {
 		"--export-ca", caCert,
 		"--anthropic",
 		"--anthropic-home", credHome,
-		"--mitm-upstream", "api.anthropic.com="+upstream.URL,
+		"--test.mitm-upstream", "api.anthropic.com="+upstream.URL,
 		"--log", filepath.Join(dir, "proxy.log"),
 	)
 	// Pick a free port ourselves so we know where to dial.

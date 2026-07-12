@@ -16,36 +16,38 @@ import (
 // dispatchSubcommand handles `runclaude <verb> ...` session-management
 // subcommands. The verb must be the first argument; `runclaude -- <verb>`
 // escapes a sandbox command that happens to share a verb's name. Host-only
-// verbs run here (handled=true, caller exits); "new" and "resume" are the
-// normal sandbox path with recording forced on, so they only strip the
-// verb (resume also its session id, resolved into resumeSid) and set
-// record — rest feeds the regular flag parsing.
-func dispatchSubcommand(args []string) (handled, record bool, resumeSid string, rest []string, err error) {
+// verbs run here (handled=true, caller exits) with their own flag sets;
+// "new" and "resume" are the normal sandbox path with recording forced on,
+// so they only strip the verb (resume also its session id, resolved into
+// resumeSid) — rest feeds the sandbox flag set, which the two verbs share
+// with the bare invocation (verb tailors its usage output and turns
+// recording on).
+func dispatchSubcommand(args []string) (handled bool, verb, resumeSid string, rest []string, err error) {
 	if len(args) == 0 {
-		return false, false, "", args, nil
+		return false, "", "", args, nil
 	}
 	switch args[0] {
 	case "new":
-		return false, true, "", args[1:], nil
+		return false, "new", "", args[1:], nil
 	case "resume":
 		sid, rest, err := resumeSubcommand(args[1:])
 		if err != nil {
-			return true, false, "", nil, err
+			return true, "", "", nil, err
 		}
-		return false, true, sid, rest, nil
+		return false, "resume", sid, rest, nil
 	case "list", "upload", "download", "rm":
 	default:
-		return false, false, "", args, nil
+		return false, "", "", args, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return true, false, "", nil, err
+		return true, "", "", nil, err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return true, false, "", nil, err
+		return true, "", "", nil, err
 	}
-	return true, false, "", nil, runSessionSubcommand(args[0], args[1:], cwd, home)
+	return true, "", "", nil, runSessionSubcommand(args[0], args[1:], cwd, home)
 }
 
 // resumeSubcommand picks the session id for the resume verb: an explicit
@@ -59,6 +61,11 @@ func resumeSubcommand(args []string) (sid string, rest []string, err error) {
 	}
 	if sid != "" && sid != "latest" {
 		return sid, rest, nil
+	}
+	// A help request must not require a repo with recorded sessions: the
+	// sandbox flag parse prints usage and exits before the sid is used.
+	if len(rest) > 0 && (rest[0] == "-h" || rest[0] == "-help" || rest[0] == "--help") {
+		return "", rest, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -84,22 +91,26 @@ func runSessionSubcommand(sub string, args []string, cwd, home string) error {
 	g := &gitRepo{gitDir: gitDir}
 	switch sub {
 	case "list":
-		if len(args) > 0 {
+		fs := verbFlagSet("list", "runclaude list")
+		fs.Parse(args)
+		if fs.NArg() != 0 {
 			return fmt.Errorf("usage: runclaude list")
 		}
 		return listSessions(g)
 	case "rm":
-		if len(args) == 0 {
+		fs := verbFlagSet("rm", "runclaude rm <session-id>...")
+		fs.Parse(args)
+		if fs.NArg() == 0 {
 			return fmt.Errorf("usage: runclaude rm <session-id>...")
 		}
-		for _, sid := range args {
+		for _, sid := range fs.Args() {
 			if err := removeSession(g, sid); err != nil {
 				return err
 			}
 		}
 		return nil
 	case "upload":
-		fs := flag.NewFlagSet("runclaude upload", flag.ExitOnError)
+		fs := verbFlagSet("upload", "runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>")
 		session := fs.String("session", "", "session id (default: latest)")
 		upstream := fs.String("upstream", fileRecordUpstream(cwd),
 			"upstream ref bounding the bundle (default: origin's default branch)")
@@ -113,7 +124,7 @@ func runSessionSubcommand(sub string, args []string, cwd, home string) error {
 		}
 		return uploadSession(g, sid, fs.Arg(0), *upstream)
 	case "download":
-		fs := flag.NewFlagSet("runclaude download", flag.ExitOnError)
+		fs := verbFlagSet("download", "runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>")
 		session := fs.String("session", "", "session id (default: the newly fetched one)")
 		at := fs.String("at", "", "checkpoint selector: uuid or timestamp substring (default: latest)")
 		dest := fs.String("dest", "", "worktree directory (default: <repo>-review-<sid>)")
@@ -124,6 +135,17 @@ func runSessionSubcommand(sub string, args []string, cwd, home string) error {
 		return downloadSession(g, fs.Arg(0), *session, *at, *dest, cwd, home)
 	}
 	return fmt.Errorf("unknown subcommand %q", sub)
+}
+
+// verbFlagSet builds the flag set for a host-only session verb; -h prints
+// the synopsis followed by the verb's own flags.
+func verbFlagSet(verb, synopsis string) *flag.FlagSet {
+	fs := flag.NewFlagSet("runclaude "+verb, flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "usage: %s\n", synopsis)
+		fs.PrintDefaults()
+	}
+	return fs
 }
 
 // fileRecordUpstream reads the project options file's recordUpstream — the

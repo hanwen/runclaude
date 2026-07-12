@@ -67,9 +67,9 @@ run_case() {
     local tail_pid=$!
 
     local errfile="$WORKDIR/$name.err"
-    local rc_args=(--claude --proxy-log "$proxylog")
+    local rc_args=(--claude --test.proxy-log "$proxylog")
     for u in "${upstreams[@]}"; do
-        rc_args+=(--mitm-upstream "$u=http://127.0.0.1:$port")
+        rc_args+=(--test.mitm-upstream "$u=http://127.0.0.1:$port")
     done
 
     if [[ -n "$claude_json" ]]; then 
@@ -106,11 +106,11 @@ run_case() {
 }
 
 # --- Anthropic API key path ---
-# Pass --anthropic-bearer to runclaude so it injects this token regardless
+# Pass --test.anthropic-bearer to runclaude so it injects this token regardless
 # of what's in the developer's ~/.claude/.credentials.json. claude's own
 # login state stays untouched.
 TEST_BEARER="sk-ant-oat01-fake-$$-$(date +%s)"
-EXTRA_RC_FLAGS=(--anthropic-bearer "$TEST_BEARER")
+EXTRA_RC_FLAGS=(--test.anthropic-bearer "$TEST_BEARER")
 run_case anthropic api.anthropic.com '{}' \
     --anthropic-api-key "$TEST_BEARER"
 EXTRA_RC_FLAGS=()
@@ -130,8 +130,8 @@ TEST_REFRESH="sk-ant-ort01-refresh-$$-$(date +%s)"
 REFRESH_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 
 EXTRA_RC_FLAGS=(
-    --anthropic-bearer "$TEST_OLD_BEARER"
-    --anthropic-refresh "$TEST_REFRESH"
+    --test.anthropic-bearer "$TEST_OLD_BEARER"
+    --test.anthropic-refresh "$TEST_REFRESH"
 )
 RUNCLAUDE_CLAUDE_TOKEN_URL="http://127.0.0.1:$REFRESH_PORT/v1/oauth/token" \
     run_case anthropic-refresh \

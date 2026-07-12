@@ -64,7 +64,21 @@ func run() error {
 	flag.Var(&allow, "allow-domain", "additional passthrough domain (repeatable); default: built-in list")
 	var defaults = flag.Bool("default-allowlist", true, "include the built-in default allowlist (Anthropic, registries, etc.)")
 	var mitmUpstream stringSlice
-	flag.Var(&mitmUpstream, "mitm-upstream", "override MITM upstream for a host, format host=url (repeatable); for testing")
+	flag.Var(&mitmUpstream, "test.mitm-upstream", "override MITM upstream for a host, format host=url (repeatable); for testing")
+	flag.Usage = func() {
+		o := flag.CommandLine.Output()
+		fmt.Fprintf(o, "Usage of %s:\n", os.Args[0])
+		// Hide the test.* flags: they exist for the tests and would only
+		// clutter the help output.
+		visible := flag.NewFlagSet("", flag.ContinueOnError)
+		flag.VisitAll(func(f *flag.Flag) {
+			if !strings.HasPrefix(f.Name, "test.") {
+				visible.Var(f.Value, f.Name, f.Usage)
+			}
+		})
+		visible.SetOutput(o)
+		visible.PrintDefaults()
+	}
 	flag.Parse()
 
 	if !*enableAnthropic && !*enableBedrock {
@@ -235,7 +249,7 @@ func parseMitmUpstream(specs []string) (map[string]string, error) {
 	for _, s := range specs {
 		eq := strings.IndexByte(s, '=')
 		if eq <= 0 {
-			return nil, fmt.Errorf("--mitm-upstream %q: want host=url", s)
+			return nil, fmt.Errorf("--test.mitm-upstream %q: want host=url", s)
 		}
 		out[s[:eq]] = s[eq+1:]
 	}

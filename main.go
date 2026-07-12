@@ -116,7 +116,7 @@ func parseMitmUpstream(items []string) map[string]string {
 	for _, kv := range items {
 		host, url, ok := strings.Cut(kv, "=")
 		if !ok || host == "" || url == "" {
-			log.Fatalf("--mitm-upstream %q: expected host=url", kv)
+			log.Fatalf("mitm upstream %q: expected host=url", kv)
 		}
 		out[host] = url
 	}
@@ -127,6 +127,19 @@ type stringSlice []string
 
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
+
+// printVisibleDefaults is fs.PrintDefaults minus the test.* flags, which
+// exist for the test scripts and would only clutter the help output.
+func printVisibleDefaults(fs *flag.FlagSet) {
+	visible := flag.NewFlagSet("", flag.ContinueOnError)
+	fs.VisitAll(func(f *flag.Flag) {
+		if !strings.HasPrefix(f.Name, "test.") {
+			visible.Var(f.Value, f.Name, f.Usage)
+		}
+	})
+	visible.SetOutput(fs.Output())
+	visible.PrintDefaults()
+}
 
 func loadConfig(envName string) (*Config, error) {
 	var c Config
@@ -425,7 +438,7 @@ func cacheDirFor(cwd string) (string, error) {
 }
 
 func mainErr() error {
-	handled, forceRecord, resumeSid, cliArgs, err := dispatchSubcommand(os.Args[1:])
+	handled, verb, resumeSid, cliArgs, err := dispatchSubcommand(os.Args[1:])
 	if handled {
 		return err
 	}
@@ -460,30 +473,34 @@ func mainErr() error {
 		log.Printf("warning: .claude/runclaude.json: %v", err)
 	}
 
+	// The sandbox flag set, shared by the bare invocation and the new/resume
+	// verbs (which are the same sandbox path with recording forced on); the
+	// host-only verbs have their own flag sets in recordcmd.go.
+	fs := flag.NewFlagSet("runclaude", flag.ExitOnError)
 	var exposed stringSlice
 	exposed = append(exposed, fileOpts.Expose...)
-	flag.Var(&exposed, "expose", "expose host path into the container (repeatable)")
-	flag.Var(&exposed, "e", "alias for --expose")
+	fs.Var(&exposed, "expose", "expose host path into the container (repeatable)")
+	fs.Var(&exposed, "e", "alias for --expose")
 	var only stringSlice
 	only = append(only, fileOpts.Only...)
-	flag.Var(&only, "only", "if set, only these paths (relative to cwd or absolute) are visible from cwd inside the container; cwd is backed by the cache dir, no git/jj repos are mapped (repeatable)")
-	flag.Var(&only, "o", "alias for --only")
-	mapPath := flag.Bool("map-path", boolOr(fileOpts.MapPath, true), "map all directories from $PATH")
-	claudeMode := flag.Bool("claude", boolOr(fileOpts.Claude, true), "bind files needed for `claude` and run it as the default command")
-	claudeConfig := flag.Bool("claude-config", fileOpts.ClaudeConfig, "like --claude but do not set the command (for testing/custom commands)")
-	restrictNet := flag.Bool("restrict-net", boolOr(fileOpts.RestrictNet, true), "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
+	fs.Var(&only, "only", "if set, only these paths (relative to cwd or absolute) are visible from cwd inside the container; cwd is backed by the cache dir, no git/jj repos are mapped (repeatable)")
+	fs.Var(&only, "o", "alias for --only")
+	mapPath := fs.Bool("map-path", boolOr(fileOpts.MapPath, true), "map all directories from $PATH")
+	claudeMode := fs.Bool("claude", boolOr(fileOpts.Claude, true), "bind files needed for `claude` and run it as the default command")
+	claudeConfig := fs.Bool("claude-config", fileOpts.ClaudeConfig, "like --claude but do not set the command (for testing/custom commands)")
+	restrictNet := fs.Bool("restrict-net", boolOr(fileOpts.RestrictNet, true), "run in a new network namespace; egress only via the in-process HTTP proxy and DNS server")
 	var allowDomain domainList
 	if len(fileOpts.AllowDomains) > 0 {
 		allowDomain.items = append(allowDomain.items, fileOpts.AllowDomains...)
 		allowDomain.set = true
 	}
-	mapWorkspace := flag.Bool("map-workspace", boolOr(fileOpts.MapWorkspace, true), "for git/jj workspaces map the originating repository")
-	flag.Var(&allowDomain, "allow-domain",
+	mapWorkspace := fs.Bool("map-workspace", boolOr(fileOpts.MapWorkspace, true), "for git/jj workspaces map the originating repository")
+	fs.Var(&allowDomain, "allow-domain",
 		"allowed egress domain (repeatable); defaults to a built-in list; pass --allow-domain= to disable enforcement")
-	flag.Var(&allowDomain, "a", "alias for --allow-domain")
-	proxyLog := flag.String("proxy-log", fileOpts.ProxyLog,
+	fs.Var(&allowDomain, "a", "alias for --allow-domain")
+	proxyLog := fs.String("test.proxy-log", fileOpts.ProxyLog,
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
-	approveListen := flag.String("approve-listen", strOr(fileOpts.ApproveListen, "127.0.0.1:0"),
+	approveListen := fs.String("approve-listen", strOr(fileOpts.ApproveListen, "127.0.0.1:0"),
 		"host address for the domain-approval web UI; the chosen address is printed on startup")
 	exclusive := flag.String("exclusive", "no",
 		"same-cwd concurrency control: \"no\" (default, just warn about other sessions), "+
@@ -491,26 +508,32 @@ func mainErr() error {
 			"\"probe\" (do not start; exit 0 if this cwd is free, nonzero if another session is live)")
 	var mitmUpstream stringSlice
 	mitmUpstream = append(mitmUpstream, fileOpts.MitmUpstream...)
-	flag.Var(&mitmUpstream, "mitm-upstream",
+	fs.Var(&mitmUpstream, "test.mitm-upstream",
 		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
 	var claudeFlags stringSlice
 	claudeFlags = append(claudeFlags, fileOpts.ClaudeFlags...)
-	flag.Var(&claudeFlags, "claude-flag",
+	fs.Var(&claudeFlags, "claude-flag",
 		"extra argument to pass to the in-container `claude` command (repeatable); e.g. --claude-flag=--setting-sources --claude-flag=user")
-	anthropicKeyOverride := flag.String("anthropic-key", "",
+	anthropicKeyOverride := fs.String("test.anthropic-key", "",
 		"override the Anthropic API key the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
-	anthropicBearerOverride := flag.String("anthropic-bearer", "",
+	anthropicBearerOverride := fs.String("test.anthropic-bearer", "",
 		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
-	anthropicRefreshOverride := flag.String("anthropic-refresh", "",
-		"OAuth refresh token to use with --anthropic-bearer for 401-triggered refresh; for testing")
-	recordUpstream := flag.String("record-upstream", fileOpts.RecordUpstream,
+	anthropicRefreshOverride := fs.String("test.anthropic-refresh", "",
+		"OAuth refresh token to use with --test.anthropic-bearer for 401-triggered refresh; for testing")
+	recordUpstream := fs.String("record-upstream", fileOpts.RecordUpstream,
 		"upstream ref bounding session bundles (default: origin's default branch)")
 	var recordExclude stringSlice
 	recordExclude = append(recordExclude, fileOpts.RecordExclude...)
-	flag.Var(&recordExclude, "record-exclude", "extra ignore pattern for recorded snapshots (repeatable)")
-	flag.Usage = func() {
-		o := flag.CommandLine.Output()
-		fmt.Fprint(o, `usage: runclaude [flags] [--] [command...]
+	fs.Var(&recordExclude, "record-exclude", "extra ignore pattern for recorded snapshots (repeatable)")
+	fs.Usage = func() {
+		o := fs.Output()
+		switch verb {
+		case "new":
+			fmt.Fprint(o, "usage: runclaude new [flags] [--] [claude args...]\n\nflags:\n")
+		case "resume":
+			fmt.Fprint(o, "usage: runclaude resume [<sid>] [flags] [--] [claude args...]\n\nflags:\n")
+		default:
+			fmt.Fprint(o, `usage: runclaude [flags] [--] [command...]
        runclaude new [flags] [--] [claude args...]             start a new recorded claude session
        runclaude resume [<sid>] [flags] [--] [claude args...]  resume a session (default: latest recorded)
        runclaude list                                          list recorded sessions
@@ -520,12 +543,13 @@ func mainErr() error {
 
 flags:
 `)
-		flag.PrintDefaults()
+		}
+		printVisibleDefaults(fs)
 	}
-	flag.CommandLine.Parse(cliArgs)
+	fs.Parse(cliArgs)
 	// Recording is turned on by the new/resume verbs or the project options
 	// file; stickiness re-enables it per session regardless (see record.go).
-	record := forceRecord || boolOr(fileOpts.Record, false)
+	record := verb != "" || boolOr(fileOpts.Record, false)
 	if resumeSid != "" && !*claudeMode {
 		return fmt.Errorf("resume requires claude mode (--claude)")
 	}
@@ -589,7 +613,7 @@ flags:
 		applyClaudeSettingsEnv(settings.Env)
 	}
 	// Explicit key/bearer overrides force the Anthropic path even on a
-	// Bedrock host (e.g. test-mitm.sh passing --anthropic-bearer).
+	// Bedrock host (e.g. test-mitm.sh passing --test.anthropic-bearer).
 	hasExplicitAnthropicCreds := *anthropicKeyOverride != "" || *anthropicBearerOverride != ""
 	useBedrock := claudeLike && !hasExplicitAnthropicCreds && os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1"
 	if hasExplicitAnthropicCreds {
@@ -609,7 +633,7 @@ flags:
 			allowedDomains = append(allowedDomains, "api.anthropic.com")
 		}
 	}
-	// Hosts mentioned via --mitm-upstream should also be MITM'd and on
+	// Hosts mentioned via --test.mitm-upstream should also be MITM'd and on
 	// the allowlist; the override is meaningless otherwise.
 	for host := range parseMitmUpstream(mitmUpstream) {
 		if !proxy.MatchDomain(host, mitmDomains) {
@@ -906,7 +930,7 @@ flags:
 				cmd = append(cmd, "--setting-sources", "user")
 			}
 			cmd = append(cmd, []string(claudeFlags)...)
-			claudeArgs := flag.Args()
+			claudeArgs := fs.Args()
 			if resumeSid != "" {
 				claudeArgs = append([]string{"--resume", resumeSid}, claudeArgs...)
 			}
@@ -943,7 +967,7 @@ flags:
 		}
 	}
 	if len(cfg.Command) == 0 {
-		if args := flag.Args(); len(args) > 0 {
+		if args := fs.Args(); len(args) > 0 {
 			cfg.Command = args
 		} else {
 			cfg.Command = []string{"bash"}

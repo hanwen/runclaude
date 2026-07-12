@@ -11,7 +11,7 @@ if [[ -z "$CLAUDE_CODE_USE_BEDROCK" ]]; then
     exit
 fi
 
-go run ./ --proxy-log $TMP/proxy.log --claude -- -p 'Repeat precisely: "bonanzablub"' |& tee $TMP/claude.log
+go run ./ --test.proxy-log $TMP/proxy.log --claude -- -p 'Repeat precisely: "bonanzablub"' |& tee $TMP/claude.log
 
 got="$(tail -1 $TMP/claude.log)"
 if [[ "$got" != "bonanzablub" ]] ; then

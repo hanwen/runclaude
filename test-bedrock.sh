@@ -11,7 +11,7 @@ if [[ -z "$CLAUDE_CODE_USE_BEDROCK" ]]; then
     exit
 fi
 
-go run ./ --proxy-log $TMP/proxy.log --claude-config \
+go run ./ --test.proxy-log $TMP/proxy.log --claude-config \
    bash -xc './agent-claude-bedrock.sh' |& tee $TMP/log
 
 grep '"role":"assistant"' $TMP/log
