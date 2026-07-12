@@ -3,7 +3,7 @@
 # inside the sandbox that appends transcript JSONL (as the real claude
 # would, into the live-bound ~/.claude/projects/) while mutating the
 # worktree, then asserts the host-side recorder produced checkpoint refs
-# and exercises the --upload/--download round trip.
+# and exercises the upload/download round trip.
 #
 # Prerequisites: working unprivileged user namespaces, git. The claude CLI
 # is NOT needed. For the pure-Go equivalent see record_test.go /

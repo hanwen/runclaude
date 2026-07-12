@@ -18,7 +18,7 @@ package main
 //
 // coalescing same-second events into one commit. meta.json (author,
 // recorder id, start, first prompt) is written once and reused as the same
-// blob in every commit; it drives --sessions discovery and scopes
+// blob in every commit; it drives `runclaude list` discovery and scopes
 // stickiness to the recording clone. transcript.jsonl is the session file
 // truncated at the parse offset per flush.
 
@@ -486,7 +486,7 @@ func (r *recorder) isSticky(sid string) bool {
 		return false
 	}
 	// Only the recording clone resumes a session: a reviewer's clone (refs
-	// fetched, transcript materialized by --download) has a different id
+	// fetched, transcript materialized by download) has a different id
 	// and must not extend the author's branch.
 	return m.RecorderID != "" && m.RecorderID == r.id
 }

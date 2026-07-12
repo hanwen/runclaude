@@ -167,7 +167,7 @@ func TestDispatchSubcommand(t *testing.T) {
 	}
 	// Anything else passes through untouched to regular flag parsing —
 	// including `--` escaping a command named like a verb.
-	for _, args := range [][]string{nil, {"--sessions"}, {"--", "list"}, {"bash", "-c", "true"}} {
+	for _, args := range [][]string{nil, {"--record"}, {"--", "list"}, {"bash", "-c", "true"}} {
 		handled, record, sid, rest, err := dispatchSubcommand(args)
 		if handled || record || sid != "" || err != nil || !reflect.DeepEqual(rest, args) {
 			t.Errorf("dispatchSubcommand(%v): handled=%v record=%v sid=%q rest=%v err=%v",

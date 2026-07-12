@@ -510,15 +510,6 @@ func mainErr() error {
 	var recordExclude stringSlice
 	recordExclude = append(recordExclude, fileOpts.RecordExclude...)
 	flag.Var(&recordExclude, "record-exclude", "extra ignore pattern for recorded snapshots (repeatable)")
-	upload := flag.String("upload", "",
-		"upload a recorded session to a directory/file (git bundle) or git remote/URL, then exit (alias of the upload subcommand)")
-	download := flag.String("download", "",
-		"fetch a recorded session from a bundle/remote, check it out as a new worktree, then exit (alias of the download subcommand)")
-	sessionFlag := flag.String("session", "", "session id for --upload/--download (default: latest / the only one)")
-	atFlag := flag.String("at", "", "checkpoint selector for --download: uuid or timestamp substring (default: latest)")
-	destFlag := flag.String("dest", "", "worktree directory for --download")
-	sessionsList := flag.Bool("sessions", false, "list recorded sessions, then exit (alias of the list subcommand)")
-	recordRm := flag.String("record-rm", "", "delete a recorded session's refs and state, then exit (alias of the rm subcommand)")
 	flag.Usage = func() {
 		o := flag.CommandLine.Output()
 		fmt.Fprint(o, `usage: runclaude [flags] [--] [command...]
@@ -539,13 +530,6 @@ flags:
 	}
 	if resumeSid != "" && !*claudeMode {
 		return fmt.Errorf("resume requires claude mode (--claude)")
-	}
-
-	if handled, err := runRecordCommands(recordCmdFlags{
-		upload: *upload, download: *download, session: *sessionFlag, at: *atFlag,
-		dest: *destFlag, upstream: *recordUpstream, rm: *recordRm, list: *sessionsList,
-	}, cwd, home); handled {
-		return err
 	}
 
 	switch *exclusive {
@@ -1100,7 +1084,7 @@ flags:
 		// The terminal is ours again: safe to tell the user what was
 		// recorded and how to share it.
 		for _, sid := range rec.Close() {
-			log.Printf("record: session %s recorded; share with: runclaude --upload <dir|remote> --session %s", sid, sid)
+			log.Printf("record: session %s recorded; share with: runclaude upload --session %s <dir|remote>", sid, sid)
 		}
 	}
 	return err

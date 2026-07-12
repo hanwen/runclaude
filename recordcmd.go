@@ -1,9 +1,7 @@
 package main
 
 // Host-only commands operating on recorded sessions: the list/upload/
-// download/rm subcommands and their legacy flag spellings (--sessions,
-// --upload, --download, --record-rm). These run before (instead of) any
-// sandbox setup.
+// download/rm subcommands. These run before (instead of) any sandbox setup.
 
 import (
 	"encoding/json"
@@ -138,46 +136,8 @@ func fileRecordUpstream(cwd string) string {
 	return opts.RecordUpstream
 }
 
-type recordCmdFlags struct {
-	upload   string // bundle path/dir, remote name, or URL
-	download string // bundle path, remote name, or URL
-	session  string // session id, or "latest"/"" for upload
-	at       string // uuid or timestamp substring selecting the checkpoint
-	dest     string // worktree dir for --download
-	upstream string // --record-upstream
-	rm       string // session id to delete
-	list     bool   // --sessions
-}
-
-// runRecordCommands executes any requested record command. It returns true
-// when a command ran (mainErr should exit without starting a sandbox).
-func runRecordCommands(f recordCmdFlags, cwd, home string) (bool, error) {
-	if f.upload == "" && f.download == "" && f.rm == "" && !f.list {
-		return false, nil
-	}
-	gitDir, ok := resolveRecordGitDir(cwd)
-	if !ok {
-		return true, fmt.Errorf("no git or jj repository at %s", cwd)
-	}
-	g := &gitRepo{gitDir: gitDir}
-	switch {
-	case f.list:
-		return true, listSessions(g)
-	case f.rm != "":
-		return true, removeSession(g, f.rm)
-	case f.upload != "":
-		sid, err := resolveSessionID(g, f.session)
-		if err != nil {
-			return true, err
-		}
-		return true, uploadSession(g, sid, f.upload, f.upstream)
-	default:
-		return true, downloadSession(g, f.download, f.session, f.at, f.dest, cwd, home)
-	}
-}
-
 // autoForkSession returns ["--fork-session"] when args resume a session
-// that was recorded by a different clone (e.g. fetched via --download):
+// that was recorded by a different clone (e.g. fetched via download):
 // continuing the author's session id would collide with their refs. A
 // session recorded by this clone continues — from any of its worktrees —
 // and stickiness keeps recording it.
