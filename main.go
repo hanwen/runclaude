@@ -503,8 +503,6 @@ func mainErr() error {
 		"override the Anthropic OAuth bearer the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	anthropicRefreshOverride := flag.String("anthropic-refresh", "",
 		"OAuth refresh token to use with --anthropic-bearer for 401-triggered refresh; for testing")
-	record := flag.Bool("record", boolOr(fileOpts.Record, false),
-		"record claude sessions: per-message worktree snapshots under refs/runclaude/<sid>/ plus a transcript branch (sticky per session; see docs/session-recording.md)")
 	recordUpstream := flag.String("record-upstream", fileOpts.RecordUpstream,
 		"upstream ref bounding session bundles (default: origin's default branch)")
 	var recordExclude stringSlice
@@ -515,7 +513,7 @@ func mainErr() error {
 		fmt.Fprint(o, `usage: runclaude [flags] [--] [command...]
        runclaude new [flags] [--] [claude args...]             start a new recorded claude session
        runclaude resume [<sid>] [flags] [--] [claude args...]  resume a session (default: latest recorded)
-       runclaude list                                        list recorded sessions
+       runclaude list                                          list recorded sessions
        runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>
        runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>
        runclaude rm <session-id>...
@@ -525,9 +523,9 @@ flags:
 		flag.PrintDefaults()
 	}
 	flag.CommandLine.Parse(cliArgs)
-	if forceRecord {
-		*record = true
-	}
+	// Recording is turned on by the new/resume verbs or the project options
+	// file; stickiness re-enables it per session regardless (see record.go).
+	record := forceRecord || boolOr(fileOpts.Record, false)
 	if resumeSid != "" && !*claudeMode {
 		return fmt.Errorf("resume requires claude mode (--claude)")
 	}
@@ -967,7 +965,7 @@ flags:
 		ApproveListen:  *approveListen,
 		MitmUpstream:   []string(mitmUpstream),
 		ClaudeFlags:    []string(claudeFlags),
-		Record:         boolPtr(*record),
+		Record:         boolPtr(record),
 		RecordUpstream: *recordUpstream,
 		RecordExclude:  []string(recordExclude),
 	}
@@ -987,8 +985,8 @@ flags:
 	}
 
 	// Session recorder: runs whenever a git dir resolves so sticky sessions
-	// (previously recorded, resumed without --record) keep recording; it
-	// claims new sessions only when --record was given.
+	// (previously recorded, resumed on a plain run) keep recording; it
+	// claims new sessions only when recording was asked for.
 	var rec *recorder
 	if claudeLike && !onlyMode {
 		if gitDir, ok := resolveRecordGitDir(cwd); ok {
@@ -1000,9 +998,9 @@ flags:
 			if err != nil {
 				return err
 			}
-			r, err := newRecorder(gitDir, cwd, home, *record, *recordUpstream, recordExclude, recordLogger)
+			r, err := newRecorder(gitDir, cwd, home, record, *recordUpstream, recordExclude, recordLogger)
 			if err != nil {
-				log.Printf("warning: --record: %v", err)
+				log.Printf("warning: record: %v", err)
 			} else {
 				rec = r
 				// Sessions are repo-scoped: bind the shared dir (the main
@@ -1016,12 +1014,12 @@ flags:
 					}
 				}
 				go rec.run()
-				if *record {
+				if record {
 					log.Printf("record: on — snapshots under refs/runclaude/, log: %s", recordLogPath)
 				}
 			}
-		} else if *record {
-			log.Printf("warning: --record: no git or jj repository at %s", cwd)
+		} else if record {
+			log.Printf("warning: record: no git or jj repository at %s", cwd)
 		}
 	}
 

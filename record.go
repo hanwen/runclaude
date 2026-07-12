@@ -1,6 +1,7 @@
 package main
 
-// Session recording (--record): correlate Claude Code transcript positions
+// Session recording (the new/resume subcommands, or `record: true` in
+// .claude/runclaude.json): correlate Claude Code transcript positions
 // with filesystem snapshots so a session can be uploaded and reviewed as
 // "conversation + tree state at each step" (see docs/session-recording.md).
 //
@@ -136,11 +137,11 @@ type recorder struct {
 	cwd         string // worktree this recorder snapshots
 	projectsDir string // host dir with <sid>.jsonl files (repo-scoped)
 	stateDir    string // <git-common-dir>/runclaude/record
-	recordAll   bool   // --record: claim sessions started under this run
+	recordAll   bool   // recording requested: claim sessions started under this run
 	upstream    string // configured upstream for meta
 	start       time.Time
 	// preexisting holds session ids whose files already existed at
-	// recorder start; --record only claims sessions newer than that
+	// recorder start; recordAll only claims sessions newer than that
 	// (sticky sessions are claimed regardless).
 	preexisting map[string]bool
 	logger      *log.Logger
@@ -358,7 +359,8 @@ func fileSize(path string) (int64, error) {
 
 // maybeClaim decides whether this recorder owns sid and, if so, locks and
 // initializes it. Ownership rules: (a) sticky — the session branch exists
-// and its meta.json recorder id is this clone's — or (b) --record was given
+// and its meta.json recorder id is this clone's — or (b) recording was asked
+// for (new/resume verb, or the options file)
 // and the session file appeared after this recorder started; and in either
 // case the transcript's latest entries were written from this worktree
 // (the projects dir is shared by all worktrees of the clone).

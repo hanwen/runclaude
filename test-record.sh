@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end test for session recording (--record): runs a fake "claude"
+# End-to-end test for session recording (the new subcommand): runs a fake
+# "claude"
 # inside the sandbox that appends transcript JSONL (as the real claude
 # would, into the live-bound ~/.claude/projects/) while mutating the
 # worktree, then asserts the host-side recorder produced checkpoint refs
@@ -55,7 +56,7 @@ echo '{"type":"user","uuid":"u5","message":{"content":[{"type":"tool_result","to
 sleep 1.5
 EOF
 
-(cd "$REPO" && "$WORKDIR/runclaude" --record --claude-config --claude=false \
+(cd "$REPO" && "$WORKDIR/runclaude" new --claude-config --claude=false \
     --restrict-net=false --map-path=false -- bash fake-claude.sh)
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

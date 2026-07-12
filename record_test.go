@@ -295,7 +295,7 @@ func TestRecorderStickyResume(t *testing.T) {
 	e.rec.scanOnce()
 	e.rec.Close()
 
-	// New recorder WITHOUT --record must resume via stickiness, from the
+	// New recorder without recordAll must resume via stickiness, from the
 	// recorded offset (no duplicate transcript commits).
 	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, false, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
@@ -390,7 +390,7 @@ func TestRecorderLockExcludesSecond(t *testing.T) {
 func TestRecorderIgnoresPreexistingSessions(t *testing.T) {
 	e := newTestEnv(t)
 	// A file that predates the recorder and has no refs: not claimed even
-	// with --record.
+	// with recordAll.
 	e.append(t, entryLine(t, "user", "u1", "old", nil))
 	rec2, err := newRecorder(filepath.Join(e.repo, ".git"), e.repo, e.home, true, "", nil, log.New(os.Stderr, "", 0))
 	if err != nil {
@@ -544,7 +544,7 @@ func TestResolveRecordGitDirNonColocatedJJ(t *testing.T) {
 func TestRecorderClaimGateByCwd(t *testing.T) {
 	e := newTestEnv(t)
 	// Entries written from another worktree: this recorder must not claim,
-	// even with --record.
+	// even with recordAll.
 	other := filepath.Join(t.TempDir(), "elsewhere")
 	e.append(t, entryLine(t, "user", "u1", "hi", map[string]any{"cwd": other}))
 	e.rec.scanOnce()
