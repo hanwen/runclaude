@@ -89,8 +89,35 @@ func resolveGitDir(cwd string) (string, bool) {
 	return filepath.Clean(gd), true
 }
 
+// jjRepoDir returns cwd's jj repo dir. In the main workspace .jj/repo is
+// the dir itself; a linked workspace (`jj workspace add`) has a pointer
+// file there instead, holding the main repo dir's path (relative to .jj).
+func jjRepoDir(cwd string) (string, bool) {
+	p := filepath.Join(cwd, ".jj", "repo")
+	fi, err := os.Stat(p)
+	if err != nil {
+		return "", false
+	}
+	if fi.IsDir() {
+		return p, true
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", false
+	}
+	repo := strings.TrimSpace(string(data))
+	if !filepath.IsAbs(repo) {
+		repo = filepath.Join(cwd, ".jj", repo)
+	}
+	return filepath.Clean(repo), true
+}
+
 func resolveJJGitStore(cwd string) (string, bool) {
-	store := filepath.Join(cwd, ".jj", "repo", "store")
+	repo, ok := jjRepoDir(cwd)
+	if !ok {
+		return "", false
+	}
+	store := filepath.Join(repo, "store")
 	typ, err := os.ReadFile(filepath.Join(store, "type"))
 	if err != nil || strings.TrimSpace(string(typ)) != "git" {
 		return "", false
@@ -104,4 +131,14 @@ func resolveJJGitStore(cwd string) (string, bool) {
 		gd = filepath.Join(store, gd)
 	}
 	return filepath.Clean(gd), true
+}
+
+// resolveRecordGitDir returns the git object store backing cwd for session
+// recording: the repo's own .git, or a jj repo's git backend store — which
+// also covers jj workspaces, whose dirs have no .git at all.
+func resolveRecordGitDir(cwd string) (string, bool) {
+	if d, ok := resolveGitDir(cwd); ok {
+		return d, true
+	}
+	return resolveJJGitStore(cwd)
 }

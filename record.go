@@ -77,6 +77,12 @@ func repoSessionsDir(home, cwd, commonDir string) string {
 	if filepath.Base(commonDir) == ".git" {
 		return transcriptDir(home, filepath.Dir(commonDir))
 	}
+	// A non-colocated jj repo's git store sits at <main>/.jj/repo/store/git;
+	// key sessions to the main workspace root, same as the colocated case.
+	jjStore := string(filepath.Separator) + filepath.Join(".jj", "repo", "store", "git")
+	if root, ok := strings.CutSuffix(commonDir, jjStore); ok && root != "" {
+		return transcriptDir(home, root)
+	}
 	return transcriptDir(home, cwd)
 }
 
@@ -190,8 +196,10 @@ func newRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 	}
 	// Recorder-side excludes: the container's vcsExcludeBinds overlay is
 	// invisible on the host, so hide claude's runtime settings.json
-	// mutations here too, plus user-configured patterns.
-	patterns := append([]string{".claude/settings.json"}, extraExcludes...)
+	// mutations here too, plus user-configured patterns. `.jj/` is jj's
+	// repo/working-copy state — linked jj workspaces carry no .jj/.gitignore
+	// (unlike colocated main workspaces), so add -A would ingest it.
+	patterns := append([]string{".claude/settings.json", ".jj/"}, extraExcludes...)
 	excludesFile := filepath.Join(stateDir, "exclude")
 	if err := os.WriteFile(excludesFile, []byte(strings.Join(patterns, "\n")+"\n"), 0600); err != nil {
 		return nil, err

@@ -29,9 +29,9 @@ func runRecordCommands(f recordCmdFlags, cwd, home string) (bool, error) {
 	if f.upload == "" && f.download == "" && f.rm == "" && !f.list {
 		return false, nil
 	}
-	gitDir, ok := resolveGitDir(cwd)
+	gitDir, ok := resolveRecordGitDir(cwd)
 	if !ok {
-		return true, fmt.Errorf("no git repository at %s", cwd)
+		return true, fmt.Errorf("no git or jj repository at %s", cwd)
 	}
 	g := &gitRepo{gitDir: gitDir}
 	switch {
@@ -65,7 +65,7 @@ func autoForkSession(cwd string, args []string) []string {
 			return nil
 		}
 	}
-	gitDir, ok := resolveGitDir(cwd)
+	gitDir, ok := resolveRecordGitDir(cwd)
 	if !ok {
 		return nil
 	}

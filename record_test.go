@@ -434,6 +434,113 @@ func TestRecorderRepoScopedSessionsDir(t *testing.T) {
 	}
 }
 
+// addJJWorkspace fabricates jj metadata (no jj binary needed): it marks
+// repo as a colocated jj main workspace and returns a sibling linked
+// workspace whose .jj/repo is the pointer file `jj workspace add` writes,
+// holding the main repo dir's path relative to the workspace's .jj.
+func addJJWorkspace(t *testing.T, repo string) string {
+	t.Helper()
+	store := filepath.Join(repo, ".jj", "repo", "store")
+	if err := os.MkdirAll(store, 0755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(store, "type"):             "git\n",
+		filepath.Join(store, "git_target"):       "../../../.git",
+		filepath.Join(repo, ".jj", ".gitignore"): "/*\n",
+	}
+	ws := filepath.Join(filepath.Dir(repo), "jjws")
+	if err := os.MkdirAll(filepath.Join(ws, ".jj", "working_copy"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(filepath.Join(ws, ".jj"), filepath.Join(repo, ".jj", "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files[filepath.Join(ws, ".jj", "repo")] = rel
+	files[filepath.Join(ws, ".jj", "working_copy", "tree_state")] = "opaque jj state"
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ws
+}
+
+func TestRecorderInJJWorkspace(t *testing.T) {
+	e := newTestEnv(t)
+	ws := addJJWorkspace(t, e.repo)
+
+	gitDir, ok := resolveRecordGitDir(ws)
+	if !ok || gitDir != filepath.Join(e.repo, ".git") {
+		t.Fatalf("resolveRecordGitDir(%s) = %q, %v; want the main workspace's .git", ws, gitDir, ok)
+	}
+	rec2, err := newRecorder(gitDir, ws, e.home, true, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec2.Close()
+	// Sessions and state are shared with recorders in the main workspace.
+	if rec2.projectsDir != e.rec.projectsDir {
+		t.Errorf("projectsDir differs: %q vs %q", rec2.projectsDir, e.rec.projectsDir)
+	}
+	if rec2.id != e.rec.id {
+		t.Errorf("recorder id differs: %q vs %q", rec2.id, e.rec.id)
+	}
+
+	// A checkpoint recorded from the workspace snapshots the workspace's
+	// tree and never ingests its .jj/ state (jj writes no .jj/.gitignore in
+	// linked workspaces).
+	sid := "99999999-8888-7777-6666-555555555555"
+	tf := filepath.Join(rec2.projectsDir, sid+".jsonl")
+	lines := entryLine(t, "assistant", "w1", []map[string]any{
+		{"type": "tool_use", "id": "t1", "name": "Write"},
+	}, map[string]any{"cwd": ws}) + entryLine(t, "user", "w2", []map[string]any{
+		{"type": "tool_result", "tool_use_id": "t1"},
+	}, map[string]any{"cwd": ws})
+	if err := os.WriteFile(tf, []byte(lines), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "ws.txt"), []byte("from ws\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rec2.scanOnce()
+	refs, err := rec2.git.refNames(recordRefPrefix + sid + "/tree/")
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("checkpoint refs: %v, %v", refs, err)
+	}
+	tree, err := rec2.git.run("ls-tree", "-r", "--name-only", refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tree, "ws.txt") {
+		t.Errorf("snapshot missing workspace file:\n%s", tree)
+	}
+	if strings.Contains(tree, ".jj/") {
+		t.Errorf("snapshot ingested .jj state:\n%s", tree)
+	}
+}
+
+func TestResolveRecordGitDirNonColocatedJJ(t *testing.T) {
+	// Non-colocated jj repo: the git store is internal, .jj/repo/store/git.
+	main := filepath.Join(t.TempDir(), "main")
+	store := filepath.Join(main, ".jj", "repo", "store")
+	if err := os.MkdirAll(store, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(store, "type"), []byte("git\n"), 0644)
+	os.WriteFile(filepath.Join(store, "git_target"), []byte("git"), 0644)
+	gitDir, ok := resolveRecordGitDir(main)
+	if want := filepath.Join(store, "git"); !ok || gitDir != want {
+		t.Fatalf("resolveRecordGitDir = %q, %v; want %q", gitDir, ok, want)
+	}
+	// Sessions key to the main workspace root, matching the colocated case.
+	home := t.TempDir()
+	if got, want := repoSessionsDir(home, "/elsewhere/ws", gitDir), transcriptDir(home, main); got != want {
+		t.Errorf("repoSessionsDir = %q, want %q", got, want)
+	}
+}
+
 func TestRecorderClaimGateByCwd(t *testing.T) {
 	e := newTestEnv(t)
 	// Entries written from another worktree: this recorder must not claim,

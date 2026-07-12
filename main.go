@@ -978,7 +978,7 @@ func mainErr() error {
 	// claims new sessions only when --record was given.
 	var rec *recorder
 	if claudeLike && !onlyMode {
-		if gitDir, ok := resolveGitDir(cwd); ok {
+		if gitDir, ok := resolveRecordGitDir(cwd); ok {
 			// Recorder output goes to a file: claude's TUI owns the
 			// terminal once the container starts. Anything user-facing is
 			// printed here (before) or after cmd.Run (below).
@@ -1008,7 +1008,7 @@ func mainErr() error {
 				}
 			}
 		} else if *record {
-			log.Printf("warning: --record: no git repository at %s", cwd)
+			log.Printf("warning: --record: no git or jj repository at %s", cwd)
 		}
 	}
 
