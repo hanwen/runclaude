@@ -18,29 +18,63 @@ import (
 // dispatchSubcommand handles `runclaude <verb> ...` session-management
 // subcommands. The verb must be the first argument; `runclaude -- <verb>`
 // escapes a sandbox command that happens to share a verb's name. Host-only
-// verbs run here (handled=true, caller exits); "new" is the normal sandbox
-// path with recording forced on, so it only strips the verb and sets
-// newSession — rest feeds the regular flag parsing.
-func dispatchSubcommand(args []string) (handled, newSession bool, rest []string, err error) {
+// verbs run here (handled=true, caller exits); "new" and "resume" are the
+// normal sandbox path with recording forced on, so they only strip the
+// verb (resume also its session id, resolved into resumeSid) and set
+// record — rest feeds the regular flag parsing.
+func dispatchSubcommand(args []string) (handled, record bool, resumeSid string, rest []string, err error) {
 	if len(args) == 0 {
-		return false, false, args, nil
+		return false, false, "", args, nil
 	}
 	switch args[0] {
 	case "new":
-		return false, true, args[1:], nil
+		return false, true, "", args[1:], nil
+	case "resume":
+		sid, rest, err := resumeSubcommand(args[1:])
+		if err != nil {
+			return true, false, "", nil, err
+		}
+		return false, true, sid, rest, nil
 	case "list", "upload", "download", "rm":
 	default:
-		return false, false, args, nil
+		return false, false, "", args, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return true, false, nil, err
+		return true, false, "", nil, err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return true, false, nil, err
+		return true, false, "", nil, err
 	}
-	return true, false, nil, runSessionSubcommand(args[0], args[1:], cwd, home)
+	return true, false, "", nil, runSessionSubcommand(args[0], args[1:], cwd, home)
+}
+
+// resumeSubcommand picks the session id for the resume verb: an explicit
+// first argument, or — when absent or "latest" — the newest recorded
+// session of cwd's repo. An explicit id needs no repo at all: it is
+// claude's to resolve.
+func resumeSubcommand(args []string) (sid string, rest []string, err error) {
+	rest = args
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		sid, rest = rest[0], rest[1:]
+	}
+	if sid != "" && sid != "latest" {
+		return sid, rest, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", nil, err
+	}
+	gitDir, ok := resolveRecordGitDir(cwd)
+	if !ok {
+		return "", nil, fmt.Errorf("resume: no git or jj repository at %s", cwd)
+	}
+	sid, err = resolveSessionID(&gitRepo{gitDir: gitDir}, "latest")
+	if err != nil {
+		return "", nil, err
+	}
+	return sid, rest, nil
 }
 
 // runSessionSubcommand executes a host-only session verb against cwd's repo.
@@ -215,7 +249,7 @@ func resolveSessionID(g *gitRepo, flagValue string) (string, error) {
 		return "", err
 	}
 	if len(ids) == 0 {
-		return "", fmt.Errorf("no recorded sessions (run with --record first)")
+		return "", fmt.Errorf("no recorded sessions (start one with `runclaude new`)")
 	}
 	return ids[len(ids)-1], nil
 }
@@ -499,7 +533,7 @@ func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
 	}
 
 	fmt.Printf("session %s checked out at %s (checkpoint %s)\n", sid, dest, strings.TrimPrefix(ref, recordRefPrefix+sid+"/tree/"))
-	fmt.Printf("replay: cd %s && runclaude -- --resume %s\n", dest, sid)
+	fmt.Printf("replay: cd %s && runclaude resume %s\n", dest, sid)
 	fmt.Printf("step checkpoints: git diff <ref-A> <ref-B> over refs under %s%s/tree/\n", recordRefPrefix, sid)
 	return nil
 }

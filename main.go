@@ -425,7 +425,7 @@ func cacheDirFor(cwd string) (string, error) {
 }
 
 func mainErr() error {
-	handled, newSession, cliArgs, err := dispatchSubcommand(os.Args[1:])
+	handled, forceRecord, resumeSid, cliArgs, err := dispatchSubcommand(os.Args[1:])
 	if handled {
 		return err
 	}
@@ -522,8 +522,9 @@ func mainErr() error {
 	flag.Usage = func() {
 		o := flag.CommandLine.Output()
 		fmt.Fprint(o, `usage: runclaude [flags] [--] [command...]
-       runclaude new [flags] [--] [claude args...]   start a new recorded claude session
-       runclaude list                                list recorded sessions
+       runclaude new [flags] [--] [claude args...]             start a new recorded claude session
+       runclaude resume [<sid>] [flags] [--] [claude args...]  resume a session (default: latest recorded)
+       runclaude list                                        list recorded sessions
        runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>
        runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>
        runclaude rm <session-id>...
@@ -533,8 +534,11 @@ flags:
 		flag.PrintDefaults()
 	}
 	flag.CommandLine.Parse(cliArgs)
-	if newSession {
+	if forceRecord {
 		*record = true
+	}
+	if resumeSid != "" && !*claudeMode {
+		return fmt.Errorf("resume requires claude mode (--claude)")
 	}
 
 	if handled, err := runRecordCommands(recordCmdFlags{
@@ -920,12 +924,16 @@ flags:
 				cmd = append(cmd, "--setting-sources", "user")
 			}
 			cmd = append(cmd, []string(claudeFlags)...)
-			cmd = append(cmd, flag.Args()...)
+			claudeArgs := flag.Args()
+			if resumeSid != "" {
+				claudeArgs = append([]string{"--resume", resumeSid}, claudeArgs...)
+			}
+			cmd = append(cmd, claudeArgs...)
 			// Resuming a session recorded by a different clone (fetched via
 			// --download) must fork: continuing the author's session id
 			// would collide with their refs. Same-clone sessions continue.
 			if !onlyMode {
-				cmd = append(cmd, autoForkSession(cwd, flag.Args())...)
+				cmd = append(cmd, autoForkSession(cwd, claudeArgs)...)
 			}
 			cfg.Command = cmd
 		}

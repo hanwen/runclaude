@@ -156,18 +156,39 @@ func TestListAndRemoveSessions(t *testing.T) {
 }
 
 func TestDispatchSubcommand(t *testing.T) {
-	handled, newSession, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
-	if handled || !newSession || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
-		t.Errorf("new: handled=%v newSession=%v rest=%v err=%v", handled, newSession, rest, err)
+	handled, record, sid, rest, err := dispatchSubcommand([]string{"new", "--", "-p", "hi"})
+	if handled || !record || sid != "" || err != nil || !reflect.DeepEqual(rest, []string{"--", "-p", "hi"}) {
+		t.Errorf("new: handled=%v record=%v sid=%q rest=%v err=%v", handled, record, sid, rest, err)
+	}
+	// An explicit resume id needs no repo; remaining args feed flag parsing.
+	handled, record, sid, rest, err = dispatchSubcommand([]string{"resume", "abc", "--restrict-net=false"})
+	if handled || !record || sid != "abc" || err != nil || !reflect.DeepEqual(rest, []string{"--restrict-net=false"}) {
+		t.Errorf("resume abc: handled=%v record=%v sid=%q rest=%v err=%v", handled, record, sid, rest, err)
 	}
 	// Anything else passes through untouched to regular flag parsing —
 	// including `--` escaping a command named like a verb.
 	for _, args := range [][]string{nil, {"--sessions"}, {"--", "list"}, {"bash", "-c", "true"}} {
-		handled, newSession, rest, err := dispatchSubcommand(args)
-		if handled || newSession || err != nil || !reflect.DeepEqual(rest, args) {
-			t.Errorf("dispatchSubcommand(%v): handled=%v newSession=%v rest=%v err=%v",
-				args, handled, newSession, rest, err)
+		handled, record, sid, rest, err := dispatchSubcommand(args)
+		if handled || record || sid != "" || err != nil || !reflect.DeepEqual(rest, args) {
+			t.Errorf("dispatchSubcommand(%v): handled=%v record=%v sid=%q rest=%v err=%v",
+				args, handled, record, sid, rest, err)
 		}
+	}
+}
+
+func TestResumeSubcommandLatest(t *testing.T) {
+	e := recordDemoSession(t)
+	t.Chdir(e.repo)
+	for _, args := range [][]string{nil, {"latest"}, {"--", "-p", "hi"}} {
+		sid, _, err := resumeSubcommand(args)
+		if err != nil || sid != e.session {
+			t.Errorf("resumeSubcommand(%v): sid=%q err=%v, want %q", args, sid, err, e.session)
+		}
+	}
+
+	t.Chdir(t.TempDir())
+	if _, _, err := resumeSubcommand(nil); err == nil {
+		t.Error("resumeSubcommand outside a repo succeeded")
 	}
 }
 
