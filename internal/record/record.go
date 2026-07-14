@@ -90,10 +90,9 @@ func repoSessionsDir(home, cwd, commonDir string) string {
 // recordState is the cached per-session recorder state. It is advisory:
 // the authoritative resume point is the size of the tip's transcript blob.
 type recordState struct {
-	Offset         int64  `json:"offset"`
-	LastTree       string `json:"lastTree,omitempty"`
-	LastCheckpoint string `json:"lastCheckpoint,omitempty"`
-	Tip            string `json:"tip,omitempty"` // <sid>/meta branch tip
+	Offset   int64  `json:"offset"`
+	LastTree string `json:"lastTree,omitempty"`
+	Tip      string `json:"tip,omitempty"` // <sid>/meta branch tip
 }
 
 type sessionMeta struct {
@@ -200,14 +199,8 @@ func NewRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
-	// Recorder-side excludes: the container's vcsExcludeBinds overlay is
-	// invisible on the host, so hide claude's runtime settings.json
-	// mutations here too, plus user-configured patterns. `.jj/` is jj's
-	// repo/working-copy state — linked jj workspaces carry no .jj/.gitignore
-	// (unlike colocated main workspaces), so add -A would ingest it.
-	patterns := append([]string{".claude/settings.json", ".jj/"}, extraExcludes...)
 	excludesFile := filepath.Join(stateDir, "exclude")
-	if err := os.WriteFile(excludesFile, []byte(strings.Join(patterns, "\n")+"\n"), 0600); err != nil {
+	if err := writeExcludesFile(excludesFile, extraExcludes); err != nil {
 		return nil, err
 	}
 	git.excludesFile = excludesFile
@@ -247,6 +240,18 @@ func NewRecorder(gitDir, cwd, home string, recordAll bool, upstream string, extr
 	}
 	r.preexisting = preexisting
 	return r, nil
+}
+
+// writeExcludesFile writes the snapshot exclusion patterns applied via
+// core.excludesFile: the container's vcsExcludeBinds overlay is invisible
+// on the host, so hide claude's runtime settings.json mutations here too,
+// plus user-configured patterns. `.jj/` is jj's repo/working-copy state —
+// linked jj workspaces carry no .jj/.gitignore (unlike colocated main
+// workspaces), so add -A would ingest it. Shared by the recorder and the
+// resume-time restore, which must see the same tree.
+func writeExcludesFile(path string, extraExcludes []string) error {
+	patterns := append([]string{".claude/settings.json", ".jj/"}, extraExcludes...)
+	return os.WriteFile(path, []byte(strings.Join(patterns, "\n")+"\n"), 0600)
 }
 
 // materializeTranscripts writes recorded sessions whose live transcript is
@@ -292,9 +297,9 @@ func (r *Recorder) Run() {
 	}
 }
 
-// Close stops polling, takes a final flush, and repacks if anything was
-// recorded. It returns the recorded session ids so the caller can print a
-// summary once the terminal is free again.
+// Close stops polling and takes a final flush. It returns the recorded
+// session ids so the caller can print a summary once the terminal is free
+// again.
 func (r *Recorder) Close() []string {
 	close(r.done)
 	r.wg.Wait()
@@ -310,11 +315,6 @@ func (r *Recorder) Close() []string {
 		recorded = append(recorded, s.sid)
 	}
 	r.mu.Unlock()
-	if len(recorded) > 0 {
-		if err := r.git.repack(); err != nil {
-			r.logger.Printf("record: repack: %v", err)
-		}
-	}
 	return recorded
 }
 
@@ -596,7 +596,7 @@ func (r *Recorder) pollSession(s *recSession) {
 	}
 
 	if len(snapshotUUIDs) > 0 {
-		r.snapshot(s, snapshotUUIDs, lastTS, newOffset)
+		r.snapshot(s, snapshotUUIDs, lastTS)
 	}
 	s.state.Offset = newOffset
 	r.saveState(s)
@@ -685,7 +685,7 @@ func (r *Recorder) handleEntry(s *recSession, line []byte) (uuid, ts string, mut
 // smushing). Unchanged trees create no commit. In a jj workspace the
 // checkpoint carries @'s change id, and when jj's own snapshot already
 // matches the tree it is reused verbatim (see recordjj.go).
-func (r *Recorder) snapshot(s *recSession, uuids []string, entryTS string, offset int64) {
+func (r *Recorder) snapshot(s *recSession, uuids []string, entryTS string) {
 	// Per-session private index: never touches the user's staging area,
 	// persists across flushes for incremental restats.
 	g := *r.git
@@ -698,39 +698,35 @@ func (r *Recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 	if tree == s.state.LastTree {
 		return
 	}
-	var wcCommit, changeID string
+	var wc *jjWC
 	if r.jjDir != "" {
-		if wcCommit, changeID, err = jjWorkingCopy(r.jjDir); err != nil {
+		if wc, err = jjWorkingCopy(r.jjDir); err != nil {
 			r.logger.Printf("record: %s: %v (checkpoints without change ids)", s.sid, err)
 			r.jjDir = ""
 		}
 	}
 	sha := ""
-	if wcCommit != "" {
+	if wc != nil {
 		// jj snapshotted this exact tree already (the last mutation came
 		// through a jj command): the checkpoint is the jj-authored commit.
-		if wcTree, err := r.git.run("rev-parse", "--verify", wcCommit+"^{tree}"); err == nil && wcTree == tree {
-			sha = wcCommit
+		if wcTree, err := r.git.run("rev-parse", "--verify", wc.commitID+"^{tree}"); err == nil && wcTree == tree {
+			sha = wc.commitID
 		}
 	}
 	if sha == "" {
+		// Checkpoints amend rather than stack: successive commits share
+		// parents and message and differ only in tree — the per-uuid refs
+		// are the history. In a jj workspace the checkpoint is an amended
+		// version of the user's change (@'s parents, description, and
+		// change id); in plain git it amends onto the current HEAD with an
+		// empty message (uncommitted work has no description there either).
 		var parents []string
-		head := r.git.headCommit()
-		if s.state.LastCheckpoint == "" {
-			if head != "" {
-				parents = append(parents, head)
-			}
-		} else {
-			parents = append(parents, s.state.LastCheckpoint)
-			// Pin a moved HEAD as second parent only when it is genuinely new
-			// history (jj moves HEAD on nearly every command; reachable HEADs
-			// would spray merge parents across every checkpoint).
-			if head != "" && !r.git.isAncestor(head, s.state.LastCheckpoint) {
-				parents = append(parents, head)
-			}
+		msg, changeID := "", ""
+		if wc != nil {
+			parents, msg, changeID = wc.parents, wc.desc, wc.changeID
+		} else if head := r.git.headCommit(); head != "" {
+			parents = []string{head}
 		}
-		msg := fmt.Sprintf("runclaude checkpoint\n\nsession: %s\nuuids: %s\nspan: %d-%d\n",
-			s.sid, strings.Join(uuids, " "), s.state.Offset, offset)
 		sha, err = r.git.commitTreeChangeID(tree, parents, msg, changeID)
 		if err != nil {
 			r.logger.Printf("record: %s: commit: %v", s.sid, err)
@@ -745,7 +741,6 @@ func (r *Recorder) snapshot(s *recSession, uuids []string, entryTS string, offse
 		}
 	}
 	s.state.LastTree = tree
-	s.state.LastCheckpoint = sha
 }
 
 // flushTranscript commits meta.json + the transcript onto the session

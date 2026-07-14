@@ -30,13 +30,15 @@ $GIT init -q -b main
 echo base > "$REPO/a.txt"
 $GIT add a.txt
 $GIT commit -q -m 'initial'
+$GIT branch initial
+
 
 # The transcript dir claude would use for this cwd (inside the container it
 # is live-bound from the real ~/.claude, so the recorder sees writes).
 ENC=$(printf %s "$REPO" | tr -c 'A-Za-z0-9' '-')
 TDIR="$HOME/.claude/projects/$ENC"
 TFILE="$TDIR/$SID.jsonl"
-trap 'rm -rf "$WORKDIR" "$TDIR"' EXIT
+#trap 'rm -rf "$WORKDIR" "$TDIR"' EXIT
 
 # Fake-claude: two turns, each appends tool_use, mutates the tree, then
 # appends the tool_result that triggers the snapshot. Lives inside the
@@ -79,10 +81,15 @@ $GIT show "refs/runclaude/$SID/meta:transcript.jsonl" | grep -q '"uuid":"u5"' \
 
 CLONE="$WORKDIR/clone"
 git clone -q "$REPO" "$CLONE"
-(cd "$CLONE" && "$WORKDIR/runclaude" download --dest "$WORKDIR/review" "$WORKDIR/$SID.bundle")
-[[ "$(cat "$WORKDIR/review/b.txt")" == "v2" ]] || fail "downloaded worktree content"
+(cd "$CLONE" && "$WORKDIR/runclaude" download "$WORKDIR/$SID.bundle")
+# Download is fetch-only: the refs arrive, nothing is checked out. The tree
+# is materialized by `runclaude resume` (RestoreCheckpoint; covered by
+# recordcmd_test.go / recordjj_test.go, as resume needs the claude CLI).
+git -C "$CLONE" for-each-ref --format='%(refname)' "refs/runclaude/$SID" \
+    | grep -q "/tree/.*/u5$" || fail "downloaded refs missing u5 checkpoint"
+[[ -e "$CLONE/b.txt" ]] && fail "download checked out the worktree"
 
-# The download materialized the transcript into the clone's repo-scoped
-# sessions dir in the real home; clean it up.
-rm -rf "$HOME/.claude/projects/$(printf %s "$CLONE" | tr -c 'A-Za-z0-9' '-')"
+# JJ support (including restoring this git-recorded session into a jj
+# workspace) is exercised by test-record-jj.sh.
+
 echo "PASS test-record.sh"

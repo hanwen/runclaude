@@ -38,25 +38,48 @@ func detectJJ(cwd string, logger *log.Logger) string {
 	return cwd
 }
 
-// jjWorkingCopy resolves dir's workspace working-copy commit and change id
-// without creating an operation or touching the working copy.
-func jjWorkingCopy(dir string) (commitID, changeID string, err error) {
+// jjWC is the working-copy commit @ as resolved by jjWorkingCopy: what a
+// recorder-authored checkpoint amends (same parents, description, and
+// change id — only the tree differs).
+type jjWC struct {
+	commitID string
+	changeID string
+	// parents are @'s parent commit ids; empty when @ sits on the root
+	// commit, which is virtual (no git object) and cannot be a parent.
+	parents []string
+	desc    string
+}
+
+// jjWorkingCopy resolves dir's workspace working-copy commit without
+// creating an operation or touching the working copy.
+func jjWorkingCopy(dir string) (*jjWC, error) {
 	cmd := exec.Command("jj", "log", "--no-graph", "--ignore-working-copy",
-		"-r", "@", "-T", `commit_id ++ " " ++ change_id`)
+		"-r", "@", "-T", `commit_id ++ " " ++ change_id ++ " " ++ parents.map(|c| c.commit_id()).join(" ") ++ "\n" ++ description`)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return "", "", fmt.Errorf("jj log -r @: %v: %s", err, strings.TrimSpace(string(ee.Stderr)))
+			return nil, fmt.Errorf("jj log -r @: %v: %s", err, strings.TrimSpace(string(ee.Stderr)))
 		}
-		return "", "", fmt.Errorf("jj log -r @: %w", err)
+		return nil, fmt.Errorf("jj log -r @: %w", err)
 	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) != 2 || !isHex(fields[0]) || !isReverseHex(fields[1]) {
-		return "", "", fmt.Errorf("jj log -r @: unexpected output %q", strings.TrimSpace(string(out)))
+	ids, desc, _ := strings.Cut(string(out), "\n")
+	fields := strings.Fields(ids)
+	if len(fields) < 2 || !isHex(fields[0]) || !isReverseHex(fields[1]) {
+		return nil, fmt.Errorf("jj log -r @: unexpected output %q", ids)
 	}
-	return fields[0], fields[1], nil
+	wc := &jjWC{commitID: fields[0], changeID: fields[1], desc: desc}
+	for _, p := range fields[2:] {
+		if !isHex(p) {
+			return nil, fmt.Errorf("jj log -r @: unexpected parent %q", p)
+		}
+		if strings.Trim(p, "0") == "" {
+			continue // the virtual root commit
+		}
+		wc.parents = append(wc.parents, p)
+	}
+	return wc, nil
 }
 
 // isHex reports whether s is a non-empty lowercase hex string (a commit id).

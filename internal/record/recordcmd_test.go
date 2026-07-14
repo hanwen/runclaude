@@ -1,6 +1,7 @@
 package record
 
 import (
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +71,8 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 		t.Errorf("bundle heads missing refs:\n%s", out)
 	}
 
-	// Download into a fresh clone (which has the prerequisite commit).
+	// Download into a fresh clone (which has the prerequisite commit):
+	// fetch-only, nothing checked out.
 	cloneParent := t.TempDir()
 	clone := filepath.Join(cloneParent, "clone")
 	cmd := exec.Command("git", "clone", "-q", e.repo, clone)
@@ -78,20 +80,54 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 		t.Fatalf("clone: %v: %s", err, out)
 	}
 	cg := &gitRepo{gitDir: filepath.Join(clone, ".git")}
-	home2 := t.TempDir()
-	dest := filepath.Join(cloneParent, "review")
-	if err := downloadSession(cg, bundle, "", "", dest, clone, home2); err != nil {
+	if err := downloadSession(cg, bundle, ""); err != nil {
 		t.Fatal(err)
 	}
-
-	// Worktree has the latest checkpoint's content.
-	data, err := os.ReadFile(filepath.Join(dest, "b.txt"))
-	if err != nil || string(data) != "v2\n" {
-		t.Errorf("worktree b.txt: %q, %v", data, err)
+	if refs, err := treeRefs(cg, e.session); err != nil || len(refs) != 2 {
+		t.Fatalf("fetched checkpoint refs: %v, %v", refs, err)
 	}
-	// Transcript materialized into the clone's repo-scoped sessions dir —
-	// the review worktree sees it via the container bind, and its size must
-	// equal the recorded blob (it is the resume offset).
+	if data, err := os.ReadFile(filepath.Join(clone, "b.txt")); err == nil {
+		t.Errorf("download checked out b.txt (%q); it must only fetch", data)
+	}
+
+	// Resume materializes the tree: on the clean clone the latest
+	// checkpoint is checked out (detached).
+	if err := RestoreCheckpoint(clone, e.session, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(clone, "b.txt"))
+	if err != nil || string(data) != "v2\n" {
+		t.Errorf("restored b.txt: %q, %v", data, err)
+	}
+	refs, _ := treeRefs(cg, e.session)
+	if head := cg.headCommit(); head != cg.readRef(refs[len(refs)-1]) {
+		t.Errorf("HEAD %s not at latest checkpoint %s", head, cg.readRef(refs[len(refs)-1]))
+	}
+	// Already at the checkpoint: a second restore is a no-op.
+	if err := RestoreCheckpoint(clone, e.session, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A dirty worktree refuses to restore.
+	if err := os.WriteFile(filepath.Join(clone, "b.txt"), []byte("dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreCheckpoint(clone, e.session, nil); err == nil {
+		t.Error("RestoreCheckpoint on dirty worktree succeeded")
+	}
+	// An unrecorded sid is claude's to resolve: no-op, no error.
+	if err := RestoreCheckpoint(clone, "not-recorded", nil); err != nil {
+		t.Errorf("RestoreCheckpoint for unrecorded sid: %v", err)
+	}
+
+	// Recorder startup in the clone materializes the fetched transcript
+	// into the repo-scoped sessions dir; its size must equal the recorded
+	// blob (it is the resume offset).
+	home2 := t.TempDir()
+	rec2, err := NewRecorder(filepath.Join(clone, ".git"), clone, home2, false, "", nil, log.New(os.Stderr, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2.Close()
 	tfile := filepath.Join(TranscriptDir(home2, clone), e.session+".jsonl")
 	fi, err := os.Stat(tfile)
 	if err != nil {
@@ -117,16 +153,6 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	}
 	if got := AutoForkSession(clone, []string{"--resume", "not-recorded"}); got != nil {
 		t.Errorf("AutoForkSession for unrecorded sid: %v", got)
-	}
-
-	// --at selects an earlier checkpoint.
-	dest2 := filepath.Join(cloneParent, "review-v1")
-	if err := downloadSession(cg, bundle, e.session, "u3", dest2, clone, home2); err != nil {
-		t.Fatal(err)
-	}
-	data, err = os.ReadFile(filepath.Join(dest2, "b.txt"))
-	if err != nil || string(data) != "v1\n" {
-		t.Errorf("--at u3 worktree b.txt: %q, %v", data, err)
 	}
 }
 
@@ -194,10 +220,9 @@ func TestResumeSubcommandLatest(t *testing.T) {
 
 func TestSessionSubcommands(t *testing.T) {
 	e := recordDemoSession(t)
-	home := t.TempDir()
 
 	bundleDir := t.TempDir()
-	if err := runSessionSubcommand("upload", []string{"--upstream", "main", bundleDir}, e.repo, home, ""); err != nil {
+	if err := runSessionSubcommand("upload", []string{"--upstream", "main", bundleDir}, e.repo, ""); err != nil {
 		t.Fatal(err)
 	}
 	bundle := filepath.Join(bundleDir, e.session+".bundle")
@@ -210,21 +235,21 @@ func TestSessionSubcommands(t *testing.T) {
 	if out, err := exec.Command("git", "clone", "-q", e.repo, clone).CombinedOutput(); err != nil {
 		t.Fatalf("clone: %v: %s", err, out)
 	}
-	dest := filepath.Join(cloneParent, "review")
-	if err := runSessionSubcommand("download", []string{"--dest", dest, bundle}, clone, home, ""); err != nil {
+	if err := runSessionSubcommand("download", []string{bundle}, clone, ""); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(filepath.Join(dest, "b.txt")); err != nil || string(data) != "v2\n" {
-		t.Errorf("downloaded worktree b.txt: %q, %v", data, err)
+	cg := &gitRepo{gitDir: filepath.Join(clone, ".git")}
+	if refs, err := treeRefs(cg, e.session); err != nil || len(refs) == 0 {
+		t.Errorf("downloaded checkpoint refs: %v, %v", refs, err)
 	}
 
-	if err := runSessionSubcommand("list", []string{"extra"}, e.repo, home, ""); err == nil {
+	if err := runSessionSubcommand("list", []string{"extra"}, e.repo, ""); err == nil {
 		t.Error("list accepted positional args")
 	}
-	if err := runSessionSubcommand("rm", nil, e.repo, home, ""); err == nil {
+	if err := runSessionSubcommand("rm", nil, e.repo, ""); err == nil {
 		t.Error("rm accepted empty args")
 	}
-	if err := runSessionSubcommand("rm", []string{e.session}, e.repo, home, ""); err != nil {
+	if err := runSessionSubcommand("rm", []string{e.session}, e.repo, ""); err != nil {
 		t.Fatal(err)
 	}
 	g := &gitRepo{gitDir: filepath.Join(e.repo, ".git")}

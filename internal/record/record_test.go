@@ -273,10 +273,17 @@ func TestRecorderCheckpointsAndTranscript(t *testing.T) {
 	if e.rec.git.readRef(u5Ref) != e.rec.git.readRef(u7Ref) {
 		t.Error("same-batch uuids should share one checkpoint commit")
 	}
-	// Second checkpoint's parent is the first.
-	parent, err := e.rec.git.run("rev-parse", e.rec.git.readRef(u5Ref)+"^")
-	if err != nil || parent != e.rec.git.readRef(treeRef) {
-		t.Errorf("checkpoint chain broken: parent %q, want %q (%v)", parent, e.rec.git.readRef(treeRef), err)
+	// Checkpoints amend rather than stack: both commits sit on the
+	// session-start HEAD, not on each other, and message noise is gone.
+	head := e.rec.git.headCommit()
+	for _, ref := range []string{treeRef, u5Ref} {
+		parents, err := e.rec.git.run("log", "-1", "--format=%P", e.rec.git.readRef(ref))
+		if err != nil || parents != head {
+			t.Errorf("%s: parents %q, want HEAD %q (%v)", ref, parents, head, err)
+		}
+	}
+	if msg, err := e.rec.git.run("log", "-1", "--format=%B", e.rec.git.readRef(u5Ref)); err != nil || msg != "" {
+		t.Errorf("checkpoint message: %q, want empty (%v)", msg, err)
 	}
 	e.rec.Close()
 }

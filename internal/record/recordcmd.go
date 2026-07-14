@@ -47,15 +47,11 @@ func DispatchSubcommand(args []string, upstreamDefault func(cwd string) string) 
 	if err != nil {
 		return true, "", "", nil, err
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return true, "", "", nil, err
-	}
 	upstream := ""
 	if upstreamDefault != nil {
 		upstream = upstreamDefault(cwd)
 	}
-	return true, "", "", nil, runSessionSubcommand(args[0], args[1:], cwd, home, upstream)
+	return true, "", "", nil, runSessionSubcommand(args[0], args[1:], cwd, upstream)
 }
 
 // resumeSubcommand picks the session id for the resume verb: an explicit
@@ -92,7 +88,7 @@ func resumeSubcommand(args []string) (sid string, rest []string, err error) {
 
 // runSessionSubcommand executes a host-only session verb against cwd's
 // repo; upstreamDefault is the default for upload's --upstream flag.
-func runSessionSubcommand(sub string, args []string, cwd, home, upstreamDefault string) error {
+func runSessionSubcommand(sub string, args []string, cwd, upstreamDefault string) error {
 	gitDir, ok := ResolveRecordGitDir(cwd)
 	if !ok {
 		return fmt.Errorf("no git or jj repository at %s", cwd)
@@ -133,15 +129,13 @@ func runSessionSubcommand(sub string, args []string, cwd, home, upstreamDefault 
 		}
 		return uploadSession(g, sid, fs.Arg(0), *upstream)
 	case "download":
-		fs := verbFlagSet("download", "runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>")
+		fs := verbFlagSet("download", "runclaude download [--session <sid>] <bundle|remote>")
 		session := fs.String("session", "", "session id (default: the newly fetched one)")
-		at := fs.String("at", "", "checkpoint selector: uuid or timestamp substring (default: latest)")
-		dest := fs.String("dest", "", "worktree directory (default: <repo>-review-<sid>)")
 		fs.Parse(args)
 		if fs.NArg() != 1 {
-			return fmt.Errorf("usage: runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>")
+			return fmt.Errorf("usage: runclaude download [--session <sid>] <bundle|remote>")
 		}
-		return downloadSession(g, fs.Arg(0), *session, *at, *dest, cwd, home)
+		return downloadSession(g, fs.Arg(0), *session)
 	}
 	return fmt.Errorf("unknown subcommand %q", sub)
 }
@@ -290,33 +284,58 @@ func treeRefs(g *gitRepo, sid string) ([]string, error) {
 	return g.refNames(recordRefPrefix + sid + "/tree/")
 }
 
-// checkpointBases returns the parents of checkpoint commits that are not
-// themselves checkpoints — i.e. the real-history commits the session was
-// based on (session-start HEAD plus any HEAD moved mid-session).
+// checkpointBases returns the nearest ancestors of checkpoint commits that
+// are not themselves checkpoints — i.e. the real-history commits the
+// session was based on (the base at session start plus any base moved
+// mid-session). Checkpoint parents are walked through: after a restore the
+// working copy sits on an earlier checkpoint of the same session, so its
+// base is only reachable via that checkpoint.
 func checkpointBases(g *gitRepo, sid string) ([]string, error) {
 	refs, err := treeRefs(g, sid)
 	if err != nil {
 		return nil, err
 	}
 	checkpoints := map[string]bool{}
+	queue := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		checkpoints[g.readRef(ref)] = true
+		sha := g.readRef(ref)
+		if !checkpoints[sha] {
+			checkpoints[sha] = true
+			queue = append(queue, sha)
+		}
 	}
 	basesSeen := map[string]bool{}
 	var bases []string
-	for sha := range checkpoints {
+	for len(queue) > 0 {
+		sha := queue[0]
+		queue = queue[1:]
 		parents, err := g.run("log", "-1", "--format=%P", sha)
 		if err != nil {
 			return nil, err
 		}
 		for _, p := range strings.Fields(parents) {
-			if !checkpoints[p] && !basesSeen[p] {
+			switch {
+			case checkpoints[p]:
+				// already walked or queued
+			case isCheckpointCommit(g, p):
+				checkpoints[p] = true
+				queue = append(queue, p)
+			case !basesSeen[p]:
 				basesSeen[p] = true
 				bases = append(bases, p)
 			}
 		}
 	}
 	return bases, nil
+}
+
+// isCheckpointCommit reports whether sha is a checkpoint of any recorded
+// session (a resumed session's first checkpoints sit on the restored
+// checkpoint, which may belong to a different sid — e.g. after a fork).
+func isCheckpointCommit(g *gitRepo, sha string) bool {
+	out, err := g.run("for-each-ref", "--points-at", sha, "--count=1",
+		"--format=%(refname)", recordRefPrefix)
+	return err == nil && strings.Contains(out, "/tree/")
 }
 
 // resolveUpstream picks the ref bounding bundles: the configured value, or
@@ -441,7 +460,13 @@ func reportNeverCommitted(g *gitRepo, sid, upstream string) error {
 	return nil
 }
 
-func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
+// downloadSession fetches a session's refs into the repo's storage.
+// Nothing is checked out: `runclaude resume <sid>` restores the recorded
+// tree and materializes the transcript (recorder startup), and forks
+// automatically when the session was recorded by another clone (see
+// AutoForkSession); the local recorder never extends foreign refs
+// (recorder id mismatch).
+func downloadSession(g *gitRepo, src, sid string) error {
 	if fi, err := os.Stat(src); err == nil && !fi.IsDir() {
 		if _, err := g.run("bundle", "verify", src); err != nil {
 			return fmt.Errorf("%w\n(missing prerequisites? fetch the upstream branch first)", err)
@@ -462,59 +487,8 @@ func downloadSession(g *gitRepo, src, sid, at, dest, cwd, home string) error {
 	if err != nil {
 		return err
 	}
-	if len(refs) == 0 {
-		return fmt.Errorf("session %s has no tree checkpoints", sid)
-	}
-	ref := refs[len(refs)-1]
-	if at != "" {
-		ref = ""
-		for _, r := range refs {
-			if strings.Contains(strings.TrimPrefix(r, recordRefPrefix+sid+"/tree/"), at) {
-				ref = r
-			}
-		}
-		if ref == "" {
-			return fmt.Errorf("no checkpoint matching --at %q; available:\n  %s", at, strings.Join(refs, "\n  "))
-		}
-	}
-	if dest == "" {
-		short := sid
-		if len(short) > 8 {
-			short = short[:8]
-		}
-		dest = filepath.Join(filepath.Dir(cwd), filepath.Base(cwd)+"-review-"+short)
-	}
-	if _, err := g.run("worktree", "add", "--detach", dest, g.readRef(ref)); err != nil {
-		return err
-	}
-	destAbs, err := filepath.Abs(dest)
-	if err != nil {
-		return err
-	}
-
-	// Materialize the transcript into the repo-scoped sessions dir so
-	// `claude --resume` (under runclaude) finds it from any worktree of
-	// this clone. Replaying under runclaude forks automatically when the
-	// session was recorded by another clone (see AutoForkSession); the
-	// local recorder never extends foreign refs (recorder id mismatch).
-	transcript, err := g.blobBytes(recordRefPrefix+sid+"/meta", "transcript.jsonl")
-	if err != nil {
-		return err
-	}
-	common, err := g.commonGitDir()
-	if err != nil {
-		return err
-	}
-	tdir := repoSessionsDir(home, destAbs, common)
-	if err := os.MkdirAll(tdir, 0700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(tdir, sid+".jsonl"), transcript, 0600); err != nil {
-		return err
-	}
-
-	fmt.Printf("session %s checked out at %s (checkpoint %s)\n", sid, dest, strings.TrimPrefix(ref, recordRefPrefix+sid+"/tree/"))
-	fmt.Printf("replay: cd %s && runclaude resume %s\n", dest, sid)
+	fmt.Printf("fetched session %s (%d tree checkpoints) into %s%s/\n", sid, len(refs), recordRefPrefix, sid)
+	fmt.Printf("replay (restores the recorded tree): runclaude resume %s\n", sid)
 	fmt.Printf("step checkpoints: git diff <ref-A> <ref-B> over refs under %s%s/tree/\n", recordRefPrefix, sid)
 	return nil
 }

@@ -539,7 +539,7 @@ func mainErr() error {
        runclaude resume [<sid>] [flags] [--] [claude args...]  resume a session (default: latest recorded)
        runclaude list                                          list recorded sessions
        runclaude upload [--session <sid>] [--upstream <ref>] <dir|bundle|remote>
-       runclaude download [--session <sid>] [--at <sel>] [--dest <dir>] <bundle|remote>
+       runclaude download [--session <sid>] <bundle|remote>
        runclaude rm <session-id>...
 
 flags:
@@ -552,10 +552,6 @@ flags:
 	// file; stickiness re-enables it per session regardless (see
 	// internal/record).
 	recordOn := verb != "" || boolOr(fileOpts.Record, false)
-	if resumeSid != "" && !*claudeMode {
-		return fmt.Errorf("resume requires claude mode (--claude)")
-	}
-
 	switch *exclusive {
 	case "no", "yes", "probe":
 	default:
@@ -591,6 +587,11 @@ flags:
 	}
 
 	claudeLike := *claudeMode || *claudeConfig
+	// --claude-config passes too: the tree restore and the recorder still
+	// run, only the injected `--resume` needs claude as the command.
+	if resumeSid != "" && !claudeLike {
+		return fmt.Errorf("resume requires claude mode (--claude or --claude-config)")
+	}
 
 	allowedDomains := allowDomain.items
 	if !allowDomain.set {
@@ -1008,6 +1009,16 @@ flags:
 	defer cleanupSession()
 	if err := checkUserNS(); err != nil {
 		return err
+	}
+
+	// The resume verb also restores the recorded tree: claude's --resume
+	// brings back the conversation, RestoreCheckpoint puts the worktree at
+	// the session's latest checkpoint (no-op when it is already there, or
+	// when the sid is not a recorded session).
+	if resumeSid != "" && !onlyMode {
+		if err := record.RestoreCheckpoint(cwd, resumeSid, recordExclude); err != nil {
+			return fmt.Errorf("resume: %w", err)
+		}
 	}
 
 	// Session recorder: runs whenever a git dir resolves so sticky sessions

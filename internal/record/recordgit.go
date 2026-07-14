@@ -136,7 +136,8 @@ func (g *gitRepo) commitTreeChangeID(tree string, parents []string, msg, changeI
 		fmt.Fprintf(&b, "parent %s\n", p)
 	}
 	fmt.Fprintf(&b, "author %s\ncommitter %s\nchange-id %s\n\n%s", author, committer, changeID, msg)
-	if !strings.HasSuffix(msg, "\n") {
+	// An empty message (jj change without a description) stays empty.
+	if msg != "" && !strings.HasSuffix(msg, "\n") {
 		b.WriteString("\n")
 	}
 	return g.runInput(b.String(), "hash-object", "-t", "commit", "-w", "--stdin", "--literally")
@@ -271,15 +272,4 @@ func (g *gitRepo) ensureIdent() {
 			"GIT_COMMITTER_NAME=runclaude", "GIT_COMMITTER_EMAIL=runclaude@localhost",
 		}
 	}
-}
-
-// repack packs runclaude refs and loose objects; called once at session
-// end to collapse per-flush transcript blobs into deltas. Errors are
-// returned for logging but are not fatal to the recording.
-func (g *gitRepo) repack() error {
-	if _, err := g.run("pack-refs", "--all", "--prune"); err != nil {
-		return err
-	}
-	_, err := g.run("repack", "-d", "-q")
-	return err
 }
