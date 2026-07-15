@@ -503,7 +503,7 @@ func mainErr() error {
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	approveListen := fs.String("approve-listen", strOr(fileOpts.ApproveListen, "127.0.0.1:0"),
 		"host address for the domain-approval web UI; the chosen address is printed on startup")
-	exclusive := flag.String("exclusive", "no",
+	exclusive := fs.String("exclusive", "no",
 		"same-cwd concurrency control: \"no\" (default, just warn about other sessions), "+
 			"\"yes\" (refuse to start if another runclaude session shares this cwd), or "+
 			"\"probe\" (do not start; exit 0 if this cwd is free, nonzero if another session is live)")
