@@ -21,6 +21,7 @@ type Options struct {
 	ProxyLog      string   `json:"proxyLog,omitempty"`
 	ApproveListen string   `json:"approveListen,omitempty"`
 	MitmUpstream  []string `json:"mitmUpstream,omitempty"`
+	ClaudeFlags   []string `json:"claudeFlags,omitempty"`
 }
 
 // loadOptionsFile reads .claude/runclaude.json from cwd.

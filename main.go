@@ -478,6 +478,10 @@ func mainErr() error {
 	mitmUpstream = append(mitmUpstream, fileOpts.MitmUpstream...)
 	flag.Var(&mitmUpstream, "mitm-upstream",
 		"override MITM upstream for a host, format host=url (repeatable). For testing: point the proxy at a fake server.")
+	var claudeFlags stringSlice
+	claudeFlags = append(claudeFlags, fileOpts.ClaudeFlags...)
+	flag.Var(&claudeFlags, "claude-flag",
+		"extra argument to pass to the in-container `claude` command (repeatable); e.g. --claude-flag=--setting-sources --claude-flag=user")
 	anthropicKeyOverride := flag.String("anthropic-key", "",
 		"override the Anthropic API key the proxy injects (bypasses ~/.claude/.credentials.json); for testing")
 	anthropicBearerOverride := flag.String("anthropic-bearer", "",
@@ -859,6 +863,7 @@ func mainErr() error {
 			if mergeProjectClaude {
 				cmd = append(cmd, "--setting-sources", "user")
 			}
+			cmd = append(cmd, []string(claudeFlags)...)
 			cfg.Command = append(cmd, flag.Args()...)
 		}
 		if bearer != "" || apiKey != "" {
@@ -906,6 +911,7 @@ func mainErr() error {
 		ProxyLog:      *proxyLog,
 		ApproveListen: *approveListen,
 		MitmUpstream:  []string(mitmUpstream),
+		ClaudeFlags:   []string(claudeFlags),
 	}
 	activeJSON, _ := json.MarshalIndent(activeOpts, "", "\t")
 	runclaudeJSONPath := filepath.Join(dir, "runclaude.json")
