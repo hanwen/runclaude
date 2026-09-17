@@ -172,7 +172,6 @@ func (ap *Approver) renderIndex(w http.ResponseWriter) {
 
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
-	b.WriteString(`<meta http-equiv="refresh" content="3">`)
 	b.WriteString(`<title>runclaude &mdash; domain approval</title>`)
 	b.WriteString(`<style>` + approvalCSS + `</style></head><body>`)
 	b.WriteString(`<h1>runclaude domain approval</h1>`)
@@ -204,7 +203,14 @@ func (ap *Approver) renderIndex(w http.ResponseWriter) {
 	for _, d := range allowed {
 		fmt.Fprintf(&b, `<li>%s</li>`, html.EscapeString(d))
 	}
-	b.WriteString(`</ul></body></html>`)
+	b.WriteString(`</ul>`)
+	// Auto-refresh to surface newly denied hosts, but skip the reload while a
+	// field is focused so typing into "Approve a domain" isn't wiped.
+	b.WriteString(`<script>setInterval(function(){` +
+		`var a=document.activeElement;` +
+		`if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'))return;` +
+		`location.reload();},3000);</script>`)
+	b.WriteString(`</body></html>`)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, b.String())
