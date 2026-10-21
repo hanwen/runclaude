@@ -470,6 +470,9 @@ func mainErr() error {
 		"path to write the proxy log to (default: <cache-dir>/proxy.log)")
 	approveListen := flag.String("approve-listen", strOr(fileOpts.ApproveListen, "127.0.0.1:0"),
 		"host address for the domain-approval web UI; the chosen address is printed on startup")
+	approveMode := flag.Bool("approve", false,
+		"approve egress host(s) for the live runclaude session(s) in this cwd (`runclaude --approve HOST...`); "+
+			"with no host, print the approval UI URLs. Does not start a sandbox.")
 	exclusive := flag.String("exclusive", "no",
 		"same-cwd concurrency control: \"no\" (default, just warn about other sessions), "+
 			"\"yes\" (refuse to start if another runclaude session shares this cwd), or "+
@@ -504,6 +507,9 @@ func mainErr() error {
 		return err
 	}
 	cacheDir := filepath.Join(cacheBase, "runclaude", filepath.Base(cwd)+"-"+hex.EncodeToString(sum[:])[:16])
+	if *approveMode {
+		return runApprove(cacheDir, flag.Args())
+	}
 	if *exclusive != "no" {
 		others := liveSessions(filepath.Join(cacheDir, "sessions"))
 		switch *exclusive {
@@ -638,6 +644,7 @@ func mainErr() error {
 	// init. commChildFile is passed via ExtraFiles all the way to init.
 	var commHostEnd *os.File
 	var commChildFile *os.File
+	var approveURL string
 	if enforceAllowlist(cfg) {
 		logPath := *proxyLog
 		if logPath == "" {
@@ -660,7 +667,8 @@ func mainErr() error {
 		if approvalLn, err := net.Listen("tcp", *approveListen); err != nil {
 			log.Printf("warning: domain approval UI: %v", err)
 		} else {
-			log.Printf("domain approval UI: http://%s", approvalLn.Addr())
+			approveURL = "http://" + approvalLn.Addr().String()
+			log.Printf("domain approval UI: %s", approveURL)
 			go func() {
 				if err := http.Serve(approvalLn, approver); err != nil {
 					logger.Printf("approval UI: %v", err)
@@ -922,7 +930,7 @@ func mainErr() error {
 
 	// Record this session and warn if other runclaude sessions share this
 	// cwd's cache (they share $HOME cache, /tmp and the merged ~/.claude tree).
-	cleanupSession := registerSession(cacheDir, cfg.Command)
+	cleanupSession := registerSession(cacheDir, cfg.Command, approveURL)
 	defer cleanupSession()
 	if err := checkUserNS(); err != nil {
 		return err

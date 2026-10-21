@@ -2,10 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"log"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+
+	"github.com/hanwen/runclaude/proxy"
 )
 
 func writeSession(t *testing.T, dir string, s sessionInfo) {
@@ -57,9 +62,32 @@ func TestLiveSessionsDropsCorruptFiles(t *testing.T) {
 	}
 }
 
+func TestRunApproveScopesToCwdAndApproves(t *testing.T) {
+	allow := proxy.NewAllowlist(nil)
+	srv := httptest.NewServer(proxy.NewApprover(allow, log.New(io.Discard, "", 0)))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	dir := filepath.Join(cacheDir, "sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A live session (our parent is alive and is not this process) exposing the
+	// approval server, plus a dead session that must be ignored.
+	writeSession(t, dir, sessionInfo{PID: os.Getppid(), ApproveURL: srv.URL})
+	writeSession(t, dir, sessionInfo{PID: 0x7ffffffe, ApproveURL: srv.URL})
+
+	if err := runApprove(cacheDir, []string{"pkg.example.com"}); err != nil {
+		t.Fatalf("runApprove: %v", err)
+	}
+	if !allow.Match("pkg.example.com") {
+		t.Fatal("host should be allowed after runApprove")
+	}
+}
+
 func TestRegisterSessionRoundTrip(t *testing.T) {
 	cacheDir := t.TempDir()
-	cleanup := registerSession(cacheDir, []string{"claude", "--foo"})
+	cleanup := registerSession(cacheDir, []string{"claude", "--foo"}, "http://127.0.0.1:12345")
 	path := filepath.Join(cacheDir, "sessions", strconv.Itoa(os.Getpid())+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -74,6 +102,9 @@ func TestRegisterSessionRoundTrip(t *testing.T) {
 	}
 	if len(s.Command) != 2 || s.Command[0] != "claude" {
 		t.Errorf("Command = %v, want [claude --foo]", s.Command)
+	}
+	if s.ApproveURL != "http://127.0.0.1:12345" {
+		t.Errorf("ApproveURL = %q, want %q", s.ApproveURL, "http://127.0.0.1:12345")
 	}
 	cleanup()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,12 +20,13 @@ import (
 // at once can interfere; the registry turns that from a silent surprise into a
 // logged warning that names the other terminal.
 type sessionInfo struct {
-	PID      int      `json:"pid"`
-	TTY      string   `json:"tty,omitempty"`
-	Term     string   `json:"term,omitempty"`     // $TERM_PROGRAM
-	TmuxPane string   `json:"tmuxPane,omitempty"` // $TMUX_PANE
-	Title    string   `json:"title,omitempty"`    // best-effort window/title hint
-	Command  []string `json:"command,omitempty"`
+	PID        int      `json:"pid"`
+	TTY        string   `json:"tty,omitempty"`
+	Term       string   `json:"term,omitempty"`     // $TERM_PROGRAM
+	TmuxPane   string   `json:"tmuxPane,omitempty"` // $TMUX_PANE
+	Title      string   `json:"title,omitempty"`    // best-effort window/title hint
+	Command    []string `json:"command,omitempty"`
+	ApproveURL string   `json:"approveUrl,omitempty"` // base URL of this session's approval UI
 }
 
 // describe renders a one-line human-readable identification of the session.
@@ -50,12 +53,13 @@ func (s sessionInfo) describe() string {
 // title is not reliably queryable (it lives in the emulator and querying it
 // requires raw-mode tty trickery that many emulators disable), so we fall back
 // to the env hints terminals/multiplexers commonly export.
-func currentSessionInfo(command []string) sessionInfo {
+func currentSessionInfo(command []string, approveURL string) sessionInfo {
 	s := sessionInfo{
-		PID:      os.Getpid(),
-		Term:     os.Getenv("TERM_PROGRAM"),
-		TmuxPane: os.Getenv("TMUX_PANE"),
-		Command:  command,
+		PID:        os.Getpid(),
+		Term:       os.Getenv("TERM_PROGRAM"),
+		TmuxPane:   os.Getenv("TMUX_PANE"),
+		Command:    command,
+		ApproveURL: approveURL,
 	}
 	// Controlling terminal: whichever of stdin/stdout/stderr is a tty.
 	for _, fd := range []int{0, 1, 2} {
@@ -86,7 +90,7 @@ func currentSessionInfo(command []string) sessionInfo {
 // registerSession writes this session's info file and warns about any other
 // live runclaude sessions in the same cwd. Stale files from dead processes are
 // pruned. It returns a cleanup func to remove this session's file on exit.
-func registerSession(cacheDir string, command []string) func() {
+func registerSession(cacheDir string, command []string, approveURL string) func() {
 	dir := filepath.Join(cacheDir, "sessions")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		log.Printf("warning: session registry: %v", err)
@@ -105,7 +109,7 @@ func registerSession(cacheDir string, command []string) func() {
 			len(others), cacheDir, strings.Join(lines, "\n"))
 	}
 
-	self := currentSessionInfo(command)
+	self := currentSessionInfo(command, approveURL)
 	path := filepath.Join(dir, strconv.Itoa(self.PID)+".json")
 	if data, err := json.Marshal(self); err != nil {
 		log.Printf("warning: session registry: %v", err)
@@ -148,6 +152,57 @@ func liveSessions(dir string) []sessionInfo {
 		live = append(live, s)
 	}
 	return live
+}
+
+// runApprove serves the `runclaude --approve` command: it contacts every live
+// runclaude session sharing cacheDir's cwd and approves each host for its
+// egress allowlist via the approval web server those sessions already run, so
+// approvals take effect without restarting any sandbox. With no hosts it prints
+// each session's approval UI URL instead. Sessions without an approval UI (net
+// not restricted) are skipped.
+func runApprove(cacheDir string, hosts []string) error {
+	var sessions []sessionInfo
+	for _, s := range liveSessions(filepath.Join(cacheDir, "sessions")) {
+		if s.ApproveURL != "" {
+			sessions = append(sessions, s)
+		}
+	}
+	if len(sessions) == 0 {
+		return fmt.Errorf("no live runclaude session with an approval UI in this cwd")
+	}
+	if len(hosts) == 0 {
+		for _, s := range sessions {
+			fmt.Printf("%s  (%s)\n", s.ApproveURL, s.describe())
+		}
+		return nil
+	}
+	var failed int
+	for _, s := range sessions {
+		for _, h := range hosts {
+			if err := postApprove(s.ApproveURL, h); err != nil {
+				failed++
+				log.Printf("approve %s on %s: %v", h, s.ApproveURL, err)
+			}
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d approval(s) failed", failed)
+	}
+	fmt.Printf("approved %s on %d session(s)\n", strings.Join(hosts, ", "), len(sessions))
+	return nil
+}
+
+// postApprove approves host at the approval server rooted at baseURL.
+func postApprove(baseURL, host string) error {
+	resp, err := http.PostForm(strings.TrimRight(baseURL, "/")+"/approve", url.Values{"host": {host}})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusSeeOther {
+		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	return nil
 }
 
 // processAlive reports whether a process with the given pid exists. signal 0
