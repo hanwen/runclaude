@@ -46,7 +46,7 @@ func TestMitmE2EAnthropic(t *testing.T) {
 			r.Header.Set("anthropic-version", "2023-06-01")
 		}
 	}
-	rp := NewMitmReverseProxy("api.anthropic.com", upstreamURL, inject, nil, logger)
+	rp := NewMitmReverseProxy("api.anthropic.com", upstreamURL, inject, nil, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 
@@ -100,7 +100,7 @@ func TestMitmE2EBedrock(t *testing.T) {
 	inject := func(h string, r *http.Request) {
 		InjectBedrock(h, r, credsProvider, signer, logger)
 	}
-	rp := NewMitmReverseProxy(host, upstreamURL, inject, nil, logger)
+	rp := NewMitmReverseProxy(host, upstreamURL, inject, nil, nil, logger)
 	mitm := httptest.NewServer(rp)
 	defer mitm.Close()
 
@@ -149,5 +149,85 @@ func TestMitmE2EBedrock(t *testing.T) {
 	got := parsed["content"].([]any)[0].(map[string]any)["text"]
 	if got != fake.FixedReply {
 		t.Errorf("text = %q, want %q", got, fake.FixedReply)
+	}
+}
+
+// TestMitmE2EBedrockUsage drives a streaming Bedrock response through the
+// real reverse proxy with an OnResponse hook, confirming the ModifyResponse
+// wiring tees the event-stream body past the usage parser and that the model
+// is recovered from the request path.
+func TestMitmE2EBedrockUsage(t *testing.T) {
+	realCreds := aws.Credentials{
+		AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
+		SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+	}
+	credsProvider := aws.CredentialsProviderFunc(func(_ context.Context) (aws.Credentials, error) {
+		return realCreds, nil
+	})
+	upstream := httptest.NewServer(fake.Handler(fake.Config{
+		AWSAccessKey: realCreds.AccessKeyID,
+		AWSSecretKey: realCreds.SecretAccessKey,
+		AWSRegion:    "us-east-1",
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	host := "bedrock-runtime.us-east-1.amazonaws.com"
+	logger := log.New(io.Discard, "", 0)
+	signer := v4.NewSigner()
+	inject := func(h string, r *http.Request) {
+		InjectBedrock(h, r, credsProvider, signer, logger)
+	}
+	tracker := NewUsageTracker(logger)
+	onResponse := func(req *http.Request, resp *http.Response) {
+		tracker.Observe(req.URL.Path, resp)
+	}
+	rp := NewMitmReverseProxy(host, upstreamURL, inject, nil, onResponse, logger)
+	mitm := httptest.NewServer(rp)
+	defer mitm.Close()
+
+	stubCreds := aws.Credentials{
+		AccessKeyID:     "AKIA000RUNCLAUDESTUB",
+		SecretAccessKey: "runclaude-stub-secret-do-not-use",
+	}
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}],"anthropic_version":"bedrock-2023-05-31"}`)
+	path := "/model/us.anthropic.claude-sonnet-4-5-20250929-v1:0/invoke-with-response-stream"
+	req, _ := http.NewRequest(http.MethodPost, mitm.URL+path, bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+
+	signReq := req.Clone(context.Background())
+	signReq.URL = &url.URL{Scheme: "https", Host: host, Path: req.URL.Path}
+	signReq.Body = io.NopCloser(bytes.NewReader(body))
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	if err := signer.SignHTTP(context.Background(), stubCreds, signReq,
+		hash, "bedrock", "us-east-1", testNow()); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"Authorization", "X-Amz-Date", "X-Amz-Security-Token"} {
+		if v := signReq.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, out)
+	}
+
+	// fakeapi's event-stream reports input_tokens=1, output_tokens=10.
+	// Assert on the parsed totals directly; the cost is far below the
+	// report's $0.01 display threshold, so the per-model line is hidden.
+	tracker.wg.Wait()
+	got := tracker.byModel["us.anthropic.claude-sonnet-4-5-20250929-v1:0"]
+	if got == nil || got.Input != 1 || got.Output != 10 {
+		t.Errorf("parsed usage = %+v, want input=1 output=10", got)
 	}
 }

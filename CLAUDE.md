@@ -71,6 +71,8 @@ Per-cwd cache at `~/.cache/runclaude/<sha256(cwd)[:16]>/` with subdirs `home/`, 
 
 When `--claude` + `CLAUDE_CODE_USE_BEDROCK=1`: the host calls `awsconfig.LoadDefaultConfig` (so SSO / profile / IMDS all work on the host), keeps the creds, and the in-container claude is given stub `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. The container's aws-sdk signs requests with the stub; the MITM strips the stub signature and re-signs with the real creds. `scrubAWSCreds` ensures no real AWS env leaks into the container.
 
+Token accounting (`proxy/usage.go`): in Bedrock mode `mainErr` installs a `proxy.UsageTracker` via `Setup.OnResponse` (a hook the MITM reverse proxy calls in `ModifyResponse`). The tracker tees each `/model/<id>/invoke[-with-response-stream]` response body past a parser — the AWS event-stream binary frames for streaming replies, plain JSON otherwise — and accumulates per-model input/output/cache tokens from the Anthropic `usage` blocks. On exit (`mainErr` after `cmd.Run`) `UsageTracker.Report` prints per-model token counts and an estimated dollar cost from the `bedrockPrices` table (per-MTok input/output/cache-write/cache-read rates, matched by model-family substring in the Bedrock model id; longest match wins).
+
 ### `fakeapi/` and `cmd/fake-anthropic/`
 
 A fake Anthropic + Bedrock server used by both `go test` and `test-mitm.sh`. Validates credentials (so MITM injection is actually tested) and streams `FixedReply` ("I am a fake anthropic API server") back as SSE — tests grep for that string.

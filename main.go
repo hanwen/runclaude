@@ -645,6 +645,7 @@ func mainErr() error {
 	var commHostEnd *os.File
 	var commChildFile *os.File
 	var approveURL string
+	var usage *proxy.UsageTracker
 	if enforceAllowlist(cfg) {
 		logPath := *proxyLog
 		if logPath == "" {
@@ -682,6 +683,14 @@ func mainErr() error {
 			Inject:   func(string, *http.Request) {},
 			Upstream: cfg.MitmUpstream,
 			OnDeny:   approver.Record,
+		}
+		if useBedrock {
+			usage = proxy.NewUsageTracker(logger)
+			setup.OnResponse = func(req *http.Request, resp *http.Response) {
+				if req != nil {
+					usage.Observe(req.URL.Path, resp)
+				}
+			}
 		}
 		if len(mitmDomains) > 0 {
 			ca, err := proxy.LoadOrCreateCA(filepath.Join(cacheBase, "runclaude"))
@@ -990,6 +999,11 @@ func mainErr() error {
 	err = cmd.Run()
 	if commChildFile != nil {
 		commChildFile.Close()
+	}
+	if usage != nil {
+		if report := usage.Report(); report != "" {
+			fmt.Fprint(os.Stderr, "\n"+report)
+		}
 	}
 	return err
 }
