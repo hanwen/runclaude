@@ -24,20 +24,48 @@ import (
 // instance backs both the proxy's allow decision (Serve) and the DNS server,
 // so a runtime approval takes effect for name resolution and egress at once.
 type Allowlist struct {
-	mu    sync.RWMutex
-	items []string
+	now func() time.Time
+
+	mu       sync.RWMutex
+	items    []string
+	allowAll time.Time
 }
 
 // NewAllowlist returns an Allowlist seeded with initial (copied).
 func NewAllowlist(initial []string) *Allowlist {
-	return &Allowlist{items: append([]string(nil), initial...)}
+	return &Allowlist{now: time.Now, items: append([]string(nil), initial...)}
 }
 
-// Match reports whether host matches any pattern currently in the list.
+// Match reports whether host matches any pattern currently in the list, or the
+// allow-all window is still open.
 func (a *Allowlist) Match(host string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	if a.now().Before(a.allowAll) {
+		return true
+	}
 	return MatchDomain(host, a.items)
+}
+
+// AllowAllFor opens a window during which Match permits every host, until d
+// from now. It extends the window if one is already open past that point.
+func (a *Allowlist) AllowAllFor(d time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if until := a.now().Add(d); until.After(a.allowAll) {
+		a.allowAll = until
+	}
+}
+
+// AllowAllUntil returns the end of the open allow-all window, or the zero time
+// if none is open.
+func (a *Allowlist) AllowAllUntil() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.now().Before(a.allowAll) {
+		return a.allowAll
+	}
+	return time.Time{}
 }
 
 // Add inserts pattern unless it is already matched. It reports whether the
@@ -146,9 +174,14 @@ func (ap *Approver) Denied() []DeniedEntry {
 	return out
 }
 
+// allowAllWindow is the duration the "allow all network" button opens egress
+// for.
+const allowAllWindow = 15 * time.Minute
+
 // ServeHTTP implements the approval web UI: GET / lists denied hosts and the
 // current allowlist; POST /approve?host=... (also accepts a form field)
-// approves a host and redirects back.
+// approves a host; POST /allow-all opens the allow-all window. Both redirect
+// back.
 func (ap *Approver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/approve":
@@ -157,6 +190,16 @@ func (ap *Approver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ap.Approve(r.FormValue("host"))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	case "/allow-all":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ap.allow.AllowAllFor(allowAllWindow)
+		if ap.logger != nil {
+			ap.logger.Printf("allow all network for %s", allowAllWindow)
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	case "/":
 		ap.renderIndex(w)
@@ -175,6 +218,14 @@ func (ap *Approver) renderIndex(w http.ResponseWriter) {
 	b.WriteString(`<title>runclaude &mdash; domain approval</title>`)
 	b.WriteString(`<style>` + approvalCSS + `</style></head><body>`)
 	b.WriteString(`<h1>runclaude domain approval</h1>`)
+
+	if until := ap.allow.AllowAllUntil(); !until.IsZero() {
+		fmt.Fprintf(&b, `<p class="allowall-on">All network allowed until %s.</p>`,
+			html.EscapeString(until.Format("15:04:05")))
+	}
+	fmt.Fprintf(&b, `<form method="post" action="/allow-all" class="allowall">`+
+		`<button type="submit">allow all network for %d minutes</button></form>`,
+		int(allowAllWindow.Minutes()))
 
 	b.WriteString(`<h2>Denied requests</h2>`)
 	if len(denied) == 0 {
@@ -225,5 +276,8 @@ th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #eee}
 button{cursor:pointer;padding:.25rem .8rem}
 .empty{color:#777}
 .add input{padding:.3rem}
+.allowall{margin:.8rem 0}
+.allowall button{background:#fbeaea;border:1px solid #d99;color:#a33}
+.allowall-on{color:#a33;font-weight:600}
 .allowed{columns:2;font-family:ui-monospace,monospace;font-size:.85rem;color:#555}
 `

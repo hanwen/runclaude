@@ -8,7 +8,38 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestAllowlistAllowAllFor(t *testing.T) {
+	a := NewAllowlist(nil)
+	now := time.Unix(1000, 0)
+	a.now = func() time.Time { return now }
+
+	if a.Match("example.com") {
+		t.Fatal("unseeded domain should not match before allow-all")
+	}
+	a.AllowAllFor(15 * time.Minute)
+	if !a.Match("example.com") {
+		t.Fatal("any domain should match inside the allow-all window")
+	}
+	if a.AllowAllUntil().IsZero() {
+		t.Fatal("AllowAllUntil should report the open window")
+	}
+	// A shorter window must not shorten the one already open.
+	a.AllowAllFor(time.Minute)
+	if want := now.Add(15 * time.Minute); !a.AllowAllUntil().Equal(want) {
+		t.Fatalf("window should stay at %v, got %v", want, a.AllowAllUntil())
+	}
+
+	now = now.Add(16 * time.Minute)
+	if a.Match("example.com") {
+		t.Fatal("domain should not match after the window expires")
+	}
+	if !a.AllowAllUntil().IsZero() {
+		t.Fatal("AllowAllUntil should be zero after expiry")
+	}
+}
 
 func TestAllowlistAddMatch(t *testing.T) {
 	a := NewAllowlist([]string{"api.anthropic.com"})
@@ -109,5 +140,18 @@ func TestApproverHTTP(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /approve should be 405, got %d", resp.StatusCode)
+	}
+
+	// POST /allow-all opens the window for every host.
+	resp, err = client.PostForm(srv.URL+"/allow-all", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("allow-all should redirect (303), got %d", resp.StatusCode)
+	}
+	if !allow.Match("never-seen.example.org") {
+		t.Fatal("any host should be allowed after POST /allow-all")
 	}
 }
